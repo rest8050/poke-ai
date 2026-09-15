@@ -1,0 +1,84 @@
+# 🎮 PokeAI - 포켓몬 배틀 딥러닝 & 강화학습 AI 프로젝트
+
+자기 포켓몬 샘플(특성, 도구, 상성)을 이해하고 상대의 행동(스킬/교체)을 예측하는 PyTorch 기반 포켓몬 배틀 AI 템플릿 프로젝트입니다.
+
+---
+
+## 📁 프로젝트 구조
+
+```
+poke-ai/
+├── requirements.txt   # 필요한 파이썬 패키지 목록
+├── model.py           # PyTorch 신경망 아키텍처 (Policy + Opponent Predictor + Value)
+├── player.py          # poke-env & RCT JSON 전황 데이터를 상태 벡터로 인코딩
+├── server.py          # 마인크래프트 RCT 모드 연동용 FastAPI 추론 서버 (http://localhost:8000)
+├── train.py           # 상대 행동 예측(Auxiliary Loss) 보조 학습 루프 템플릿
+└── README.md          # 프로젝트 사용 가이드
+```
+
+---
+
+## ⚙️ 1. 환경 설치
+
+```bash
+cd poke-ai
+pip install -r requirements.txt
+```
+
+---
+
+## 🧠 2. 모델 학습 (Train)
+
+```bash
+python train.py
+```
+* 학습이 완료되면 `checkpoint.pt` 가중치 파일이 생성됩니다.
+* `poke-env` 라이브러리를 이용해 로컬 포켓몬 쇼다운 서버와 셀프 플레이(Self-Play) 방식으로 수만 판 훈련시킬 수 있습니다.
+
+---
+
+## 🚀 3. AI 추론 서버 실행 (FastAPI)
+
+```bash
+python server.py
+```
+* 서버가 가동되면 `http://localhost:8000/predict` 엔드포인트를 통해 전황 상태를 전송받고 최적의 스킬/교체 행동을 응답합니다.
+* Swagger UI 테스트: `http://localhost:8000/docs`
+
+---
+
+## 🔗 4. 마인크래프트 RCT 모드 연동 방법
+
+마인크래프트 RCT 모드의 커스텀 `BattleAI` 클래스에서 턴마다 아래 형식으로 POST 요청을 보냅니다:
+
+**Request (`POST /predict`):**
+```json
+{
+  "battle_id": "battle_001",
+  "trainer_name": "Ace_Trainer_Red",
+  "active": {
+    "name": "Pikachu",
+    "hp_percent": 0.85,
+    "level": 50,
+    "status": null,
+    "moves": ["Thunderbolt", "Volt Tackle", "Iron Tail", "Quick Attack"]
+  },
+  "opponent": {
+    "name": "Charizard",
+    "hp_percent": 1.0,
+    "status": null
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "action_type": "move",
+  "action_index": 0,
+  "chosen_action": "Thunderbolt",
+  "predicted_opponent_action": 1,
+  "confidence": 0.942,
+  "state_value": 0.821
+}
+```
