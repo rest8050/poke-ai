@@ -1,10 +1,19 @@
+import sys
+import os
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+while _current_dir != os.path.dirname(_current_dir):
+    if os.path.exists(os.path.join(_current_dir, "data", "vocab.json")):
+        if _current_dir not in sys.path:
+            sys.path.insert(0, _current_dir)
+        break
+    _current_dir = os.path.dirname(_current_dir)
 import torch
 import numpy as np
 import json
 import re
 from enum import Enum
 
-from tensor_encoder import BattleTensorEncoder, VocabManager, extract_enum_str
+from src.core.tensor_encoder import BattleTensorEncoder, VocabManager, extract_enum_str
 
 
 class MockType(Enum):
@@ -76,7 +85,7 @@ class MockBattle:
 
 def run_full_1to1_verification():
     print("🔬 [1대1 완전 검증] BattleTensorEncoder 전체 인덱스 & 항목별 1:1 매칭 검증 시작...\n")
-    encoder = BattleTensorEncoder(vocab_path="vocab.json")
+    encoder = BattleTensorEncoder(vocab_path="data/vocab.json")
     v_mgr = encoder.vocab_mgr
 
     # 1. 테스트 포켓몬 준비

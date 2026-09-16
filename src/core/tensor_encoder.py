@@ -4,7 +4,10 @@ import json
 import os
 import re
 from enum import Enum
+from functools import lru_cache
 from typing import Dict, Any, Tuple, List, Optional
+
+from src.core.set_prior import predict as predict_set
 
 
 WEATHER_MAP = {
@@ -61,7 +64,7 @@ class VocabManager:
     """
     _instance = None
 
-    def __init__(self, vocab_path: str = "vocab.json"):
+    def __init__(self, vocab_path: str = "data/vocab.json"):
         self.vocab = {}
         if os.path.exists(vocab_path):
             try:
@@ -71,7 +74,7 @@ class VocabManager:
                 print(f"⚠️ vocab.json 로드 실패: {e}")
 
     @classmethod
-    def get_instance(cls, vocab_path: str = "vocab.json"):
+    def get_instance(cls, vocab_path: str = "data/vocab.json"):
         if cls._instance is None:
             cls._instance = VocabManager(vocab_path)
         return cls._instance
@@ -243,13 +246,32 @@ def extract_move_features(move: Any) -> Tuple[float, float, float, float, float,
     return bp, acc, pp_ratio, priority, cat_val, sec_val, move_type_norm
 
 
+@lru_cache(maxsize=2048)
+def _move_obj(move_id: str):
+    """추론된 기술 id -> poke-env Move (수치 피처용)"""
+    try:
+        from poke_env.battle import Move
+        move = Move(move_id, gen=9)
+        move.entry  # 존재하지 않는 기술이면 여기서 예외
+        return move
+    except Exception:
+        return None
+
+
+# my_num / opp_num 레이아웃 [.., 23]
+#   0~11 배틀 수치, 12~18 종족값, 19 도구 추론됨, 20 특성 추론됨, 21 추론 기술 수/4, 22 팀 프리뷰로만 확인
+# my_cat / opp_cat 레이아웃 [.., 10]
+#   0 item, 1 ability, 2 type1, 3 type2, 4 status, 5~8 moves, 9 tera type
+NUM_DIM, CAT_DIM = 23, 10
+
+
 class BattleTensorEncoder:
     """
     poke-env의 Battle 객체 또는 RCT Mod의 JSON 상태를 
     DeepPokemonBattleTransformerNet 입력 규격 텐서로 변환하는 전용 엔코더
     """
     
-    def __init__(self, vocab_path: str = "vocab.json", device: str = "cpu"):
+    def __init__(self, vocab_path: str = "data/vocab.json", device: str = "cpu"):
         self.vocab_mgr = VocabManager.get_instance(vocab_path)
         self.device = device
 
@@ -257,12 +279,12 @@ class BattleTensorEncoder:
         """
         poke-env의 Battle 객체 변환 (Enum 파싱 & 딕셔너리 weather 호환)
         """
-        my_cat = np.zeros((1, 6, 10), dtype=np.int64)
-        my_num = np.zeros((1, 6, 12), dtype=np.float32)
+        my_cat = np.zeros((1, 6, CAT_DIM), dtype=np.int64)
+        my_num = np.zeros((1, 6, NUM_DIM), dtype=np.float32)
         my_m_num = np.zeros((1, 6, 4, 7), dtype=np.float32)
         
-        opp_cat = np.zeros((1, 6, 10), dtype=np.int64)
-        opp_num = np.zeros((1, 6, 12), dtype=np.float32)
+        opp_cat = np.zeros((1, 6, CAT_DIM), dtype=np.int64)
+        opp_num = np.zeros((1, 6, NUM_DIM), dtype=np.float32)
         opp_m_num = np.zeros((1, 6, 4, 7), dtype=np.float32)
         
         field_vec = np.zeros((1, 48), dtype=np.float32)
@@ -273,7 +295,11 @@ class BattleTensorEncoder:
 
         # --- A. 내 팀 6마리 인코딩 ---
         my_team_list = list(battle.team.values())
+        my_team_keys = list(battle.team.keys())
         active_pkmn = getattr(battle, "active_pokemon", None)
+        # poke-env는 요청(request)의 teraType을 읽지 않아 테라 전엔 tera_type이 None → 원본 요청에서 직접 읽음
+        request_tera = {m.get("ident"): m.get("teraType")
+                        for m in ((getattr(battle, "last_request", None) or {}).get("side") or {}).get("pokemon", [])}
 
         for i in range(min(6, len(my_team_list))):
             pkmn = my_team_list[i]
@@ -295,7 +321,6 @@ class BattleTensorEncoder:
             # 수치 슬롯 10: 현재 포켓몬 기믹 활성화 상태 (다이맥스 남은 턴/3.0, 테라스탈 1.0, 메가진화 1.0)
             is_tera = getattr(pkmn, "is_terastallized", False)
             is_dyna = getattr(pkmn, "is_dynamaxed", False)
-            # 다이맥스 남은 턴은 Pokemon이 아니라 Battle에 있음
             dyna_turns = (getattr(battle, "dynamax_turns_left", None) or 3) if is_dyna else 0
 
             clean_species = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "species", "")))
@@ -310,30 +335,83 @@ class BattleTensorEncoder:
 
             my_num[0, i, 10] = gimmick_state
 
-            # 수치 슬롯 11: 트레이너/포켓몬 기믹 발동 가능 여부 (테라스탈/다이맥스/메가진화 중 하나라도 가능하면 1.0)
-            can_tera = getattr(battle, "can_terastallize", False)
+            # 수치 슬롯 11: 트레이너/포켓몬 기믹 발동 가능 여부
+            can_tera = getattr(battle, "can_tera", False)
             can_dyna = getattr(battle, "can_dynamax", False)
             can_mega = getattr(battle, "can_mega_evolve", False) or getattr(battle, "can_z_move", False)
             my_num[0, i, 11] = 1.0 if (can_tera or can_dyna or can_mega) else 0.0
 
-            # 카테고리 ID (Enum 안전 변환)
-            my_cat[0, i, 0] = self.vocab_mgr.get_id("species", getattr(pkmn, "species", None))
-            my_cat[0, i, 1] = self.vocab_mgr.get_id("item", getattr(pkmn, "item", None))
-            my_cat[0, i, 2] = self.vocab_mgr.get_id("ability", getattr(pkmn, "ability", None))
-            my_cat[0, i, 3] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_1", None))
-            my_cat[0, i, 4] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_2", None))
-            my_cat[0, i, 5] = self.vocab_mgr.get_id("status", getattr(pkmn, "status", None))
+            # 카테고리 ID (species_id 슬롯 제거, 인덱스 1씩 시프트)
+            # [0]=item, [1]=ability, [2]=type1, [3]=type2, [4]=status, [5:9]=moves
+            my_cat[0, i, 0] = self.vocab_mgr.get_id("item", getattr(pkmn, "item", None))
+            my_cat[0, i, 1] = self.vocab_mgr.get_id("ability", getattr(pkmn, "ability", None))
+            my_cat[0, i, 2] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_1", None))
+            my_cat[0, i, 3] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_2", None))
+            my_cat[0, i, 4] = self.vocab_mgr.get_id("status", getattr(pkmn, "status", None))
+            my_cat[0, i, 9] = self.vocab_mgr.get_id("type", getattr(pkmn, "tera_type", None) or request_tera.get(my_team_keys[i]))
 
             moves_dict = getattr(pkmn, "moves", {}) or {}
             for m_idx, move in enumerate(moves_dict.values()):
                 if m_idx < 4:
                     move_id = getattr(move, "id", None)
-                    my_cat[0, i, 6 + m_idx] = self.vocab_mgr.get_id("move", move_id)
-                    # 6가지 명시적 수치 및 부가효과 피처 주입
+                    my_cat[0, i, 5 + m_idx] = self.vocab_mgr.get_id("move", move_id)
                     my_m_num[0, i, m_idx, :] = extract_move_features(move)
+
+            # species base_stats 7개 수치화 (my_num 뒤쪽 7 슬롯: 12~18)
+            base_stats = getattr(pkmn, "base_stats", None) or {}
+            hp_val = base_stats.get("hp", 0)
+            atk_val = base_stats.get("atk", 0)
+            def_val = base_stats.get("def", 0)
+            spa_val = base_stats.get("spa", 0)
+            spd_val = base_stats.get("spd", 0)
+            spe_val = base_stats.get("spe", 0)
+            
+            item_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "item", "")))
+            ability_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "ability", "")))
+            
+            if item_str == "choiceband":
+                atk_val *= 1.5
+            elif item_str == "choicespecs":
+                spa_val *= 1.5
+            elif item_str == "choicescarf":
+                spe_val *= 1.5
+            elif item_str == "lifeorb":
+                # 생명의구슬은 기술 위력 1.3배지만, 인공지능 인지를 위해 공/특공 1.3배로 근사치 적용
+                atk_val *= 1.3
+                spa_val *= 1.3
+            elif item_str == "assaultvest":
+                spd_val *= 1.5
+            elif item_str == "eviolite":
+                # 엄밀히는 미진화체 전용이나, 실전 데이터 특성상 장착 시 1.5배로 근사
+                def_val *= 1.5
+                spd_val *= 1.5
+            elif item_str == "boosterenergy" and ability_str in ["protosynthesis", "quarkdrive"]:
+                stats_dict = {"atk": atk_val, "def": def_val, "spa": spa_val, "spd": spd_val, "spe": spe_val}
+                highest = max(stats_dict, key=stats_dict.get)
+                if highest == "spe": spe_val *= 1.5
+                elif highest == "atk": atk_val *= 1.3
+                elif highest == "def": def_val *= 1.3
+                elif highest == "spa": spa_val *= 1.3
+                elif highest == "spd": spd_val *= 1.3
+
+            my_num[0, i, 12] = hp_val / 255.0
+            my_num[0, i, 13] = atk_val / 255.0
+            my_num[0, i, 14] = def_val / 255.0
+            my_num[0, i, 15] = spa_val / 255.0
+            my_num[0, i, 16] = spd_val / 255.0
+            my_num[0, i, 17] = spe_val / 255.0
+            my_num[0, i, 18] = min(1.0, (getattr(pkmn, "weight", 0) or 0) / 500.0)
+
 
         # --- B. 상대 팀 6마리 및 공개된 기술 인코딩 ---
         opp_team_list = list(battle.opponent_team.values()) if hasattr(battle, "opponent_team") else []
+        n_seen = len(opp_team_list)
+        seen_species = [re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", ""))) for p in opp_team_list]
+        for p in getattr(battle, "teampreview_opponent_team", None) or []:
+            sp = re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", "")))
+            # ponytail: 폼 차이(프리뷰 'urshifu' vs 실제 'urshifurapidstrike')는 접두사로만 매칭
+            if sp and not any(s.startswith(sp) or sp.startswith(s) for s in seen_species):
+                opp_team_list.append(p)
         opp_active = getattr(battle, "opponent_active_pokemon", None)
 
         for i in range(min(6, len(opp_team_list))):
@@ -370,19 +448,91 @@ class BattleTensorEncoder:
             opp_num[0, i, 10] = gimmick_state
             opp_num[0, i, 11] = 0.0  # 상대 기믹 가능 여부는 모를 수 있으므로 기본값 0.0
 
-            opp_cat[0, i, 0] = self.vocab_mgr.get_id("species", getattr(pkmn, "species", None))
-            opp_cat[0, i, 1] = self.vocab_mgr.get_id("item", getattr(pkmn, "item", None))
-            opp_cat[0, i, 2] = self.vocab_mgr.get_id("ability", getattr(pkmn, "ability", None))
-            opp_cat[0, i, 3] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_1", None))
-            opp_cat[0, i, 4] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_2", None))
-            opp_cat[0, i, 5] = self.vocab_mgr.get_id("status", getattr(pkmn, "status", None))
+            opp_num[0, i, 22] = 0.0 if i < n_seen else 1.0
 
+            # 정보 추론: 공개 안 된 도구/특성/기술/테라 타입을 세트 사전 확률로 채움
             moves_dict = getattr(pkmn, "moves", {}) or {}
+            item_name = getattr(pkmn, "item", None)
+            ability_name = getattr(pkmn, "ability", None)
+            item_unknown = item_name == "unknown_item"
+            prior = predict_set(getattr(pkmn, "species", ""), list(moves_dict),
+                                None if item_unknown else item_name, ability_name)
+            if prior:
+                if item_unknown and prior["item"]:
+                    item_name = prior["item"]
+                    opp_num[0, i, 19] = 1.0
+                if not ability_name and prior["ability"]:
+                    ability_name = prior["ability"]
+                    opp_num[0, i, 20] = 1.0
+
+            opp_cat[0, i, 0] = self.vocab_mgr.get_id("item", item_name)
+            opp_cat[0, i, 1] = self.vocab_mgr.get_id("ability", ability_name)
+            opp_cat[0, i, 2] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_1", None))
+            opp_cat[0, i, 3] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_2", None))
+            opp_cat[0, i, 4] = self.vocab_mgr.get_id("status", getattr(pkmn, "status", None))
+
             for m_idx, move in enumerate(moves_dict.values()):
                 if m_idx < 4:
                     move_id = getattr(move, "id", None)
-                    opp_cat[0, i, 6 + m_idx] = self.vocab_mgr.get_id("move", move_id)
+                    opp_cat[0, i, 5 + m_idx] = self.vocab_mgr.get_id("move", move_id)
                     opp_m_num[0, i, m_idx, :] = extract_move_features(move)
+
+            if prior:
+                n_rev = min(4, len(moves_dict))
+                guesses = [m for m in (_move_obj(mid) for mid in prior["moves"]) if m is not None][:4 - n_rev]
+                for j, move in enumerate(guesses):
+                    opp_cat[0, i, 5 + n_rev + j] = self.vocab_mgr.get_id("move", move.id)
+                    opp_m_num[0, i, n_rev + j, :] = extract_move_features(move)
+                opp_num[0, i, 21] = len(guesses) / 4.0
+
+            # 테라 타입: 이미 테라스탈했으면 type_1이 곧 테라 타입, 아니면 추론값
+            tera_name = getattr(pkmn, "type_1", None) if is_tera else (prior or {}).get("tera")
+            opp_cat[0, i, 9] = self.vocab_mgr.get_id("type", tera_name)
+
+            # 상대 포켓방 base_stats
+            base_stats = getattr(pkmn, "base_stats", None) or {}
+            hp_val = base_stats.get("hp", 0)
+            atk_val = base_stats.get("atk", 0)
+            def_val = base_stats.get("def", 0)
+            spa_val = base_stats.get("spa", 0)
+            spd_val = base_stats.get("spd", 0)
+            spe_val = base_stats.get("spe", 0)
+            
+            item_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(item_name or ""))
+            ability_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(ability_name or ""))
+            
+            if item_str == "choiceband":
+                atk_val *= 1.5
+            elif item_str == "choicespecs":
+                spa_val *= 1.5
+            elif item_str == "choicescarf":
+                spe_val *= 1.5
+            elif item_str == "lifeorb":
+                # 생명의구슬은 기술 위력 1.3배지만, 인공지능 인지를 위해 공/특공 1.3배로 근사치 적용
+                atk_val *= 1.3
+                spa_val *= 1.3
+            elif item_str == "assaultvest":
+                spd_val *= 1.5
+            elif item_str == "eviolite":
+                # 엄밀히는 미진화체 전용이나, 실전 데이터 특성상 장착 시 1.5배로 근사
+                def_val *= 1.5
+                spd_val *= 1.5
+            elif item_str == "boosterenergy" and ability_str in ["protosynthesis", "quarkdrive"]:
+                stats_dict = {"atk": atk_val, "def": def_val, "spa": spa_val, "spd": spd_val, "spe": spe_val}
+                highest = max(stats_dict, key=stats_dict.get)
+                if highest == "spe": spe_val *= 1.5
+                elif highest == "atk": atk_val *= 1.3
+                elif highest == "def": def_val *= 1.3
+                elif highest == "spa": spa_val *= 1.3
+                elif highest == "spd": spd_val *= 1.3
+
+            opp_num[0, i, 12] = hp_val / 255.0
+            opp_num[0, i, 13] = atk_val / 255.0
+            opp_num[0, i, 14] = def_val / 255.0
+            opp_num[0, i, 15] = spa_val / 255.0
+            opp_num[0, i, 16] = spd_val / 255.0
+            opp_num[0, i, 17] = spe_val / 255.0
+            opp_num[0, i, 18] = min(1.0, (getattr(pkmn, "weight", 0) or 0) / 500.0)
 
         # --- C. 필드, 날씨, 룸 & 내/상대 사이드 조건(벽, 장판, 순풍) 48D 정밀 인코딩 ---
         # C.1 현재 턴 수 정규화 (50턴 기준 - 인덱스 47)
@@ -461,7 +611,8 @@ class BattleTensorEncoder:
         if active_pkmn and hasattr(battle, "available_moves"):
             active_moves = list(getattr(active_pkmn, "moves", {}).values())
             avail_move_ids = [getattr(m, "id", None) for m in getattr(battle, "available_moves", [])]
-            # 4~7번 = 해당 기술을 Z기술로 사용 (메가/다이맥스는 player가 규칙으로 자동 발동)
+            # 4~7번 = 해당 기술을 Z기술(7세대) 또는 테라스탈(9세대)과 함께 사용 (메가/다이맥스는 player가 규칙으로 자동 발동)
+            can_tera = getattr(battle, "can_tera", False)
             z_ids = set()
             if getattr(battle, "can_z_move", False):
                 z_ids = {getattr(m, "id", None) for m in (getattr(active_pkmn, "available_z_moves", None) or [])}
@@ -506,7 +657,7 @@ class BattleTensorEncoder:
 
                     if is_valid:
                         action_mask[0, m_idx] = True
-                        if mv_id in z_ids:
+                        if mv_id in z_ids or can_tera:
                             action_mask[0, 4 + m_idx] = True
 
         if hasattr(battle, "available_switches"):
@@ -608,7 +759,7 @@ class DummyBattle:
 def main():
     print("🧪 [Fix 검증] Enum 객체, Weather/TrickRoom 남은 턴 수, <unk> 미지 포켓몬 테스트 시작...")
     
-    encoder = BattleTensorEncoder(vocab_path="vocab.json")
+    encoder = BattleTensorEncoder(vocab_path="data/vocab.json")
     mock_battle = DummyBattle()
     
     tensors = encoder.encode_battle(mock_battle)

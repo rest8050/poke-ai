@@ -1,10 +1,19 @@
+import sys
+import os
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+while _current_dir != os.path.dirname(_current_dir):
+    if os.path.exists(os.path.join(_current_dir, "data", "vocab.json")):
+        if _current_dir not in sys.path:
+            sys.path.insert(0, _current_dir)
+        break
+    _current_dir = os.path.dirname(_current_dir)
 import asyncio
 import torch
 import warnings
 from poke_env.player import Player
 from poke_env import LocalhostServerConfiguration
-from train_ppo import PPOCollectingPlayer
-from model import DeepPokemonBattleTransformerNet
+from src.training.train_ppo import PPOCollectingPlayer
+from src.core.model import DeepPokemonBattleTransformerNet
 
 from poke_env import AccountConfiguration
 
@@ -16,7 +25,7 @@ async def main():
     
     # 모델 로드
     model = DeepPokemonBattleTransformerNet()
-    model.load_state_dict(torch.load("deep_checkpoint_ppo.pt", map_location=device))
+    model.load_state_dict(torch.load("checkpoints/deep_checkpoint_ppo.pt", map_location=device))
     model.to(device)
     model.eval() # 빡겜 모드(평가 모드) 고정
 

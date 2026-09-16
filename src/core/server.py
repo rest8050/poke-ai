@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Any
 import torch
 import numpy as np
 
-from model import DeepPokemonBattleTransformerNet
+from src.core.model import DeepPokemonBattleTransformerNet
 
 app = FastAPI(
     title="PokeAI Inference Server for Minecraft RCT Mod",

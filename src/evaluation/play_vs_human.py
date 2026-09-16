@@ -1,19 +1,28 @@
+import sys
+import os
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+while _current_dir != os.path.dirname(_current_dir):
+    if os.path.exists(os.path.join(_current_dir, "data", "vocab.json")):
+        if _current_dir not in sys.path:
+            sys.path.insert(0, _current_dir)
+        break
+    _current_dir = os.path.dirname(_current_dir)
 import asyncio
 import torch
 from poke_env import LocalhostServerConfiguration
 from poke_env.ps_client.account_configuration import AccountConfiguration
-from player import SmartPokemonPlayer
-from model import DeepPokemonBattleTransformerNet
+from src.core.player import SmartPokemonPlayer
+from src.core.model import DeepPokemonBattleTransformerNet
 
 async def main():
     print("🤖 AI 모델 불러오는 중...")
     model = DeepPokemonBattleTransformerNet()
     
     try:
-        model.load_state_dict(torch.load("deep_checkpoint_ppo.pt", map_location="cpu", weights_only=True))
+        model.load_state_dict(torch.load("checkpoints/deep_checkpoint_ppo.pt", map_location="cpu", weights_only=True))
         print("✅ 학습된 PPO 모델 가중치 로드 완료!")
     except FileNotFoundError:
-        print("⚠️ 'deep_checkpoint_ppo.pt'를 찾을 수 없어 갓 태어난 AI로 진행합니다.")
+        print("⚠️ 'checkpoints/deep_checkpoint_ppo.pt'를 찾을 수 없어 갓 태어난 AI로 진행합니다.")
 
     model.eval()
 

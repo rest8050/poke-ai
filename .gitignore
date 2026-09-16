@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+logs/
+# 학습 중 계속 덮어쓰는 체크포인트는 제외, 기준선은 git add -f 로 따로 고정
+checkpoints/*.pt
