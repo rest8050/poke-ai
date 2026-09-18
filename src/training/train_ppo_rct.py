@@ -26,13 +26,16 @@ from src.core.rct_player import RCTBattleAIPlayer
 from src.core.player import SmartPokemonPlayer
 from src.core.model import DeepPokemonBattleTransformerNet, load_compatible
 from src.core.search import search_pick
+from src.core.battle_eval import potential
 
 # 수집(워커)은 CPU, 학습(메인)은 GPU
 ROLLOUT_DEVICE = torch.device("cpu")
 LEARN_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATTLE_FORMAT = "gen9ou"
-TEAM_POOL_PATH = "data/team_pool.json"
+TEAM_POOL_PATH = "data/team_pool_metamon.json"  # Metamon 학습 풀 (평가 전용 _holdout.json은 학습에 쓰지 말 것)
 TARGET_KL = 0.015
+# 신용 할당 거리: GAE 실질 지평 ≈ 1/(1-γλ) → 0.99/0.95 약 17턴, 0.995/0.97 약 29턴
+GAMMA, GAE_LAMBDA = 0.995, 0.97
 LR_MIN, LR_MAX = 1e-6, 3e-4
 
 
@@ -57,8 +60,8 @@ class RandomPoolTeambuilder(Teambuilder):
 
 OPPONENTS = {"rct": RCTBattleAIPlayer, "heuristic": SimpleHeuristicsPlayer, "random": RandomPlayer}
 
-TENSOR_KEYS = ["my_team_cat", "my_team_num", "my_move_num", "opp_team_cat", "opp_team_num", "opp_move_num",
-               "field_vec", "action_mask", "history_in", "log_prob", "value", "advantage", "return"]
+OBS_KEYS = ["my_team_cat", "my_team_num", "my_move_num", "opp_team_cat", "opp_team_num", "opp_move_num", "field_vec"]
+TENSOR_KEYS = OBS_KEYS + ["action_mask", "log_prob", "value", "advantage", "return"]
 
 
 class PPOCollectingPlayer(SmartPokemonPlayer):
@@ -74,30 +77,17 @@ class PPOCollectingPlayer(SmartPokemonPlayer):
         self.history.clear()
         self.battles.clear()
 
-    def compute_dense_reward(self, battle):
-        if not hasattr(battle, "team") or not battle.team:
-            return 0.0
-
-        my_fainted = sum(1 for mon in battle.team.values() if mon.fainted)
-        opp_fainted = sum(1 for mon in battle.opponent_team.values() if mon.fainted)
-
-        my_hp = sum(mon.current_hp_fraction for mon in battle.team.values())
-        revealed_opp = len(battle.opponent_team)
-        unrevealed_opp = 6 - revealed_opp
-        opp_hp = sum(mon.current_hp_fraction for mon in battle.opponent_team.values()) + unrevealed_opp
-
-        return ((my_hp - opp_hp) + (opp_fainted * 2.0 - my_fainted * 2.0)) * 0.1
-
     def choose_move(self, battle):
         tag = battle.battle_tag
-        current_score = self.compute_dense_reward(battle)
+        current_score = potential(battle)  # Foul Play식 국면 평가 Φ(s)
 
         if not self.is_eval:
             if tag not in self.trajectories:
                 self.trajectories[tag] = []
             else:
+                # 잠재 함수 보상: γ·Φ(s') - Φ(s) (최적 정책 불변, 신용 할당만 가속)
                 last_score = self.last_state_scores.get(tag, 0.0)
-                step_reward = current_score - last_score
+                step_reward = GAMMA * current_score - last_score
                 if len(self.trajectories[tag]) > 0:
                     self.trajectories[tag][-1]["reward"] = self.trajectories[tag][-1].get("reward", 0.0) + step_reward
 
@@ -144,7 +134,6 @@ class PPOCollectingPlayer(SmartPokemonPlayer):
                 "opp_move_num": opp_m_num.squeeze(0),
                 "field_vec": field_vec.squeeze(0),
                 "action_mask": action_mask.squeeze(0),
-                "history_in": history.squeeze(0).detach() if history is not None else torch.zeros(256, device=ROLLOUT_DEVICE),
                 "action": action_idx,
                 "log_prob": log_prob.squeeze(0),
                 "value": val.squeeze(0),
@@ -153,7 +142,7 @@ class PPOCollectingPlayer(SmartPokemonPlayer):
 
         return self.order_for(battle, action_idx) or self.choose_random_move(battle)
 
-def compute_gae(trajectory, final_reward, gamma=0.99, lam=0.95):
+def compute_gae(trajectory, final_reward, gamma=GAMMA, lam=GAE_LAMBDA):
     values = [step["value"] for step in trajectory]
     values.append(torch.tensor([0.0], device=ROLLOUT_DEVICE))
 
@@ -182,6 +171,9 @@ def _pack_steps(steps):
     out = {k: torch.stack([s[k] for s in steps]).numpy() for k in TENSOR_KEYS}
     out["action"] = np.array([s["action"] for s in steps], dtype=np.int64)
     out["opp_move_label"] = np.array([s["opp_move_label"] for s in steps], dtype=np.int64)
+    # 히스토리 트랜스포머 학습용: 어느 배틀의 몇 번째 턴인지 (배틀별로 연속, 턴 순서대로 쌓임)
+    out["seq_id"] = np.array([s["seq_id"] for s in steps], dtype=np.int64)
+    out["seq_pos"] = np.array([s["seq_pos"] for s in steps], dtype=np.int64)
     return out
 
 
@@ -222,14 +214,17 @@ async def _worker_loop(wid, kind, cmd_q, out_q, max_concurrent, team_pool, eval_
         finished = sum(1 for b in ai_player.battles.values() if b.finished)
         steps = []
         if not is_eval:
-            for battle_tag, trajectory in ai_player.trajectories.items():
+            for seq_id, (battle_tag, trajectory) in enumerate(ai_player.trajectories.items()):
                 battle_obj = ai_player.battles.get(battle_tag)
                 if not trajectory or not battle_obj or battle_obj.won is None:
                     continue
-                advantages = compute_gae(trajectory, 1.0 if battle_obj.won else -1.0)
+                # 종료 상태 Φ=0 → 마지막 스텝에 -Φ(마지막 관측 상태)를 더해 잠재 함수 형태를 닫음
+                final_reward = (1.0 if battle_obj.won else -1.0) - ai_player.last_state_scores.get(battle_tag, 0.0)
+                advantages = compute_gae(trajectory, final_reward)
                 for t, step in enumerate(trajectory):
                     step["advantage"] = advantages[t].detach()
                     step["return"] = (advantages[t] + step["value"]).detach()
+                    step["seq_id"], step["seq_pos"] = seq_id, t
                     steps.append(step)
         out_q.put((wid, wins, finished, _pack_steps(steps), "rct" if is_eval else kind))
 
@@ -295,6 +290,10 @@ def merge_buffers(results):
     parts = [r[3] for r in results if r[3] is not None]
     if not parts:
         return None
+    offset = 0
+    for part in parts:  # 워커마다 0부터 매긴 배틀 번호를 전역으로 겹치지 않게
+        part["seq_id"] = part["seq_id"] + offset
+        offset = int(part["seq_id"].max()) + 1
     return {k: torch.from_numpy(np.concatenate([p[k] for p in parts])).to(LEARN_DEVICE) for k in parts[0]}
 
 
@@ -305,16 +304,29 @@ def ppo_update(model, optimizer, buf, batch_size, ppo_epochs):
     entropy_coef = 0.008
     aux_coef = 0.0
     n = buf["action"].shape[0]
+    # 배틀 단위 구간: 한 배틀의 턴은 버퍼에서 연속, 턴 순서대로 (히스토리 트랜스포머가 배틀 전체를 봐야 함)
+    seq = buf["seq_id"]
+    starts = torch.nonzero(torch.cat([seq.new_ones(1, dtype=torch.bool), seq[1:] != seq[:-1]])).flatten().tolist()
+    ends = starts[1:] + [n]
+    n_seq = len(starts)
 
     for epoch in range(ppo_epochs):
         model.eval()
-        perm = torch.randperm(n, device=LEARN_DEVICE)
+        order = torch.randperm(n_seq).tolist()
         epoch_policy_loss = epoch_value_loss = epoch_entropy = 0.0
         epoch_approx_kl = epoch_clip_frac = 0.0
         batch_count = 0
 
-        for i in range(0, n, batch_size):
-            idx = perm[i:i + batch_size]
+        i = 0
+        while i < n_seq:
+            # 턴 수가 batch_size에 찰 때까지 배틀을 통째로 묶음
+            chosen, count = [], 0
+            while i < n_seq and count < batch_size:
+                chosen.append(order[i])
+                count += ends[order[i]] - starts[order[i]]
+                i += 1
+            idx = torch.cat([torch.arange(starts[c], ends[c], device=LEARN_DEVICE) for c in chosen])
+            local_seq = torch.cat([torch.full((ends[c] - starts[c],), j, device=LEARN_DEVICE) for j, c in enumerate(chosen)])
             if len(idx) < 4:
                 continue
             b = {k: v[idx] for k, v in buf.items()}
@@ -323,11 +335,8 @@ def ppo_update(model, optimizer, buf, batch_size, ppo_epochs):
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             returns = b["return"].view(-1, 1)
 
-            outputs = model(
-                b["my_team_cat"], b["my_team_num"], b["my_move_num"],
-                b["opp_team_cat"], b["opp_team_num"], b["opp_move_num"],
-                b["field_vec"], history_state=b["history_in"], action_mask=b["action_mask"]
-            )
+            outputs = model.forward_sequences([b[k] for k in OBS_KEYS], local_seq, b["seq_pos"],
+                                              len(chosen), action_mask=b["action_mask"])
 
             dist = torch.distributions.Categorical(logits=outputs["policy_logits"])
             new_log_probs = dist.log_prob(b["action"])

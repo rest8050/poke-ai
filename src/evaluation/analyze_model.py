@@ -7,6 +7,7 @@
 사용 예:
   python src/evaluation/analyze_model.py --battles 200 --opponent rct
   python src/evaluation/analyze_model.py --mode argmax --search 0.5 --replays
+  python src/evaluation/analyze_model.py --pool data/team_pool.json   # 기본은 Metamon 평가 전용 500팀
 
 출력: logs/analysis_<시각>/
   turns.jsonl    턴별 결정 로그
@@ -224,8 +225,8 @@ async def main(args):
     model.eval()
     print(f"✅ {args.ckpt} 로드 (확장 {expanded}, 버림 {skipped})")
 
-    pool = load_team_pool()
-    pool_data = json.load(open("data/team_pool.json", encoding="utf-8-sig"))["teams"]
+    pool = load_team_pool(args.pool)
+    pool_data = json.load(open(args.pool, encoding="utf-8-sig"))["teams"]
     pool_names = {team_species(m.species or m.nickname for m in Teambuilder.parse_showdown_team(t["export"])): t["name"]
                   for t in pool_data}
 
@@ -276,7 +277,7 @@ async def main(args):
                 ft.write(json.dumps(t, ensure_ascii=False) + "\n")
 
     summary = summarize(battles, turns)
-    summary.update(opponent=args.opponent, mode=args.mode, search=args.search, ckpt=args.ckpt)
+    summary.update(opponent=args.opponent, mode=args.mode, search=args.search, ckpt=args.ckpt, pool=args.pool)
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -294,4 +295,6 @@ if __name__ == "__main__":
     ap.add_argument("--concurrent", type=int, default=8)
     ap.add_argument("--replays", action="store_true", help="Showdown HTML 리플레이도 저장")
     ap.add_argument("--out", default="logs")
+    ap.add_argument("--pool", default="data/team_pool_metamon_holdout.json",
+                    help="양쪽 팀을 뽑을 팀 풀 JSON (기존 24팀: data/team_pool.json)")
     asyncio.run(main(ap.parse_args()))

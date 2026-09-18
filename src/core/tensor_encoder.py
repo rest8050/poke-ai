@@ -187,6 +187,159 @@ def layers(val: Any, max_layers: float) -> float:
     return 1.0 / max_layers
 
 
+# 기술 부가효과 벡터 (기대값 = 확률 × 효과량, 대략 -1~1)
+MOVE_EFFECT_NAMES = [
+    "drain", "recoil", "extra_hits", "crit_stage", "fixed_damage",                       # 0-4 데미지 보정
+    "tgt_brn", "tgt_par", "tgt_psn", "tgt_slp", "tgt_frz", "tgt_flinch", "tgt_confusion",   # 5-11 상대 상태이상
+    "tgt_offense", "tgt_defense", "tgt_speed",                                               # 12-14 상대 랭크
+    "self_offense", "self_defense", "self_speed",                                            # 15-17 자기 랭크
+    "heal", "self_switch", "force_switch",                                                   # 18-20 회복/템포
+    "hazard_set", "hazard_removal", "screen", "trick_room", "weather_terrain_tailwind",      # 21-25 필드
+    "protect", "disrupt", "residual_on_target", "substitute", "item_manipulation",           # 26-30 방해/유틸
+    "alt_offense_stat", "ignore_target_boosts", "self_sacrifice", "charge_or_recharge", "contact",  # 31-35
+]
+MOVE_EFFECT_DIM = len(MOVE_EFFECT_NAMES)
+MOVE_NUM_DIM = 8 + MOVE_EFFECT_DIM  # 기본 수치 7 + 상대 액티브 배율 1 + 부가효과
+
+# Showdown 데이터에 필드가 없고 코드로만 구현된 효과 (poke-engine choice_effects.rs 와 같은 방식으로 목록 보완)
+_HAZARD_SET_EXTRA = {"ceaselessedge", "stoneaxe"}
+_HAZARD_REMOVAL = {"rapidspin", "defog", "mortalspin", "tidyup", "courtchange"}
+_ITEM_MANIPULATION = {"knockoff", "trick", "switcheroo", "thief", "covet", "bugbite", "pluck", "incinerate", "corrosivegas"}
+_DISRUPT = {"taunt", "encore", "disable", "torment", "healblock", "imprison", "throatchop"}
+_RESIDUAL = {"leechseed", "saltcure", "partiallytrapped", "nightmare"}
+_HAZARDS = {"stealthrock", "spikes", "toxicspikes", "stickyweb"}
+_SCREENS = {"reflect", "lightscreen", "auroraveil"}
+_SELF_TARGETS = {"self", "adjacentallyorself", "allies", "allyside", "allyteam"}
+# 회복량이 날씨/상대 능력치에 따라 달라져 데이터 필드가 비어 있는 회복기 (기본값으로 근사)
+_HEAL_EXTRA = {"rest": 1.0, "moonlight": 0.5, "synthesis": 0.5, "morningsun": 0.5, "shoreup": 0.5,
+               "strengthsap": 0.5, "painsplit": 0.5, "junglehealing": 0.25, "lunarblessing": 0.25}
+# 코드로 구현된 자기 랭크 변화 (저주는 고스트 타입이 아닐 때 기준)
+_SELF_BOOST_EXTRA = {"curse": {"atk": 1, "def": 1, "spe": -1}, "bellydrum": {"atk": 6},
+                     "takeheart": {"spa": 1, "spd": 1}, "stockpile": {"def": 1, "spd": 1}}
+# ponytail: 흑안개, 길동무, 치유방울, 멸망의노래, 검은눈빛/블록(교체 봉쇄), 변신, 잠꼬대는 벡터에 표현 안 됨 → ID 임베딩에 의존
+_STATUS_SLOT = {"brn": 5, "par": 6, "psn": 7, "tox": 7, "slp": 8, "frz": 9}
+
+
+def _norm_id(x: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", extract_enum_str(x))
+
+
+def _add_boosts(vec: List[float], boosts: Optional[Dict[str, int]], chance: float, base: int) -> None:
+    """랭크 변화 기대값을 공격계/방어계/스피드 3칸에 누적 (2랭크 = 1.0)"""
+    for stat, stage in (boosts or {}).items():
+        slot = {"atk": 0, "spa": 0, "def": 1, "spd": 1, "spe": 2}.get(stat)
+        if slot is not None:
+            vec[base + slot] += stage * chance / 2.0
+
+
+@lru_cache(maxsize=4096)
+def move_effect_features(move_id: str) -> Tuple[float, ...]:
+    """기술 id → 부가효과 벡터 (MOVE_EFFECT_NAMES 순서). 모르는 기술은 0벡터"""
+    vec = [0.0] * MOVE_EFFECT_DIM
+    move = _move_obj(move_id)
+    if move is None:
+        return tuple(vec)
+    mid = move.id
+    self_target = _norm_id(getattr(move, "target", "")) in _SELF_TARGETS
+
+    vec[0] = float(getattr(move, "drain", 0) or 0)
+    vec[1] = float(getattr(move, "recoil", 0) or 0)
+    vec[2] = min(1.0, max(0.0, float(getattr(move, "expected_hits", 1) or 1) - 1) / 4.0)  # 추가 타격 수 (단타=0, 5타=1)
+    vec[3] = min(1.0, max(0, (getattr(move, "crit_ratio", 0) or 0) - 1) / 2.0)
+    vec[4] = 1.0 if getattr(move, "damage", None) else 0.0
+
+    # 기술 자체 효과 (변화기: 도깨비불, 칼춤, 차밍보이스 등)
+    status = _norm_id(getattr(move, "status", None))
+    if status in _STATUS_SLOT and not self_target:
+        vec[_STATUS_SLOT[status]] += 1.0
+    _add_boosts(vec, getattr(move, "boosts", None), 1.0, 15 if self_target else 12)
+    _add_boosts(vec, getattr(move, "self_boost", None), 1.0, 15)
+    _add_boosts(vec, _SELF_BOOST_EXTRA.get(mid), 1.0, 15)
+    volatile = _norm_id(getattr(move, "volatile_status", None))
+    if volatile == "yawn":
+        vec[8] += 1.0  # ponytail: 하품은 다음 턴 수면이라 수면 확률 1로 근사
+    if volatile == "confusion" and not self_target:
+        vec[11] += 1.0
+
+    # 확률 부가효과 (열탕 화상 30%, 문포스 특공 -1 30%, 고속스핀 자기 스피드 +1 등)
+    secondary = getattr(move, "secondary", None) or []
+    for sec in secondary:
+        chance = (sec.get("chance") or 100) / 100.0
+        sec_status = _norm_id(sec.get("status"))
+        if sec_status in _STATUS_SLOT:
+            vec[_STATUS_SLOT[sec_status]] += chance
+        sec_volatile = _norm_id(sec.get("volatileStatus"))
+        if sec_volatile == "flinch":
+            vec[10] += chance
+        elif sec_volatile == "confusion":
+            vec[11] += chance
+        _add_boosts(vec, sec.get("boosts"), chance, 12)
+        _add_boosts(vec, (sec.get("self") or {}).get("boosts"), chance, 15)
+
+    heal = float(getattr(move, "heal", 0) or 0)
+    if _norm_id(getattr(move, "slot_condition", None)) == "wish":
+        heal = 0.5
+    vec[18] = _HEAL_EXTRA.get(mid, heal)
+    vec[19] = 1.0 if getattr(move, "self_switch", None) else 0.0
+    vec[20] = 1.0 if getattr(move, "force_switch", False) else 0.0
+
+    side = _norm_id(getattr(move, "side_condition", None))
+    vec[21] = 1.0 if side in _HAZARDS or mid in _HAZARD_SET_EXTRA else 0.0
+    vec[22] = 1.0 if mid in _HAZARD_REMOVAL else 0.0
+    vec[23] = 1.0 if side in _SCREENS else 0.0
+    pseudo = _norm_id(getattr(move, "pseudo_weather", None))
+    vec[24] = 1.0 if pseudo == "trickroom" else 0.0
+    vec[25] = 1.0 if (getattr(move, "weather", None) or getattr(move, "terrain", None)
+                      or side == "tailwind" or (pseudo and pseudo != "trickroom")) else 0.0
+
+    vec[26] = 1.0 if getattr(move, "is_protect_move", False) or getattr(move, "stalling_move", False) else 0.0
+    secondary_volatiles = {_norm_id(s.get("volatileStatus")) for s in secondary}
+    vec[27] = 1.0 if (volatile in _DISRUPT or secondary_volatiles & _DISRUPT) and not self_target else 0.0
+    vec[28] = 1.0 if (volatile in _RESIDUAL or secondary_volatiles & _RESIDUAL) and not self_target else 0.0
+    vec[29] = 1.0 if volatile == "substitute" else 0.0
+    vec[30] = 1.0 if mid in _ITEM_MANIPULATION else 0.0
+
+    entry = getattr(move, "entry", {}) or {}
+    vec[31] = 1.0 if entry.get("overrideOffensiveStat") or getattr(move, "use_target_offensive", False) else 0.0
+    vec[32] = 1.0 if getattr(move, "ignore_defensive", False) else 0.0
+    vec[33] = 1.0 if getattr(move, "self_destruct", None) else 0.0
+    flags = getattr(move, "flags", None) or set()
+    vec[34] = 1.0 if "charge" in flags or "recharge" in flags else 0.0
+    vec[35] = 1.0 if "contact" in flags else 0.0
+
+    for i in range(5, 12):
+        vec[i] = min(1.0, vec[i])
+    for i in range(12, 18):
+        vec[i] = max(-1.0, min(1.0, vec[i]))
+    return tuple(vec)
+
+
+def defender_ability(mon: Any) -> Optional[str]:
+    """상성 판단용 방어측 특성: 공개/후보 1개면 그 값, 아니면 세트 추론값"""
+    from src.core.rct_player import ability as known_ability
+    ab = known_ability(mon)
+    if ab:
+        return ab
+    item = getattr(mon, "item", None)
+    prior = predict_set(getattr(mon, "species", ""), list(getattr(mon, "moves", {}) or {}),
+                        None if item == "unknown_item" else item, None)
+    return (prior or {}).get("ability") or ""
+
+
+def move_effectiveness(battle: Any, move: Any, defender: Any, def_ability: Optional[str]) -> float:
+    """
+    기술이 방어측에게 실제로 들어가는 배율 / 4 (0=무효, 0.25=등배, 1=4배)
+    타입(테라 후 타입 포함), 특성 면역(저수/부유 등), 풍선, 중력, 불가사의부적 반영.
+    변화기와 방어측 없음은 등배(0.25)로 둠 — 무효와 구분은 분류 피처가 함.
+    ponytail: 공격측 틀깨기, 프리즈드라이/플라잉프레스 같은 특수 상성은 미반영
+    """
+    if defender is None or not (getattr(move, "base_power", 0) or 0):
+        return 0.25
+    from src.core.rct_player import eff_move
+    move_type = extract_enum_str(getattr(move, "type", None))
+    return min(4.0, eff_move(battle, move_type, defender, def_ability)) / 4.0
+
+
 def extract_move_features(move: Any) -> Tuple[float, float, float, float, float, float, float]:
     """
     기술(Move) 객체에서 7가지 명시적 수치 및 부가효과 피처 추출:
@@ -281,11 +434,11 @@ class BattleTensorEncoder:
         """
         my_cat = np.zeros((1, 6, CAT_DIM), dtype=np.int64)
         my_num = np.zeros((1, 6, NUM_DIM), dtype=np.float32)
-        my_m_num = np.zeros((1, 6, 4, 7), dtype=np.float32)
+        my_m_num = np.zeros((1, 6, 4, MOVE_NUM_DIM), dtype=np.float32)
         
         opp_cat = np.zeros((1, 6, CAT_DIM), dtype=np.int64)
         opp_num = np.zeros((1, 6, NUM_DIM), dtype=np.float32)
-        opp_m_num = np.zeros((1, 6, 4, 7), dtype=np.float32)
+        opp_m_num = np.zeros((1, 6, 4, MOVE_NUM_DIM), dtype=np.float32)
         
         field_vec = np.zeros((1, 48), dtype=np.float32)
         action_mask = np.zeros((1, 22), dtype=bool)
@@ -297,6 +450,9 @@ class BattleTensorEncoder:
         my_team_list = list(battle.team.values())
         my_team_keys = list(battle.team.keys())
         active_pkmn = getattr(battle, "active_pokemon", None)
+        opp_active_mon = getattr(battle, "opponent_active_pokemon", None)
+        opp_active_ability = defender_ability(opp_active_mon) if opp_active_mon else None
+        my_active_ability = extract_enum_str(getattr(active_pkmn, "ability", None)) if active_pkmn else None
         # poke-env는 요청(request)의 teraType을 읽지 않아 테라 전엔 tera_type이 None → 원본 요청에서 직접 읽음
         request_tera = {m.get("ident"): m.get("teraType")
                         for m in ((getattr(battle, "last_request", None) or {}).get("side") or {}).get("pokemon", [])}
@@ -355,7 +511,9 @@ class BattleTensorEncoder:
                 if m_idx < 4:
                     move_id = getattr(move, "id", None)
                     my_cat[0, i, 5 + m_idx] = self.vocab_mgr.get_id("move", move_id)
-                    my_m_num[0, i, m_idx, :] = extract_move_features(move)
+                    my_m_num[0, i, m_idx, :7] = extract_move_features(move)
+                    my_m_num[0, i, m_idx, 7] = move_effectiveness(battle, move, opp_active_mon, opp_active_ability)
+                    my_m_num[0, i, m_idx, 8:] = move_effect_features(move_id)
 
             # species base_stats 7개 수치화 (my_num 뒤쪽 7 슬롯: 12~18)
             base_stats = getattr(pkmn, "base_stats", None) or {}
@@ -475,14 +633,18 @@ class BattleTensorEncoder:
                 if m_idx < 4:
                     move_id = getattr(move, "id", None)
                     opp_cat[0, i, 5 + m_idx] = self.vocab_mgr.get_id("move", move_id)
-                    opp_m_num[0, i, m_idx, :] = extract_move_features(move)
+                    opp_m_num[0, i, m_idx, :7] = extract_move_features(move)
+                    opp_m_num[0, i, m_idx, 7] = move_effectiveness(battle, move, active_pkmn, my_active_ability)
+                    opp_m_num[0, i, m_idx, 8:] = move_effect_features(move_id)
 
             if prior:
                 n_rev = min(4, len(moves_dict))
                 guesses = [m for m in (_move_obj(mid) for mid in prior["moves"]) if m is not None][:4 - n_rev]
                 for j, move in enumerate(guesses):
                     opp_cat[0, i, 5 + n_rev + j] = self.vocab_mgr.get_id("move", move.id)
-                    opp_m_num[0, i, n_rev + j, :] = extract_move_features(move)
+                    opp_m_num[0, i, n_rev + j, :7] = extract_move_features(move)
+                    opp_m_num[0, i, n_rev + j, 7] = move_effectiveness(battle, move, active_pkmn, my_active_ability)
+                    opp_m_num[0, i, n_rev + j, 8:] = move_effect_features(move.id)
                 opp_num[0, i, 21] = len(guesses) / 4.0
 
             # 테라 타입: 이미 테라스탈했으면 type_1이 곧 테라 타입, 아니면 추론값

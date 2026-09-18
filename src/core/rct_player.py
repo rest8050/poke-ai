@@ -164,8 +164,9 @@ def raised(battle, mon):
     return has_eff(mon, "magnetrise") or has_eff(mon, "telekinesis")
 
 
-def eff_single(battle, atk_type, def_type, defender):
-    ab = ability(defender)
+def eff_single(battle, atk_type, def_type, defender, ab=None):
+    """ab: 방어측 특성을 직접 지정 (미공개 특성을 추론값으로 판단할 때). None이면 공개 정보 사용"""
+    ab = ab if ab is not None else ability(defender)
     if atk_type == "water" and ab in ("stormdrain", "waterabsorb", "dryskin"):
         return 0
     if atk_type == "electric" and ab in ("voltabsorb", "lightningrod", "motordrive"):
@@ -182,9 +183,9 @@ def eff_single(battle, atk_type, def_type, defender):
     return CHART.get(def_type, {}).get(atk_type, 1.0)
 
 
-def eff_move(battle, move_type, defender):
-    e = math.prod(eff_single(battle, move_type, dt, defender) for dt in types(defender))
-    return 0 if e < 2.0 and ability(defender) == "wonderguard" else e
+def eff_move(battle, move_type, defender, ab=None):
+    e = math.prod(eff_single(battle, move_type, dt, defender, ab) for dt in types(defender))
+    return 0 if e < 2.0 and (ab if ab is not None else ability(defender)) == "wonderguard" else e
 
 
 def eff_mons(battle, attacker, defender, avg=False):

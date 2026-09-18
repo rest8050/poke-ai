@@ -57,9 +57,11 @@ def load_compatible(model: nn.Module, state: dict):
 
 class MoveEncoderBlock(nn.Module):
     """
-    기술 임베딩(48d)과 기술 수치 데이터(위력, 명중률, PP비율, 우선도, 물리/특수/변화 분류, 부가효과, 기술타입 - 7d)를 정밀 결합하는 인코더 (GELU)
+    기술 임베딩(48d)과 기술 수치 데이터를 결합하는 인코더 (GELU)
+    수치 44d: 위력, 명중률, PP비율, 우선도, 분류, 부가효과(구), 기술타입, 상대 액티브에게 실제 배율,
+             + 부가효과 벡터 36칸 (tensor_encoder.MOVE_EFFECT_NAMES). 새 피처는 항상 끝에 추가.
     """
-    def __init__(self, move_dim: int = 48, move_num_dim: int = 7):
+    def __init__(self, move_dim: int = 48, move_num_dim: int = 44):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(move_dim + move_num_dim, 64),
@@ -68,11 +70,14 @@ class MoveEncoderBlock(nn.Module):
         )
 
     def forward(self, move_embs, move_numerics):
-        # move_embs: [B, 4, 48], move_numerics: [B, 4, 7]
-        combined = torch.cat([move_embs, move_numerics], dim=-1) # [B, 4, 55]
+        # move_embs: [B, 4, 48], move_numerics: [B, 4, 44]
+        combined = torch.cat([move_embs, move_numerics], dim=-1) # [B, 4, 92]
         out = self.fc(combined) # [B, 4, 48]
         return out
 
+
+# 히스토리 트랜스포머의 턴 위치 임베딩 크기 (그 이상 긴 배틀은 마지막 위치로 고정)
+MAX_TURNS = 256
 
 # 스탯 기반 종(Species) 인코딩 차원
 SPECIES_STAT_DIM = 7  # hp, atk, def, spa, spd, spe, weight (각 정규화)
@@ -116,7 +121,7 @@ class PokemonEmbeddingLayer(nn.Module):
         """
         species_stats: [B, 7] float (hp/255, atk/255, def/255, spa/255, spd/255, spe/255, weight/500)
         move_ids: [B, 4]
-        move_numerics: [B, 4, 7]
+        move_numerics: [B, 4, 44]
         """
         sp_emb = self.species_proj(species_stats)  # [B, 64]
         it_emb = self.item_embed(item_id)          # [B, 32]
@@ -191,10 +196,22 @@ class DeepPokemonBattleTransformerNet(nn.Module):
             nn.Linear(64, 64)
         )
         
-        # GRU: 아군액티브(128) + 상대액티브(128) + 아군팀요약(256) + 상대팀요약(256) + 필드(64) = 832
-        self.history_gru = nn.GRUCell(input_size=pokemon_embed_dim * 2 + 256 * 2 + 64, hidden_size=history_dim)
-        
-        # Fusion: 아군액티브(128) + 아군팀요약(256) + 상대액티브(128) + 상대팀요약(256) + 필드(64) + GRU히스토리(256) = 1088
+        # 히스토리: 배틀의 모든 턴 요약을 시퀀스로 보는 인과 트랜스포머 (이전 GRUCell 대체)
+        # 턴 요약 = 아군액티브(128) + 상대액티브(128) + 아군팀요약(256) + 상대팀요약(256) + 필드(64) = 832
+        turn_dim = pokemon_embed_dim * 2 + 256 * 2 + 64
+        self.turn_proj = nn.Linear(turn_dim, history_dim)
+        self.turn_pos = nn.Embedding(MAX_TURNS, history_dim)
+        seq_layer = nn.TransformerEncoderLayer(
+            d_model=history_dim, nhead=4, dim_feedforward=history_dim * 2, dropout=0.0,
+            activation="gelu", batch_first=True, norm_first=True
+        )
+        self.history_seq = nn.TransformerEncoder(seq_layer, num_layers=2, enable_nested_tensor=False)
+        # 출력 투영을 0으로 시작 → 처음엔 히스토리 = 0 벡터 (기존 체크포인트의 나머지 부분이 안정적으로 이어지도록)
+        self.history_out = nn.Linear(history_dim, history_dim)
+        nn.init.zeros_(self.history_out.weight)
+        nn.init.zeros_(self.history_out.bias)
+
+        # Fusion: 아군액티브(128) + 아군팀요약(256) + 상대액티브(128) + 상대팀요약(256) + 필드(64) + 히스토리(256) = 1088
         fusion_dim = pokemon_embed_dim + 256 + pokemon_embed_dim + 256 + 64 + history_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim, 512),
@@ -244,18 +261,57 @@ class DeepPokemonBattleTransformerNet(nn.Module):
             nn.Linear(64, 1)
         )
 
-    def forward(self, 
+    def forward(self,
                 my_team_cat, my_team_num, my_move_num,
                 opp_team_cat, opp_team_num, opp_move_num,
                 field_vec, history_state=None,
                 action_mask=None, opp_action_mask=None):
         """
+        한 턴 추론 (롤아웃/배포용). history_state = 이전 턴들의 요약 시퀀스 [B, t-1, 832] (첫 턴은 None).
+        반환 history_state = 이번 턴까지의 시퀀스 → 다음 턴에 그대로 넘기면 됨.
+        """
+        enc = self._encode_turn(my_team_cat, my_team_num, my_move_num,
+                                opp_team_cat, opp_team_num, opp_move_num, field_vec)
+        cur = enc["turn_input"].unsqueeze(1)
+        seq = cur if history_state is None else torch.cat([history_state.to(cur.dtype), cur], dim=1)
+        history = self._history(seq)[:, -1]
+        out = self._heads(enc, history, action_mask, opp_action_mask)
+        out["history_state"] = seq
+        return out
+
+    def forward_sequences(self, obs, seq_index, time_index, n_seq, action_mask=None):
+        """
+        학습용: 여러 배틀의 모든 턴을 한 번에 계산. 각 턴은 같은 배틀의 이전 턴만 봄 (인과 마스크).
+        obs: 한 턴 입력 7개 (각 [N, ...], N = 전체 턴 수)
+        seq_index/time_index: [N] 각 턴의 배틀 번호(0..n_seq-1)와 배틀 내 턴 번호(0부터 빈틈 없이)
+        """
+        enc = self._encode_turn(*obs)
+        turn_input = enc["turn_input"]
+        T = int(time_index.max().item()) + 1
+        turn_seq = turn_input.new_zeros(n_seq, T, turn_input.size(-1))
+        turn_seq[seq_index, time_index] = turn_input
+        history = self._history(turn_seq)[seq_index, time_index]
+        return self._heads(enc, history, action_mask, None)
+
+    def _history(self, turn_seq):
+        """[B, T, 832] 턴 요약 시퀀스 → [B, T, 256] 각 시점의 히스토리 (미래 턴은 보지 않음)"""
+        T = turn_seq.size(1)
+        pos = torch.arange(T, device=turn_seq.device).clamp(max=MAX_TURNS - 1)
+        x = self.turn_proj(turn_seq) + self.turn_pos(pos)
+        causal = torch.triu(torch.full((T, T), float("-inf"), device=turn_seq.device), diagonal=1)
+        return self.history_out(self.history_seq(x, mask=causal))
+
+    def _encode_turn(self,
+                     my_team_cat, my_team_num, my_move_num,
+                     opp_team_cat, opp_team_num, opp_move_num,
+                     field_vec):
+        """
         my_team_cat: [B, 6, 10]
         my_team_num: [B, 6, 23]
-        my_move_num: [B, 6, 4, 6] (기술 수치)
+        my_move_num: [B, 6, 4, 44] (기술 수치)
         opp_team_cat: [B, 6, 10]
         opp_team_num: [B, 6, 23]
-        opp_move_num: [B, 6, 4, 6]
+        opp_move_num: [B, 6, 4, 44]
         field_vec: [B, 48]
         """
         B = my_team_cat.size(0)
@@ -274,7 +330,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         for i in range(6):
             cat_i = my_team_cat[:, i, :]       # [B, 10] (item, ability, type1, type2, status, moves×4, tera)
             num_i = my_team_num[:, i, :]        # [B, 23] (battle 12 + species_stats 7 + 추론 플래그 4)
-            mv_num_i = my_move_num[:, i, :, :]  # [B, 4, 7]
+            mv_num_i = my_move_num[:, i, :, :]  # [B, 4, 44]
 
             # 배틀 수치 (앞 12): is_active, fainted, slot_pos, hp_frac, boosts×5, level, gimmick×2
             battle_num_i = num_i[:, :12]         # [B, 12]
@@ -309,7 +365,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         for i in range(6):
             cat_i = opp_team_cat[:, i, :]       # [B, 10]
             num_i = opp_team_num[:, i, :]        # [B, 23]
-            mv_num_i = opp_move_num[:, i, :, :]  # [B, 4, 7]
+            mv_num_i = opp_move_num[:, i, :, :]  # [B, 4, 44]
 
             battle_num_i = num_i[:, :12]         # [B, 12]
             species_stats_i = num_i[:, 12:19]    # [B, 7]
@@ -367,20 +423,29 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         opp_team_max = opp_team_masked_for_max.max(dim=1).values.clamp(min=-100.0)
         opp_team_summary = torch.cat([opp_team_mean, opp_team_max], dim=-1) # [B, 256]
         
-        # --- E. 필드 및 GRU 히스토리 ---
+        # --- E. 필드 + 턴 요약 ---
         field_features = self.field_encoder(field_vec) # [B, 64]
-        
         turn_input = torch.cat([my_active_vec, opp_active_vec, my_team_summary, opp_team_summary, field_features], dim=-1) # [B, 832]
-        if history_state is None:
-            history_state = torch.zeros(B, self.history_gru.hidden_size, device=device)
-        new_history_state = self.history_gru(turn_input, history_state) # [B, 64]
-        
+        return {
+            "turn_input": turn_input, "my_active_vec": my_active_vec, "my_team_summary": my_team_summary,
+            "opp_active_vec": opp_active_vec, "opp_team_summary": opp_team_summary, "field_features": field_features,
+            "my_team_attended": my_team_attended, "my_active_moves": my_active_moves, "my_active_ctx": my_active_ctx,
+        }
+
+    def _heads(self, enc, history, action_mask=None, opp_action_mask=None):
+        """턴 인코딩 + 히스토리 [B, 256] → 정책/가치 등 출력 헤드"""
+        my_active_vec, my_team_summary = enc["my_active_vec"], enc["my_team_summary"]
+        opp_active_vec, opp_team_summary = enc["opp_active_vec"], enc["opp_team_summary"]
+        field_features, my_team_attended = enc["field_features"], enc["my_team_attended"]
+        my_active_moves, my_active_ctx = enc["my_active_moves"], enc["my_active_ctx"]
+        B = my_active_vec.size(0)
+
         # --- F. 전황 통합 (Fusion) ---
         combined_all = torch.cat([
-            my_active_vec, my_team_summary, 
-            opp_active_vec, opp_team_summary, 
-            field_features, new_history_state
-        ], dim=-1) # [B, 896]
+            my_active_vec, my_team_summary,
+            opp_active_vec, opp_team_summary,
+            field_features, history
+        ], dim=-1) # [B, 1088]
         
         latent = self.fusion(combined_all) # [B, 256]
         
@@ -421,7 +486,6 @@ class DeepPokemonBattleTransformerNet(nn.Module):
             "opp_action_logits": opp_action_logits,
             "opp_item_logits": opp_item_logits,
             "value": value,
-            "history_state": new_history_state
         }
 
     def get_action(self, my_team_cat, my_team_num, my_move_num, 
