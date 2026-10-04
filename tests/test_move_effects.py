@@ -46,4 +46,9 @@ assert f("moonlight")["heal"] == 0.5 and f("painsplit")["heal"] == 0.5 and f("st
 assert f("curse") == {"self_offense": 0.5, "self_defense": 0.5, "self_speed": -0.5}
 assert f("bellydrum")["self_offense"] == 1                                          # +6은 1로 클램프
 assert f("notarealmove") == {}                                                      # 모르는 기술 = 0벡터
+assert f("thunderclap")["priority_conditional"] == 1                                # 상대가 공격기 아니면 우선도 0으로 처리됨
+assert f("suckerpunch")["priority_conditional"] == 1                                # 상대가 공격기 아니면 기술 자체가 실패
+assert f("upperhand")["priority_conditional"] == 1                                  # 상대가 우선기 아니면 기술 자체가 실패
+assert "priority_conditional" not in f("quickattack")                               # 조건 없는 일반 선공기는 해당 없음
+assert "priority_conditional" not in f("extremespeed")
 print(f"move effects OK ({MOVE_EFFECT_DIM}칸)")

@@ -21,7 +21,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
-from poke_env.teambuilder import ConstantTeambuilder, Teambuilder
+from poke_env.teambuilder import Teambuilder
 from src.core.rct_player import RCTBattleAIPlayer
 from src.core.player import SmartPokemonPlayer
 from src.core.model import DeepPokemonBattleTransformerNet, load_compatible
@@ -395,7 +395,7 @@ def ppo_update(model, optimizer, buf, batch_size, ppo_epochs):
 
 def main(n_iterations=100, battles_per_iter=128, opponents="rct:8", concurrent_per_worker=4,
          batch_size=1024, ppo_epochs=4, eval_every=10, eval_battles=96,
-         ckpt_path="checkpoints/deep_checkpoint_ppo_rct.pt", eval_search=None):
+         ckpt_path="checkpoints/vs_bot_RL.pt", eval_search=None):
     kinds = parse_opponents(opponents)
     n_workers = len(kinds)
     print(f"🚀 [PPO] 병렬 수집 시작 (워커 {n_workers}개 × 동시 {concurrent_per_worker}판, 상대 {opponents}, "
@@ -475,7 +475,9 @@ if __name__ == "__main__":
     ap.add_argument("--opponents", default=None,
                     help="워커별 학습 상대, 예: rct:5,heuristic:3 (가능: rct, heuristic, random)")
     ap.add_argument("--concurrent", type=int, default=4, help="워커 하나당 동시 배틀 수")
-    ap.add_argument("--ckpt", default="checkpoints/deep_checkpoint_ppo_rct.pt")
+    ap.add_argument("--ckpt", default="checkpoints/vs_bot_RL.pt",
+                    help="시작 체크포인트이자 매 iteration 저장 위치 (덮어씀). BC 체크포인트와 겹치지 않는 이름으로. "
+                         "처음 시작할 땐 이 경로로 BC 체크포인트를 복사해 두고 실행 (없으면 무작위 초기화로 시작)")
     ap.add_argument("--eval-search", type=float, default=None,
                     help="평가 때만 1턴 탐색 혼합 비율 λ (예: 0.5). 생략하면 정책만")
     args = ap.parse_args()

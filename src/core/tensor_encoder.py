@@ -7,16 +7,17 @@ from enum import Enum
 from functools import lru_cache
 from typing import Dict, Any, Tuple, List, Optional
 
-from src.core.set_prior import predict as predict_set
+from src.core.events import SLOT_DIM, TURN_DIM
 
 
-WEATHER_MAP = {
-    "sun": 1, "sunnyday": 1, "desolateland": 1, "harshsunshine": 1, "sunny": 1,
-    "rain": 2, "raindance": 2, "primordialsea": 2, "heavyrain": 2,
-    "sand": 3, "sandstorm": 3,
-    "hail": 4, "snow": 4, "snowscape": 4,
-    "deltastream": 5,
-}
+def effective_base_stats(pkmn, base_stats):
+    """내 포켓몬의 종족값 대신 실제 노력치/성격이 반영된 능력치(아는 경우만). 상대는 항상 모르므로 호출 안 함.
+    poke-env가 실전에선 서버 request의 진짜 수치를, 우리가 만든 재생 데이터(FoulPlay 자기 팀)는 compute_raw_stats로 채움 (전부 없으면 종족값 그대로)"""
+    stats = getattr(pkmn, "stats", None) or {}
+    if all(stats.get(k) is not None for k in ("hp", "atk", "def", "spa", "spd", "spe")):
+        return stats
+    return base_stats
+
 
 
 def extract_enum_str(val: Any) -> str:
@@ -59,8 +60,9 @@ def extract_enum_str(val: Any) -> str:
 class VocabManager:
     """
     결정론적 vocab.json 기반 문자열 -> 고유 ID 변환 매니저
-    - 0: 빈/미공개 패딩 슬롯 (Strict Padding)
-    - <unk>: 사전에 등록되지 않은 아이템/포켓몬 (Unknown Token)
+    - 0: 빈 슬롯 (Strict Padding)
+    - <unk>: 사전에 등록되지 않은 처음 본 개체 (novel)
+    - <unk>+1: 아직 안 드러난 값 (hidden) — 도구/특성/기술에만 사용
     """
     _instance = None
 
@@ -72,6 +74,14 @@ class VocabManager:
                     self.vocab = json.load(f)
             except Exception as e:
                 print(f"⚠️ vocab.json 로드 실패: {e}")
+
+    def unk_id(self, kind: str) -> int:
+        kd = self.vocab.get(kind, {})
+        return kd.get("<unk>", len(kd) + 1)
+
+    def slot_id(self, kind: str, name: Any, hidden: bool = False) -> int:
+        """도구/특성/기술 ID. 0 = 빈 자리, <unk> = 어휘에 없는 처음 본 개체, unk+1 = 아직 안 드러난 값(hidden)"""
+        return self.unk_id(kind) + 1 if hidden else self.get_id(kind, name)
 
     @classmethod
     def get_instance(cls, vocab_path: str = "data/vocab.json"):
@@ -161,14 +171,16 @@ def get_dynamic_turns(val: Any, effect_name: str, current_turn: int, battle: Any
     if isinstance(val, (int, float)):
         v = float(val)
         
-        # 4. val 형태 동적 판별 (남은 턴 수 vs 시작 턴 번호)
-        # Case A: val이 이미 남은 턴 수 (0 < v <= max_duration 이고 current_turn > max_duration 인 경우)
-        if 0 < v <= max_duration and current_turn > max_duration:
-            turns_left_cnt = v
+        # 4. val 형태 동적 판별 (남은 턴 수 vs 시작 턴 번호). poke-env는 보통 시작 턴 번호를 주므로
+        # Case B(시작 턴)를 먼저 본다 — 안 그러면 "시작 턴 번호가 우연히 최대 지속시간과 같은" 경계에서
+        # (예: 훈열의돌로 8턴 지속인데 정확히 턴8에 시작) 남은 턴 수로 오인식하는 버그가 생김.
         # Case B: val이 시작된 턴 번호 (v <= current_turn 이고 (current_turn - v) < max_duration 인 경우)
-        elif 0 <= v <= current_turn and (current_turn - v) < max_duration:
+        if 0 <= v <= current_turn and (current_turn - v) < max_duration:
             elapsed = current_turn - v
             turns_left_cnt = max(0.0, max_duration - elapsed)
+        # Case A: val이 이미 남은 턴 수 (0 < v <= max_duration 이고 current_turn > max_duration 인 경우)
+        elif 0 < v <= max_duration and current_turn > max_duration:
+            turns_left_cnt = v
         # Case C: 기타 지정 수치
         else:
             turns_left_cnt = max(0.0, min(v, max_duration))
@@ -197,15 +209,23 @@ MOVE_EFFECT_NAMES = [
     "hazard_set", "hazard_removal", "screen", "trick_room", "weather_terrain_tailwind",      # 21-25 필드
     "protect", "disrupt", "residual_on_target", "substitute", "item_manipulation",           # 26-30 방해/유틸
     "alt_offense_stat", "ignore_target_boosts", "self_sacrifice", "charge_or_recharge", "contact",  # 31-35
+    "priority_conditional",                                                                          # 36 (선공권이 상대의 이번 턴 선택에 달림 — 아래 설명)
 ]
 MOVE_EFFECT_DIM = len(MOVE_EFFECT_NAMES)
-MOVE_NUM_DIM = 8 + MOVE_EFFECT_DIM  # 기본 수치 7 + 상대 액티브 배율 1 + 부가효과
+MOVE_NUM_DIM = 9 + MOVE_EFFECT_DIM  # 기본 수치 7 + 상대 액티브 배율 1 + 부가효과 + 선공권 우열(끝에 추가)
 
 # Showdown 데이터에 필드가 없고 코드로만 구현된 효과 (poke-engine choice_effects.rs 와 같은 방식으로 목록 보완)
 _HAZARD_SET_EXTRA = {"ceaselessedge", "stoneaxe"}
 _HAZARD_REMOVAL = {"rapidspin", "defog", "mortalspin", "tidyup", "courtchange"}
 _ITEM_MANIPULATION = {"knockoff", "trick", "switcheroo", "thief", "covet", "bugbite", "pluck", "incinerate", "corrosivegas"}
 _DISRUPT = {"taunt", "encore", "disable", "torment", "healblock", "imprison", "throatchop"}
+# 선공권이 고정이 아니라 "이번 턴 상대가 뭘 냈는지"에 달린 기술. poke-env 정적 데이터의 priority 필드는
+# 명목값(예: thunderclap=1)만 있고 이 조건을 반영 안 해서, 실제로는 조건이 안 맞으면 선공이 아니게 됨
+# (thunderclap: 상대가 공격기가 아니면 우선도 0으로 처리됨 / suckerpunch, upperhand: 조건 불충족 시 기술 자체가 실패).
+# 명목 priority 피처(4번)는 그대로 두고, "이 값은 상대 선택에 달려 있어 불확실하다"는 플래그만 따로 추가함
+# (날씨볼처럼 관측 가능한 상태에서 정답을 계산해 넣는 것과 달리, 상대의 동시 선택은 관측 불가능해 정답을 못 만듦 —
+#  대신 모델이 이미 갖고 있는 상대 행동 예측(opp_action_head)과 엮어 스스로 위험도를 배우게 유도하는 용도).
+_CONDITIONAL_PRIORITY = {"thunderclap", "suckerpunch", "upperhand"}
 _RESIDUAL = {"leechseed", "saltcure", "partiallytrapped", "nightmare"}
 _HAZARDS = {"stealthrock", "spikes", "toxicspikes", "stickyweb"}
 _SCREENS = {"reflect", "lightscreen", "auroraveil"}
@@ -306,6 +326,7 @@ def move_effect_features(move_id: str) -> Tuple[float, ...]:
     flags = getattr(move, "flags", None) or set()
     vec[34] = 1.0 if "charge" in flags or "recharge" in flags else 0.0
     vec[35] = 1.0 if "contact" in flags else 0.0
+    vec[36] = 1.0 if mid in _CONDITIONAL_PRIORITY else 0.0
 
     for i in range(5, 12):
         vec[i] = min(1.0, vec[i])
@@ -315,32 +336,121 @@ def move_effect_features(move_id: str) -> Tuple[float, ...]:
 
 
 def defender_ability(mon: Any) -> Optional[str]:
-    """상성 판단용 방어측 특성: 공개/후보 1개면 그 값, 아니면 세트 추론값"""
+    """상성 판단용 방어측 특성: 공개됐거나 후보가 1개일 때만. 미공개면 ""(타입 상성만) — 이름 기반 세트 추정은 쓰지 않음"""
     from src.core.rct_player import ability as known_ability
-    ab = known_ability(mon)
-    if ab:
-        return ab
-    item = getattr(mon, "item", None)
-    prior = predict_set(getattr(mon, "species", ""), list(getattr(mon, "moves", {}) or {}),
-                        None if item == "unknown_item" else item, None)
-    return (prior or {}).get("ability") or ""
+    return known_ability(mon) or ""
+
+
+# 날씨에 따라 타입이 바뀌는 기술(웨더볼) — poke-env는 이런 걸 자동으로 재계산해주지 않아서
+# move.type을 그대로 읽으면 항상 고정(노말) 취급됨. 실전 버그로 확인됨(모래바람 중 웨더볼을
+# 여전히 물타입인 것처럼 판단 → 하마돈 상대 반감기를 씀). 여기서 실제 타입으로 바로잡음.
+_WEATHER_MOVE_TYPE = {
+    "sunnyday": "fire", "desolateland": "fire",
+    "raindance": "water", "primordialsea": "water",
+    "sandstorm": "rock",
+    "hail": "ice", "snow": "ice", "snowscape": "ice",
+}
+
+
+def _current_weather(battle: Any) -> str:
+    return next((re.sub(r"[^a-z0-9]", "", str(k).lower()) for k in (getattr(battle, "weather", None) or {})), "")
+
+
+def effective_move_type(battle: Any, move: Any) -> str:
+    """move.type을 그대로 쓰되, 날씨의존 기술(지금은 웨더볼)만 현재 날씨 기준 실제 타입으로 교체."""
+    move_type = extract_enum_str(getattr(move, "type", None))
+    if getattr(move, "id", None) != "weatherball":
+        return move_type
+    return _WEATHER_MOVE_TYPE.get(_current_weather(battle), "normal")
+
+
+_RAIN_WEATHER = {"raindance", "primordialsea"}
+_SUN_WEATHER = {"sunnyday", "desolateland"}
+_WEATHER_ACC_BOOST_MOVES = {"hurricane", "thunder"}  # 비=필중, 쾌청=명중 50%
+
+
+def effective_move_power(battle: Any, move: Any, base_power: float) -> float:
+    """물/불타입 기술의 비/쾌청 보정(1.5배/0.5배)과 웨더볼의 날씨 중 위력 2배를 반영.
+    poke-env는 move.base_power를 고정값으로만 주고 날씨 보정을 안 해줌."""
+    if not base_power or battle is None:
+        return base_power
+    w = _current_weather(battle)
+    if not w:
+        return base_power
+    if getattr(move, "id", None) == "weatherball":
+        return base_power * 2.0
+    mtype = extract_enum_str(getattr(move, "type", None))
+    if w in _RAIN_WEATHER:
+        if mtype == "water":
+            return base_power * 1.5
+        if mtype == "fire":
+            return base_power * 0.5
+    elif w in _SUN_WEATHER:
+        if mtype == "fire":
+            return base_power * 1.5
+        if mtype == "water":
+            return base_power * 0.5
+    return base_power
+
+
+def effective_move_accuracy(battle: Any, move: Any, accuracy: float) -> float:
+    """허리케인/천둥: 비=필중(1.0), 쾌청=명중 50%(0.5). poke-env는 고정 명중률(0.7)만 줌."""
+    if battle is None or getattr(move, "id", None) not in _WEATHER_ACC_BOOST_MOVES:
+        return accuracy
+    w = _current_weather(battle)
+    if w in _RAIN_WEATHER:
+        return 1.0
+    if w in _SUN_WEATHER:
+        return 0.5
+    return accuracy
 
 
 def move_effectiveness(battle: Any, move: Any, defender: Any, def_ability: Optional[str]) -> float:
     """
     기술이 방어측에게 실제로 들어가는 배율 / 4 (0=무효, 0.25=등배, 1=4배)
-    타입(테라 후 타입 포함), 특성 면역(저수/부유 등), 풍선, 중력, 불가사의부적 반영.
+    타입(테라 후 타입 포함, 날씨의존 타입 포함), 특성 면역(저수/부유 등), 풍선, 중력, 불가사의부적 반영.
     변화기와 방어측 없음은 등배(0.25)로 둠 — 무효와 구분은 분류 피처가 함.
     ponytail: 공격측 틀깨기, 프리즈드라이/플라잉프레스 같은 특수 상성은 미반영
     """
     if defender is None or not (getattr(move, "base_power", 0) or 0):
         return 0.25
     from src.core.rct_player import eff_move
-    move_type = extract_enum_str(getattr(move, "type", None))
+    move_type = effective_move_type(battle, move)
     return min(4.0, eff_move(battle, move_type, defender, def_ability)) / 4.0
 
 
-def extract_move_features(move: Any) -> Tuple[float, float, float, float, float, float, float]:
+def _battle_has_trickroom(battle: Any) -> bool:
+    fields = getattr(battle, "fields", None) or {}
+    keys = fields if isinstance(fields, dict) else ({fields} if not isinstance(fields, (list, tuple, set)) else fields)
+    return any("trickroom" in re.sub(r'[^a-z0-9]', '', extract_enum_str(k)) for k in keys)
+
+
+def priority_speed_edge(battle: Any, move: Any, own: Any, opp: Any) -> float:
+    """
+    이 기술이 상대가 "드러낸 기술 중 최고 우선도"보다 먼저 나갈지: +1 먼저, -1 나중, 0 동률/불명.
+    실제 규칙 그대로: 우선도 등급이 다르면 스피드 무관하게 등급만으로 결정 (Thunderclap류처럼 상대가
+    실제로 그 기술을 낼지는 예측 영역이라 여기선 다루지 않음 — "상대가 쓸 수 있는 선공기가 있다"는
+    드러난 사실만 반영). 등급이 같으면 종족값 기준 스피드로 근사 비교.
+    ponytail: 스탯 랭크업/마비/추진력 등 스피드 보정은 미반영(둘 다 미보정 종족값 비교), 상대 도구는
+    반영 안 함(species_stats만) — 정밀 비교보다 "등급이 다르면 확정적으로 진다/이긴다"는 큰 신호가 핵심.
+    """
+    if move is None or opp is None:
+        return 0.0
+    my_pri = getattr(move, "priority", 0) or 0
+    opp_moves = (getattr(opp, "moves", {}) or {}).values()
+    opp_pri = max((getattr(m, "priority", 0) or 0 for m in opp_moves), default=0)
+    if my_pri != opp_pri:
+        return 1.0 if my_pri > opp_pri else -1.0
+    my_spe = (getattr(own, "base_stats", None) or {}).get("spe", 0) if own is not None else 0
+    opp_spe = (getattr(opp, "base_stats", None) or {}).get("spe", 0)
+    if _battle_has_trickroom(battle):
+        my_spe, opp_spe = -my_spe, -opp_spe
+    if my_spe == opp_spe:
+        return 0.0
+    return 1.0 if my_spe > opp_spe else -1.0
+
+
+def extract_move_features(move: Any, battle: Any = None) -> Tuple[float, float, float, float, float, float, float]:
     """
     기술(Move) 객체에서 7가지 명시적 수치 및 부가효과 피처 추출:
     1. base_power / 200.0 (위력)
@@ -354,8 +464,13 @@ def extract_move_features(move: Any) -> Tuple[float, float, float, float, float,
     if move is None:
         return 0.0, 1.0, 1.0, 0.0, 0.33, 0.0, 0.0
 
-    bp = (getattr(move, "base_power", 0) or 0) / 200.0
-    acc = (getattr(move, "accuracy", 1.0) or 1.0)
+    base_power_raw = getattr(move, "base_power", 0) or 0
+    accuracy_raw = getattr(move, "accuracy", 1.0) or 1.0
+    if battle is not None:
+        base_power_raw = effective_move_power(battle, move, base_power_raw)
+        accuracy_raw = effective_move_accuracy(battle, move, accuracy_raw)
+    bp = base_power_raw / 200.0
+    acc = accuracy_raw
     
     curr_pp = getattr(move, "current_pp", 1) or 0
     max_pp = getattr(move, "max_pp", 1) or 1
@@ -392,7 +507,7 @@ def extract_move_features(move: Any) -> Tuple[float, float, float, float, float,
         "psychic": 11, "bug": 12, "rock": 13, "ghost": 14, "dragon": 15,
         "steel": 16, "dark": 17, "fairy": 18, "stellar": 19,
     }
-    move_type_raw = extract_enum_str(getattr(move, "type", None))
+    move_type_raw = effective_move_type(battle, move) if battle is not None else extract_enum_str(getattr(move, "type", None))
     move_type_id = _TYPE_MAP.get(move_type_raw, 0)
     move_type_norm = move_type_id / 20.0
 
@@ -415,7 +530,13 @@ def _move_obj(move_id: str):
 #   0~11 배틀 수치, 12~18 종족값, 19 도구 추론됨, 20 특성 추론됨, 21 추론 기술 수/4, 22 팀 프리뷰로만 확인
 # my_cat / opp_cat 레이아웃 [.., 10]
 #   0 item, 1 ability, 2 type1, 3 type2, 4 status, 5~8 moves, 9 tera type
-NUM_DIM, CAT_DIM = 23, 10
+# my_num / opp_num 레이아웃 [.., BASE_NUM] (죽은 칸 정리 후):
+#   0 필드 위, 1 기절, 2 HP비율, 3~7 공/방/특공/특방/스피드 랭크, 8 레벨, 9 기믹 활성, 10 기믹 사용가능,
+#   11 종족값(또는 내 쪽은 아는 경우 실능력치) HP, 12~16 공/방/특공/특방/스피드, 17 몸무게,
+#   18 아직 팀프리뷰로만 보임(상대 전용) — 뒤 SLOT_DIM칸은 상대 슬롯별 증거 (events.py)
+BASE_NUM = 19
+NUM_DIM, CAT_DIM = BASE_NUM + SLOT_DIM, 11  # 카테고리 [0..9]=도구/특성/타입/상태/기술/테라, [10]=종 ID (상대만 모델이 씀)
+FIELD_DIM = 48 + TURN_DIM
 
 
 class BattleTensorEncoder:
@@ -427,6 +548,7 @@ class BattleTensorEncoder:
     def __init__(self, vocab_path: str = "data/vocab.json", device: str = "cpu"):
         self.vocab_mgr = VocabManager.get_instance(vocab_path)
         self.device = device
+        self.blind_preview = False  # True면 팀 프리뷰로 알게 된 상대 팀을 안 씀 (마인크래프트처럼 프리뷰가 없는 환경 재현: 상대는 등장해야 보임)
 
     def encode_battle(self, battle: Any) -> Tuple[torch.Tensor, ...]:
         """
@@ -440,7 +562,7 @@ class BattleTensorEncoder:
         opp_num = np.zeros((1, 6, NUM_DIM), dtype=np.float32)
         opp_m_num = np.zeros((1, 6, 4, MOVE_NUM_DIM), dtype=np.float32)
         
-        field_vec = np.zeros((1, 48), dtype=np.float32)
+        field_vec = np.zeros((1, FIELD_DIM), dtype=np.float32)
         action_mask = np.zeros((1, 22), dtype=bool)
 
         if not hasattr(battle, "team") or not battle.team:
@@ -463,18 +585,17 @@ class BattleTensorEncoder:
             
             my_num[0, i, 0] = 1.0 if is_active else 0.0
             my_num[0, i, 1] = 1.0 if getattr(pkmn, "fainted", False) else 0.0
-            my_num[0, i, 2] = i / 5.0
-            my_num[0, i, 3] = getattr(pkmn, "current_hp_fraction", 1.0)
-            
+            my_num[0, i, 2] = getattr(pkmn, "current_hp_fraction", 1.0)
+
             boosts = getattr(pkmn, "boosts", {}) or {}
-            my_num[0, i, 4] = boosts.get("atk", 0) / 6.0
-            my_num[0, i, 5] = boosts.get("def", 0) / 6.0
-            my_num[0, i, 6] = boosts.get("spa", 0) / 6.0
-            my_num[0, i, 7] = boosts.get("spd", 0) / 6.0
-            my_num[0, i, 8] = boosts.get("spe", 0) / 6.0
-            my_num[0, i, 9] = (getattr(pkmn, "level", 100) or 100) / 100.0
-            
-            # 수치 슬롯 10: 현재 포켓몬 기믹 활성화 상태 (다이맥스 남은 턴/3.0, 테라스탈 1.0, 메가진화 1.0)
+            my_num[0, i, 3] = boosts.get("atk", 0) / 6.0
+            my_num[0, i, 4] = boosts.get("def", 0) / 6.0
+            my_num[0, i, 5] = boosts.get("spa", 0) / 6.0
+            my_num[0, i, 6] = boosts.get("spd", 0) / 6.0
+            my_num[0, i, 7] = boosts.get("spe", 0) / 6.0
+            my_num[0, i, 8] = (getattr(pkmn, "level", 100) or 100) / 100.0
+
+            # 수치 슬롯 9: 현재 포켓몬 기믹 활성화 상태 (다이맥스 남은 턴/3.0, 테라스탈 1.0, 메가진화 1.0)
             is_tera = getattr(pkmn, "is_terastallized", False)
             is_dyna = getattr(pkmn, "is_dynamaxed", False)
             dyna_turns = (getattr(battle, "dynamax_turns_left", None) or 3) if is_dyna else 0
@@ -489,20 +610,22 @@ class BattleTensorEncoder:
             else:
                 gimmick_state = 0.0
 
-            my_num[0, i, 10] = gimmick_state
+            my_num[0, i, 9] = gimmick_state
 
-            # 수치 슬롯 11: 트레이너/포켓몬 기믹 발동 가능 여부
+            # 수치 슬롯 10: 트레이너/포켓몬 기믹 발동 가능 여부
             can_tera = getattr(battle, "can_tera", False)
             can_dyna = getattr(battle, "can_dynamax", False)
             can_mega = getattr(battle, "can_mega_evolve", False) or getattr(battle, "can_z_move", False)
-            my_num[0, i, 11] = 1.0 if (can_tera or can_dyna or can_mega) else 0.0
+            my_num[0, i, 10] = 1.0 if (can_tera or can_dyna or can_mega) else 0.0
 
             # 카테고리 ID (species_id 슬롯 제거, 인덱스 1씩 시프트)
             # [0]=item, [1]=ability, [2]=type1, [3]=type2, [4]=status, [5:9]=moves
-            my_cat[0, i, 0] = self.vocab_mgr.get_id("item", getattr(pkmn, "item", None))
-            my_cat[0, i, 1] = self.vocab_mgr.get_id("ability", getattr(pkmn, "ability", None))
+            my_item, my_abil = getattr(pkmn, "item", None), getattr(pkmn, "ability", None)
+            my_cat[0, i, 0] = self.vocab_mgr.slot_id("item", my_item, my_item == "unknown_item")
+            my_cat[0, i, 1] = self.vocab_mgr.slot_id("ability", my_abil, not my_abil)
             my_cat[0, i, 2] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_1", None))
             my_cat[0, i, 3] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_2", None))
+            my_cat[0, i, 10] = self.vocab_mgr.get_id("species", getattr(pkmn, "species", None))
             my_cat[0, i, 4] = self.vocab_mgr.get_id("status", getattr(pkmn, "status", None))
             my_cat[0, i, 9] = self.vocab_mgr.get_id("type", getattr(pkmn, "tera_type", None) or request_tera.get(my_team_keys[i]))
 
@@ -511,18 +634,23 @@ class BattleTensorEncoder:
                 if m_idx < 4:
                     move_id = getattr(move, "id", None)
                     my_cat[0, i, 5 + m_idx] = self.vocab_mgr.get_id("move", move_id)
-                    my_m_num[0, i, m_idx, :7] = extract_move_features(move)
+                    my_m_num[0, i, m_idx, :7] = extract_move_features(move, battle)
                     my_m_num[0, i, m_idx, 7] = move_effectiveness(battle, move, opp_active_mon, opp_active_ability)
-                    my_m_num[0, i, m_idx, 8:] = move_effect_features(move_id)
+                    my_m_num[0, i, m_idx, 8:8 + MOVE_EFFECT_DIM] = move_effect_features(move_id)
+                    my_m_num[0, i, m_idx, 8 + MOVE_EFFECT_DIM] = priority_speed_edge(battle, move, pkmn, opp_active_mon)
+            for m_idx in range(min(4, len(moves_dict)), 4):  # 아직 안 드러난 기술 자리
+                my_cat[0, i, 5 + m_idx] = self.vocab_mgr.slot_id("move", None, True)
 
-            # species base_stats 7개 수치화 (my_num 뒤쪽 7 슬롯: 12~18)
+            # species base_stats 7개 수치화 (my_num 뒤쪽 7 슬롯: 11~17)
+            # 내 포켓몬은 노력치/성격을 알면(실전, 혹은 FoulPlay 재생) 종족값 대신 실제 능력치를 씀 → 아래 도구 배율도 그 위에 곱해짐
             base_stats = getattr(pkmn, "base_stats", None) or {}
-            hp_val = base_stats.get("hp", 0)
-            atk_val = base_stats.get("atk", 0)
-            def_val = base_stats.get("def", 0)
-            spa_val = base_stats.get("spa", 0)
-            spd_val = base_stats.get("spd", 0)
-            spe_val = base_stats.get("spe", 0)
+            eff_stats = effective_base_stats(pkmn, base_stats)
+            hp_val = eff_stats.get("hp", 0) or 0
+            atk_val = eff_stats.get("atk", 0) or 0
+            def_val = eff_stats.get("def", 0) or 0
+            spa_val = eff_stats.get("spa", 0) or 0
+            spd_val = eff_stats.get("spd", 0) or 0
+            spe_val = eff_stats.get("spe", 0) or 0
             
             item_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "item", "")))
             ability_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "ability", "")))
@@ -552,25 +680,26 @@ class BattleTensorEncoder:
                 elif highest == "spa": spa_val *= 1.3
                 elif highest == "spd": spd_val *= 1.3
 
-            my_num[0, i, 12] = hp_val / 255.0
-            my_num[0, i, 13] = atk_val / 255.0
-            my_num[0, i, 14] = def_val / 255.0
-            my_num[0, i, 15] = spa_val / 255.0
-            my_num[0, i, 16] = spd_val / 255.0
-            my_num[0, i, 17] = spe_val / 255.0
-            my_num[0, i, 18] = min(1.0, (getattr(pkmn, "weight", 0) or 0) / 500.0)
+            my_num[0, i, 11] = hp_val / 255.0
+            my_num[0, i, 12] = atk_val / 255.0
+            my_num[0, i, 13] = def_val / 255.0
+            my_num[0, i, 14] = spa_val / 255.0
+            my_num[0, i, 15] = spd_val / 255.0
+            my_num[0, i, 16] = spe_val / 255.0
+            my_num[0, i, 17] = min(1.0, (getattr(pkmn, "weight", 0) or 0) / 500.0)
 
 
         # --- B. 상대 팀 6마리 및 공개된 기술 인코딩 ---
         opp_team_list = list(battle.opponent_team.values()) if hasattr(battle, "opponent_team") else []
         n_seen = len(opp_team_list)
         seen_species = [re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", ""))) for p in opp_team_list]
-        for p in getattr(battle, "teampreview_opponent_team", None) or []:
+        for p in ([] if self.blind_preview else (getattr(battle, "teampreview_opponent_team", None) or [])):
             sp = re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", "")))
             # ponytail: 폼 차이(프리뷰 'urshifu' vs 실제 'urshifurapidstrike')는 접두사로만 매칭
             if sp and not any(s.startswith(sp) or sp.startswith(s) for s in seen_species):
                 opp_team_list.append(p)
         opp_active = getattr(battle, "opponent_active_pokemon", None)
+        ev = battle.__dict__.get("_ev")  # 턴 사건/상대 증거 (events.py가 parse_message에서 채움)
 
         for i in range(min(6, len(opp_team_list))):
             pkmn = opp_team_list[i]
@@ -578,16 +707,15 @@ class BattleTensorEncoder:
             
             opp_num[0, i, 0] = 1.0 if is_active else 0.0
             opp_num[0, i, 1] = 1.0 if getattr(pkmn, "fainted", False) else 0.0
-            opp_num[0, i, 2] = i / 5.0
-            opp_num[0, i, 3] = getattr(pkmn, "current_hp_fraction", 1.0)
+            opp_num[0, i, 2] = getattr(pkmn, "current_hp_fraction", 1.0)
             
             boosts = getattr(pkmn, "boosts", {}) or {}
-            opp_num[0, i, 4] = boosts.get("atk", 0) / 6.0
-            opp_num[0, i, 5] = boosts.get("def", 0) / 6.0
-            opp_num[0, i, 6] = boosts.get("spa", 0) / 6.0
-            opp_num[0, i, 7] = boosts.get("spd", 0) / 6.0
-            opp_num[0, i, 8] = boosts.get("spe", 0) / 6.0
-            opp_num[0, i, 9] = (getattr(pkmn, "level", 100) or 100) / 100.0
+            opp_num[0, i, 3] = boosts.get("atk", 0) / 6.0
+            opp_num[0, i, 4] = boosts.get("def", 0) / 6.0
+            opp_num[0, i, 5] = boosts.get("spa", 0) / 6.0
+            opp_num[0, i, 6] = boosts.get("spd", 0) / 6.0
+            opp_num[0, i, 7] = boosts.get("spe", 0) / 6.0
+            opp_num[0, i, 8] = (getattr(pkmn, "level", 100) or 100) / 100.0
 
             is_tera = getattr(pkmn, "is_terastallized", False)
             is_dyna = getattr(pkmn, "is_dynamaxed", False)
@@ -603,52 +731,36 @@ class BattleTensorEncoder:
             else:
                 gimmick_state = 0.0
 
-            opp_num[0, i, 10] = gimmick_state
-            opp_num[0, i, 11] = 0.0  # 상대 기믹 가능 여부는 모를 수 있으므로 기본값 0.0
+            opp_num[0, i, 9] = gimmick_state
+            opp_num[0, i, 10] = 0.0  # 상대 기믹 가능 여부는 모를 수 있으므로 기본값 0.0
 
-            opp_num[0, i, 22] = 0.0 if i < n_seen else 1.0
+            opp_num[0, i, BASE_NUM - 1] = 0.0 if i < n_seen else 1.0  # 아직 팀프리뷰로만 보임
 
-            # 정보 추론: 공개 안 된 도구/특성/기술/테라 타입을 세트 사전 확률로 채움
+            # 공개 안 된 도구/특성/기술/테라 타입은 추정해서 채우지 않고 hidden 토큰으로 둠 (모델이 불확실한 채로 판단)
             moves_dict = getattr(pkmn, "moves", {}) or {}
             item_name = getattr(pkmn, "item", None)
             ability_name = getattr(pkmn, "ability", None)
-            item_unknown = item_name == "unknown_item"
-            prior = predict_set(getattr(pkmn, "species", ""), list(moves_dict),
-                                None if item_unknown else item_name, ability_name)
-            if prior:
-                if item_unknown and prior["item"]:
-                    item_name = prior["item"]
-                    opp_num[0, i, 19] = 1.0
-                if not ability_name and prior["ability"]:
-                    ability_name = prior["ability"]
-                    opp_num[0, i, 20] = 1.0
 
-            opp_cat[0, i, 0] = self.vocab_mgr.get_id("item", item_name)
-            opp_cat[0, i, 1] = self.vocab_mgr.get_id("ability", ability_name)
+            opp_cat[0, i, 0] = self.vocab_mgr.slot_id("item", item_name, item_name == "unknown_item")
+            opp_cat[0, i, 1] = self.vocab_mgr.slot_id("ability", ability_name, not ability_name)
             opp_cat[0, i, 2] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_1", None))
             opp_cat[0, i, 3] = self.vocab_mgr.get_id("type", getattr(pkmn, "type_2", None))
+            opp_cat[0, i, 10] = self.vocab_mgr.get_id("species", getattr(pkmn, "species", None))
             opp_cat[0, i, 4] = self.vocab_mgr.get_id("status", getattr(pkmn, "status", None))
 
             for m_idx, move in enumerate(moves_dict.values()):
                 if m_idx < 4:
                     move_id = getattr(move, "id", None)
                     opp_cat[0, i, 5 + m_idx] = self.vocab_mgr.get_id("move", move_id)
-                    opp_m_num[0, i, m_idx, :7] = extract_move_features(move)
+                    opp_m_num[0, i, m_idx, :7] = extract_move_features(move, battle)
                     opp_m_num[0, i, m_idx, 7] = move_effectiveness(battle, move, active_pkmn, my_active_ability)
-                    opp_m_num[0, i, m_idx, 8:] = move_effect_features(move_id)
+                    opp_m_num[0, i, m_idx, 8:8 + MOVE_EFFECT_DIM] = move_effect_features(move_id)
+                    opp_m_num[0, i, m_idx, 8 + MOVE_EFFECT_DIM] = priority_speed_edge(battle, move, pkmn, active_pkmn)
+            for m_idx in range(min(4, len(moves_dict)), 4):  # 아직 안 드러난 기술 자리
+                opp_cat[0, i, 5 + m_idx] = self.vocab_mgr.slot_id("move", None, True)
 
-            if prior:
-                n_rev = min(4, len(moves_dict))
-                guesses = [m for m in (_move_obj(mid) for mid in prior["moves"]) if m is not None][:4 - n_rev]
-                for j, move in enumerate(guesses):
-                    opp_cat[0, i, 5 + n_rev + j] = self.vocab_mgr.get_id("move", move.id)
-                    opp_m_num[0, i, n_rev + j, :7] = extract_move_features(move)
-                    opp_m_num[0, i, n_rev + j, 7] = move_effectiveness(battle, move, active_pkmn, my_active_ability)
-                    opp_m_num[0, i, n_rev + j, 8:] = move_effect_features(move.id)
-                opp_num[0, i, 21] = len(guesses) / 4.0
-
-            # 테라 타입: 이미 테라스탈했으면 type_1이 곧 테라 타입, 아니면 추론값
-            tera_name = getattr(pkmn, "type_1", None) if is_tera else (prior or {}).get("tera")
+            # 테라 타입: 이미 테라스탈했으면 type_1이 곧 테라 타입, 아니면 미공개
+            tera_name = getattr(pkmn, "type_1", None) if is_tera else None
             opp_cat[0, i, 9] = self.vocab_mgr.get_id("type", tera_name)
 
             # 상대 포켓방 base_stats
@@ -688,15 +800,18 @@ class BattleTensorEncoder:
                 elif highest == "spa": spa_val *= 1.3
                 elif highest == "spd": spd_val *= 1.3
 
-            opp_num[0, i, 12] = hp_val / 255.0
-            opp_num[0, i, 13] = atk_val / 255.0
-            opp_num[0, i, 14] = def_val / 255.0
-            opp_num[0, i, 15] = spa_val / 255.0
-            opp_num[0, i, 16] = spd_val / 255.0
-            opp_num[0, i, 17] = spe_val / 255.0
-            opp_num[0, i, 18] = min(1.0, (getattr(pkmn, "weight", 0) or 0) / 500.0)
+            opp_num[0, i, 11] = hp_val / 255.0
+            opp_num[0, i, 12] = atk_val / 255.0
+            opp_num[0, i, 13] = def_val / 255.0
+            opp_num[0, i, 14] = spa_val / 255.0
+            opp_num[0, i, 15] = spd_val / 255.0
+            opp_num[0, i, 16] = spe_val / 255.0
+            opp_num[0, i, 17] = min(1.0, (getattr(pkmn, "weight", 0) or 0) / 500.0)
+            opp_num[0, i, BASE_NUM:] = ev.slot_vec(re.sub(r"[^a-z0-9]", "", str(getattr(pkmn, "species", "")).lower())) if ev else 0.0
 
         # --- C. 필드, 날씨, 룸 & 내/상대 사이드 조건(벽, 장판, 순풍) 48D 정밀 인코딩 ---
+        if ev:  # 직전 턴 사건 10칸 (인덱스 48~57)
+            field_vec[0, 48:] = ev.last
         # C.1 현재 턴 수 정규화 (50턴 기준 - 인덱스 47)
         turn_num = getattr(battle, "turn", 1) or 1
         field_vec[0, 47] = min(1.0, turn_num / 50.0)
@@ -897,7 +1012,7 @@ class DummyBattle:
     def __init__(self):
         # Enum 객체 및 "FIRE (pokemon type) object" 문자열 모사 포켓몬 생성
         p1 = DummyPokemon("pikachu", item="lightball", type1=MockPokemonType.ELECTRIC, moves=[DummyMove("thunderbolt", 90, 1.0, 15, move_type=MockPokemonType.ELECTRIC), DummyMove("quickattack", 40, 1.0, 30, move_type="normal")])
-        p2 = DummyPokemon("charizard", type1="FIRE (pokemon type) object", status="BRN (status) object", moves=[DummyMove("flamethrower", 90, 1.0, 15, move_type=MockPokemonType.FIRE)])
+        p2 = DummyPokemon("charizard", item="heatrock", type1="FIRE (pokemon type) object", status="BRN (status) object", moves=[DummyMove("flamethrower", 90, 1.0, 15, move_type=MockPokemonType.FIRE)])
         p3 = DummyPokemon("unknown_custom_mon", type1=MockPokemonType.WATER, hp=0.0) # 사전에 없는 포켓몬!
         
         self.active_pokemon = p1

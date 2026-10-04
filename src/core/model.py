@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import json
 import os
 
+import numpy as np
+
 
 def load_vocab_sizes(vocab_path: str = "data/vocab.json"):
     defaults = {
@@ -29,6 +31,20 @@ def load_vocab_sizes(vocab_path: str = "data/vocab.json"):
     return defaults
 
 
+def zero_unseen_id_rows(model: nn.Module, path: str = "data/entity_features.npz") -> int:
+    """학습 팀 풀에 한 번도 안 나온 도구/특성/기술의 ID 임베딩 행(무작위 초기값)을 0으로 → 미등장 개체는 특징으로만 표현"""
+    z, n = np.load(path), 0
+    emb = model.embeddings
+    with torch.no_grad():
+        for kind in ("item", "ability", "move"):
+            w = getattr(emb, f"{kind}_embed").weight
+            unseen = torch.from_numpy(z[f"{kind}_seen"] == 0).to(w.device)
+            unseen[0] = False
+            w[unseen] = 0.0
+            n += int(unseen.sum())
+    return n
+
+
 def load_compatible(model: nn.Module, state: dict):
     """
     체크포인트 부분 로드.
@@ -36,7 +52,10 @@ def load_compatible(model: nn.Module, state: dict):
     - 입력 열만 늘어난 2D weight(끝에 새 피처를 붙인 Linear)는 기존 열 복사 + 새 열 0
       → 새 피처가 처음엔 무시되어 기존 정책이 그대로 유지되고, 학습하며 점차 사용
     return: (확장된 키, 버려진 키)
+    체크포인트에 깊은 헤드 키(move_deep.*)가 있으면 모델에도 자동으로 켬 (안 켜면 그 가중치가 조용히 버려져 성능만 떨어짐)
     """
+    if hasattr(model, "enable_deep_heads") and any(k.startswith("move_deep.") for k in state):
+        model.enable_deep_heads()
     own = model.state_dict()
     expanded, skipped = [], []
     for k, v in state.items():
@@ -58,10 +77,10 @@ def load_compatible(model: nn.Module, state: dict):
 class MoveEncoderBlock(nn.Module):
     """
     기술 임베딩(48d)과 기술 수치 데이터를 결합하는 인코더 (GELU)
-    수치 44d: 위력, 명중률, PP비율, 우선도, 분류, 부가효과(구), 기술타입, 상대 액티브에게 실제 배율,
-             + 부가효과 벡터 36칸 (tensor_encoder.MOVE_EFFECT_NAMES). 새 피처는 항상 끝에 추가.
+    수치 46d: 위력, 명중률, PP비율, 우선도, 분류, 부가효과(구), 기술타입, 상대 액티브에게 실제 배율,
+             + 부가효과 벡터 37칸 + 선공권 우열 1칸 (tensor_encoder.MOVE_EFFECT_NAMES). 새 피처는 항상 끝에 추가.
     """
-    def __init__(self, move_dim: int = 48, move_num_dim: int = 44):
+    def __init__(self, move_dim: int = 48, move_num_dim: int = 46):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(move_dim + move_num_dim, 64),
@@ -70,8 +89,8 @@ class MoveEncoderBlock(nn.Module):
         )
 
     def forward(self, move_embs, move_numerics):
-        # move_embs: [B, 4, 48], move_numerics: [B, 4, 44]
-        combined = torch.cat([move_embs, move_numerics], dim=-1) # [B, 4, 92]
+        # move_embs: [B, 4, 48], move_numerics: [B, 4, 46]
+        combined = torch.cat([move_embs, move_numerics], dim=-1) # [B, 4, 94]
         out = self.fc(combined) # [B, 4, 48]
         return out
 
@@ -96,7 +115,8 @@ class PokemonEmbeddingLayer(nn.Module):
                  item_dim: int = 32,
                  ability_dim: int = 32,
                  type_dim: int = 16,
-                 status_dim: int = 8):
+                 status_dim: int = 8,
+                 feature_path: str = "data/entity_features.npz"):
         super().__init__()
         
         sizes = load_vocab_sizes(vocab_path)
@@ -117,21 +137,50 @@ class PokemonEmbeddingLayer(nn.Module):
         # MoveEncoderBlock 연결
         self.move_encoder = MoveEncoderBlock(move_dim=move_dim)
 
+        # 도구/특성/기술의 설명문 기반 고정 특징 표 (tools/build_entity_features.py) → 미등장 개체도 효과로 표현
+        # 투영은 0으로 시작 → 기존 체크포인트의 동작이 처음엔 그대로. id_dropout은 학습 스크립트가 켬 (ID 없이도 특징만으로 두게)
+        self.id_dropout = 0.0
+        self.novel_p = 0.0  # 학습 중 이 확률로 실제 개체를 "처음 본 개체"(<unk> ID, 특징 0)로 바꿈 → novel 토큰이 학습됨
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            _v = json.load(f)
+        self.unk = {k: _v[k]["<unk>"] for k in ("item", "ability", "move")}
+        self.has_feat = os.path.exists(feature_path)
+        if self.has_feat:
+            z = np.load(feature_path)
+            for kind, dim in (("item", item_dim), ("ability", ability_dim), ("move", move_dim)):
+                f = torch.from_numpy(z[f"{kind}_feat"]).float()
+                assert f.size(0) == getattr(self, f"{kind}_embed").num_embeddings, f"{kind} 특징 표 크기가 vocab과 다름 → 표를 다시 생성"
+                self.register_buffer(f"{kind}_feat", f, persistent=False)
+                proj = nn.Linear(f.size(1), dim)
+                nn.init.zeros_(proj.weight); nn.init.zeros_(proj.bias)
+                setattr(self, f"{kind}_proj", proj)
+
+    def _emb(self, kind, ids):
+        if self.novel_p > 0:
+            real = (ids > 0) & (ids < self.unk[kind])  # 빈 자리(0)/novel/hidden은 그대로
+            ids = torch.where(real & (torch.rand(ids.shape, device=ids.device) < self.novel_p), torch.full_like(ids, self.unk[kind]), ids)
+        e = getattr(self, f"{kind}_embed")(ids)
+        if not self.has_feat:
+            return e
+        if self.id_dropout > 0:
+            e = e.masked_fill((torch.rand(ids.shape, device=ids.device) < self.id_dropout).unsqueeze(-1), 0.0)
+        return e + getattr(self, f"{kind}_proj")(getattr(self, f"{kind}_feat")[ids])
+
     def forward(self, species_stats, item_id, ability_id, type1_id, type2_id, status_id, move_ids, move_numerics):
         """
         species_stats: [B, 7] float (hp/255, atk/255, def/255, spa/255, spd/255, spe/255, weight/500)
         move_ids: [B, 4]
-        move_numerics: [B, 4, 44]
+        move_numerics: [B, 4, 46]
         """
         sp_emb = self.species_proj(species_stats)  # [B, 64]
-        it_emb = self.item_embed(item_id)          # [B, 32]
-        ab_emb = self.ability_embed(ability_id)    # [B, 32]
+        it_emb = self._emb("item", item_id)          # [B, 32]
+        ab_emb = self._emb("ability", ability_id)    # [B, 32]
         t1_emb = self.type_embed(type1_id)         # [B, 16]
         t2_emb = self.type_embed(type2_id)         # [B, 16]
         st_emb = self.status_embed(status_id)      # [B, 8]
         
         # 기술 임베딩 + 수치 인코딩 결합
-        raw_mv_emb = self.move_embed(move_ids)                        # [B, 4, 48]
+        raw_mv_emb = self._emb("move", move_ids)                        # [B, 4, 48]
         encoded_mv_emb = self.move_encoder(raw_mv_emb, move_numerics) # [B, 4, 48]
         mv_emb_flat = encoded_mv_emb.view(encoded_mv_emb.size(0), -1) # [B, 192]
         
@@ -139,17 +188,55 @@ class PokemonEmbeddingLayer(nn.Module):
         return cat_features # [B, 360]
 
 
-class PositionalSlotEncoding(nn.Module):
+class ResHead(nn.Module):
     """
-    팀 엔트리 슬롯(0~5번 슬롯) 고유 위치 정보 임베딩
+    기존 얕은 점수 헤드의 출력에 더하는 깊은 잔차 가지 (LayerNorm + 잔차 블록).
+    마지막 층을 0으로 초기화해서 시작 시 출력이 0 → 기존 체크포인트의 동작이 그대로 유지되고, 학습하며 점차 기여함.
     """
-    def __init__(self, num_slots: int = 6, slot_dim: int = 16):
+    def __init__(self, in_dim: int, out_dim: int, width: int = 256, blocks: int = 1):
         super().__init__()
-        self.slot_embed = nn.Embedding(num_slots, slot_dim)
+        self.inp = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, width), nn.GELU())
+        self.blocks = nn.ModuleList([
+            nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, width))
+            for _ in range(blocks)
+        ])
+        self.out = nn.Linear(width, out_dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
-    def forward(self, batch_size: int, device: torch.device):
-        slot_ids = torch.arange(6, device=device).unsqueeze(0).repeat(batch_size, 1)
-        return self.slot_embed(slot_ids) # [B, 6, 16]
+    def forward(self, x):
+        h = self.inp(x)
+        for block in self.blocks:
+            h = h + block(h)
+        return self.out(h)
+
+
+class TeamCrossBlock(nn.Module):
+    """
+    팀 매치업 한 라운드: 팀 내부 셀프어텐션(직전 라운드에서 상대를 보고 알게 된 것을 팀원끼리 재조율)
+    -> 양방향 크로스어텐션(내 팀 <-> 상대 팀). 기존엔 셀프->크로스가 팀당 딱 1번, 크로스도 단방향(내->상대)이었음 —
+    이러면 "상대를 보고 배운 걸 내 팀원끼리 다시 맞춰본다"가 불가능해서, 라운드를 반복해 그 경로를 만듦.
+    """
+    def __init__(self, dim: int, ff: int, heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.self_my = nn.TransformerEncoderLayer(dim, heads, ff, dropout=dropout, activation="gelu", batch_first=True)
+        self.self_opp = nn.TransformerEncoderLayer(dim, heads, ff, dropout=dropout, activation="gelu", batch_first=True)
+        self.cross_my = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.cross_opp = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm_my = nn.LayerNorm(dim)
+        self.norm_opp = nn.LayerNorm(dim)
+
+    def forward(self, my, opp, my_pad, opp_pad):
+        my = self.self_my(my, src_key_padding_mask=my_pad)
+        opp = self.self_opp(opp, src_key_padding_mask=opp_pad)
+        # 슬롯이 전부 마스킹되면 softmax가 NaN -> 그 샘플만 마스크 해제 (값은 0 벡터라 결과엔 영향 없음)
+        opp_key_mask = opp_pad & ~opp_pad.all(dim=1, keepdim=True)
+        my_key_mask = my_pad & ~my_pad.all(dim=1, keepdim=True)
+        c_my, _ = self.cross_my(my, opp, opp, key_padding_mask=opp_key_mask)
+        c_opp, _ = self.cross_opp(opp, my, my, key_padding_mask=my_key_mask)
+        my = self.norm_my(my + c_my)
+        opp = self.norm_opp(opp + c_opp)
+        return my, opp
 
 
 class DeepPokemonBattleTransformerNet(nn.Module):
@@ -162,33 +249,39 @@ class DeepPokemonBattleTransformerNet(nn.Module):
                  vocab_path: str = "data/vocab.json",
                  pokemon_embed_dim: int = 128,
                  history_dim: int = 256,
-                 field_dim: int = 48):
+                 field_dim: int = 58,  # 48 + 직전 턴 사건 10 (events.TURN_DIM)
+                 latent_dim: int = 256,
+                 num_layers: int = 2,
+                 entity_features: bool = True,
+                 deep_heads: bool = False,
+                 history_mode: str = "flat",
+                 cross_rounds: int = 2,
+                 head_width: int = 128):
         super().__init__()
-        
+        assert history_mode in ("flat", "typed"), history_mode
+        self.history_mode = history_mode
+        self.cross_rounds = cross_rounds
+        # 체크포인트 옆 .cfg.json에 저장할 구조 인자 (기본 구조와 다른 모델을 다시 만들 때 필요)
+        self.cfg = dict(pokemon_embed_dim=pokemon_embed_dim, history_dim=history_dim, latent_dim=latent_dim,
+                        num_layers=num_layers, history_mode=history_mode, cross_rounds=cross_rounds,
+                        head_width=head_width)
+
         self.pokemon_embed_dim = pokemon_embed_dim
         self.action_dim = self.ACTION_DIM
+        team_dim = pokemon_embed_dim * 2  # 팀 요약 = mean + max 풀링
         
-        self.embeddings = PokemonEmbeddingLayer(vocab_path=vocab_path)
+        self.embeddings = PokemonEmbeddingLayer(vocab_path=vocab_path, feature_path="data/entity_features.npz" if entity_features else "")
         
-        # 입력: 임베딩(360) + 배틀 수치(12) + 테라 타입(16) + 추론 플래그(4)
+        # 입력: 임베딩(360) + 배틀 수치(11) + 테라 타입(16) + 팀프리뷰만 봄(1)+상대 슬롯 증거(8)
         # 새 피처는 반드시 끝에 붙임 (load_compatible이 기존 열을 보존하도록)
         self.pkmn_fc = nn.Sequential(
-            nn.Linear(360 + 12 + 16 + 4, 256),
-            nn.LayerNorm(256),
+            nn.Linear(360 + 11 + 16 + 9, team_dim),  # 마지막 9 = 아직 팀프리뷰로만 보임 1 + 상대 슬롯 증거 8
+            nn.LayerNorm(team_dim),
             nn.GELU(),
-            nn.Linear(256, pokemon_embed_dim),
+            nn.Linear(team_dim, pokemon_embed_dim),
             nn.LayerNorm(pokemon_embed_dim)
         )
-        
-        encoder_layer_my = nn.TransformerEncoderLayer(
-            d_model=pokemon_embed_dim, nhead=4, dim_feedforward=256, dropout=0.1, activation="gelu", batch_first=True
-        )
-        self.my_team_attention = nn.TransformerEncoder(encoder_layer_my, num_layers=2)
-        
-        encoder_layer_opp = nn.TransformerEncoderLayer(
-            d_model=pokemon_embed_dim, nhead=4, dim_feedforward=256, dropout=0.1, activation="gelu", batch_first=True
-        )
-        self.opp_team_attention = nn.TransformerEncoder(encoder_layer_opp, num_layers=2)
+
         
         self.field_encoder = nn.Sequential(
             nn.Linear(field_dim, 64),
@@ -198,68 +291,84 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         
         # 히스토리: 배틀의 모든 턴 요약을 시퀀스로 보는 인과 트랜스포머 (이전 GRUCell 대체)
         # 턴 요약 = 아군액티브(128) + 상대액티브(128) + 아군팀요약(256) + 상대팀요약(256) + 필드(64) = 832
-        turn_dim = pokemon_embed_dim * 2 + 256 * 2 + 64
-        self.turn_proj = nn.Linear(turn_dim, history_dim)
+        turn_dim = pokemon_embed_dim * 2 + team_dim * 2 + 64
+        if history_mode == "typed":
+            # 유형별 토큰: 턴마다 [내 쪽, 상대 쪽, 필드] 3개 토큰. 각자 따로 투영해서 어텐션이 유형별로 조회할 수 있게 함
+            self.my_tok = nn.Linear(pokemon_embed_dim + team_dim, history_dim)
+            self.opp_tok = nn.Linear(pokemon_embed_dim + team_dim, history_dim)
+            self.field_tok = nn.Linear(64, history_dim)
+            self.type_embed = nn.Embedding(3, history_dim)
+        else:
+            self.turn_proj = nn.Linear(turn_dim, history_dim)
         self.turn_pos = nn.Embedding(MAX_TURNS, history_dim)
         seq_layer = nn.TransformerEncoderLayer(
             d_model=history_dim, nhead=4, dim_feedforward=history_dim * 2, dropout=0.0,
             activation="gelu", batch_first=True, norm_first=True
         )
-        self.history_seq = nn.TransformerEncoder(seq_layer, num_layers=2, enable_nested_tensor=False)
+        self.history_seq = nn.TransformerEncoder(seq_layer, num_layers=num_layers, enable_nested_tensor=False)
         # 출력 투영을 0으로 시작 → 처음엔 히스토리 = 0 벡터 (기존 체크포인트의 나머지 부분이 안정적으로 이어지도록)
-        self.history_out = nn.Linear(history_dim, history_dim)
+        self.history_out = nn.Linear(history_dim * (3 if history_mode == "typed" else 1), history_dim)
         nn.init.zeros_(self.history_out.weight)
         nn.init.zeros_(self.history_out.bias)
 
         # Fusion: 아군액티브(128) + 아군팀요약(256) + 상대액티브(128) + 상대팀요약(256) + 필드(64) + 히스토리(256) = 1088
-        fusion_dim = pokemon_embed_dim + 256 + pokemon_embed_dim + 256 + 64 + history_dim
+        fusion_dim = pokemon_embed_dim + team_dim + pokemon_embed_dim + team_dim + 64 + history_dim
         self.fusion = nn.Sequential(
-            nn.Linear(fusion_dim, 512),
-            nn.LayerNorm(512),
+            nn.Linear(fusion_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim),
             nn.GELU()
         )
         
-        # 크로스 어텐션: 내 팀 슬롯(Query)이 상대 팀 전체(Key/Value)를 스캔
-        self.cross_attn = nn.MultiheadAttention(pokemon_embed_dim, num_heads=4, dropout=0.1, batch_first=True)
-        self.cross_norm = nn.LayerNorm(pokemon_embed_dim)
+        # 팀-매치업 블록: 셀프어텐션(팀 내부 재조율) -> 양방향 크로스어텐션(상대 팀과 대조) 을 cross_rounds번 반복.
+        # 라운드가 반복돼야 "상대를 보고 알게 된 것"을 팀원끼리 다시 조율할 수 있음 (기존엔 셀프->크로스 딱 1번뿐이었음)
+        self.team_cross = nn.ModuleList([TeamCrossBlock(pokemon_embed_dim, team_dim) for _ in range(cross_rounds)])
 
         # 후보별 점수 헤드 (pointer 방식)
         # 기술 j: latent(256) + 액티브 기술 j 벡터(48) + 액티브 문맥(128) -> [일반, Z/테라]
         self.move_score = nn.Sequential(
-            nn.Linear(256 + 48 + pokemon_embed_dim, 128),
+            nn.Linear(latent_dim + 48 + pokemon_embed_dim, head_width),
             nn.GELU(),
-            nn.Linear(128, 2)
+            nn.Linear(head_width, 2)
         )
         # 교체 k: latent(256) + 크로스 어텐션 거친 k번 슬롯 벡터(128) -> 1
         self.switch_score = nn.Sequential(
-            nn.Linear(256 + pokemon_embed_dim, 128),
+            nn.Linear(latent_dim + pokemon_embed_dim, head_width),
             nn.GELU(),
-            nn.Linear(128, 1)
+            nn.Linear(head_width, 1)
         )
+        # 깊은 잔차 가지: 기존 헤드 출력에 더함. 입력에 상대 액티브 벡터를 직접 추가 (latent 병목을 거치지 않고 상호작용을 만들 수 있게)
+        self.deep_heads = False
+        self.latent_dim = latent_dim
+        if deep_heads:
+            self.enable_deep_heads()
         # 계층 행동: 0=기술, 1=교체
-        self.type_head = nn.Linear(256, 2)
+        self.type_head = nn.Linear(latent_dim, 2)
         is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
         is_switch[8:14] = True
         self.register_buffer("is_switch", is_switch, persistent=False)
         self.opp_action_head = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(latent_dim, 128),
             nn.GELU(),
             nn.Linear(128, self.ACTION_DIM)
         )
-        self.opp_item_belief_head = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.GELU(),
-            nn.Linear(128, 50)
-        )
         self.value_head = nn.Sequential(
-            nn.Linear(256, 64),
+            nn.Linear(latent_dim, 64),
             nn.GELU(),
             nn.Linear(64, 1)
         )
+
+    def enable_deep_heads(self):
+        """깊은 잔차 가지를 켬 (이미 켜져 있으면 무시). 0 초기화라 켜도 출력은 그대로. load_compatible이 체크포인트에 이 가지의 키가 있으면 자동 호출"""
+        if self.deep_heads:
+            return
+        dev = next(self.parameters()).device
+        self.deep_heads = True
+        self.move_deep = ResHead(self.latent_dim + 48 + 2 * self.pokemon_embed_dim, 2).to(dev)  # latent + 기술벡터 + 내 액티브 문맥 + 상대 액티브
+        self.switch_deep = ResHead(self.latent_dim + 2 * self.pokemon_embed_dim, 1).to(dev)      # latent + 후보 슬롯 벡터 + 상대 액티브
 
     def forward(self,
                 my_team_cat, my_team_num, my_move_num,
@@ -291,14 +400,31 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         turn_seq = turn_input.new_zeros(n_seq, T, turn_input.size(-1))
         turn_seq[seq_index, time_index] = turn_input
         history = self._history(turn_seq)[seq_index, time_index]
-        return self._heads(enc, history, action_mask, None)
+        out = self._heads(enc, history, action_mask, None)
+        return out
 
     def _history(self, turn_seq):
         """[B, T, 832] 턴 요약 시퀀스 → [B, T, 256] 각 시점의 히스토리 (미래 턴은 보지 않음)"""
-        T = turn_seq.size(1)
-        pos = torch.arange(T, device=turn_seq.device).clamp(max=MAX_TURNS - 1)
+        B, T = turn_seq.size(0), turn_seq.size(1)
+        dev = turn_seq.device
+        pos = torch.arange(T, device=dev).clamp(max=MAX_TURNS - 1)
+        if self.history_mode == "typed":
+            pe = self.pokemon_embed_dim
+            td = 2 * pe  # 팀 요약 차원 (mean+max)
+            # turn_input = [내 액티브(pe), 상대 액티브(pe), 내 팀 요약(td), 상대 팀 요약(td), 필드(64)]
+            my = torch.cat([turn_seq[..., :pe], turn_seq[..., 2 * pe:2 * pe + td]], dim=-1)
+            opp = torch.cat([turn_seq[..., pe:2 * pe], turn_seq[..., 2 * pe + td:2 * pe + 2 * td]], dim=-1)
+            fld = turn_seq[..., 2 * pe + 2 * td:]
+            tok = torch.stack([self.my_tok(my), self.opp_tok(opp), self.field_tok(fld)], dim=2)      # [B, T, 3, H]
+            tok = tok + self.type_embed.weight[None, None] + self.turn_pos(pos)[None, :, None]
+            x = tok.reshape(B, T * 3, -1)
+            turn_id = torch.arange(T, device=dev).repeat_interleave(3)
+            blocked = turn_id[None, :] > turn_id[:, None]   # 미래 턴의 토큰은 못 봄 (같은 턴 토큰끼리는 서로 봄)
+            mask = torch.zeros(T * 3, T * 3, device=dev).masked_fill(blocked, float("-inf"))
+            h = self.history_seq(x, mask=mask).reshape(B, T, -1)                                     # [B, T, 3H]
+            return self.history_out(h)
         x = self.turn_proj(turn_seq) + self.turn_pos(pos)
-        causal = torch.triu(torch.full((T, T), float("-inf"), device=turn_seq.device), diagonal=1)
+        causal = torch.triu(torch.full((T, T), float("-inf"), device=dev), diagonal=1)
         return self.history_out(self.history_seq(x, mask=causal))
 
     def _encode_turn(self,
@@ -308,10 +434,10 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         """
         my_team_cat: [B, 6, 10]
         my_team_num: [B, 6, 23]
-        my_move_num: [B, 6, 4, 44] (기술 수치)
+        my_move_num: [B, 6, 4, 46] (기술 수치)
         opp_team_cat: [B, 6, 10]
         opp_team_num: [B, 6, 23]
-        opp_move_num: [B, 6, 4, 44]
+        opp_move_num: [B, 6, 4, 46]
         field_vec: [B, 48]
         """
         B = my_team_cat.size(0)
@@ -329,20 +455,20 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
         for i in range(6):
             cat_i = my_team_cat[:, i, :]       # [B, 10] (item, ability, type1, type2, status, moves×4, tera)
-            num_i = my_team_num[:, i, :]        # [B, 23] (battle 12 + species_stats 7 + 추론 플래그 4)
-            mv_num_i = my_move_num[:, i, :, :]  # [B, 4, 44]
+            num_i = my_team_num[:, i, :]        # [B, 27] (battle 11 + species_stats 7 + 팀프리뷰만 봄 1 + 상대 슬롯 증거 8, 내 쪽은 뒤 9칸 항상 0)
+            mv_num_i = my_move_num[:, i, :, :]  # [B, 4, 46]
 
-            # 배틀 수치 (앞 12): is_active, fainted, slot_pos, hp_frac, boosts×5, level, gimmick×2
-            battle_num_i = num_i[:, :12]         # [B, 12]
+            # 배틀 수치 (앞 11): is_active, fainted, hp_frac, boosts×5, level, gimmick×2
+            battle_num_i = num_i[:, :11]         # [B, 11]
             # 종 스탯 (뒤 7): hp/255, atk/255, def/255, spa/255, spd/255, spe/255, weight/500
-            species_stats_i = num_i[:, 12:19]    # [B, 7]
+            species_stats_i = num_i[:, 11:18]    # [B, 7]
 
             it, ab, t1, t2, st = cat_i[:, 0], cat_i[:, 1], cat_i[:, 2], cat_i[:, 3], cat_i[:, 4]
             mvs = cat_i[:, 5:9]
 
             cat_emb = self.embeddings(species_stats_i, it, ab, t1, t2, st, mvs, mv_num_i)  # [B, 360]
             tera_emb = self.embeddings.type_embed(cat_i[:, 9])  # [B, 16]
-            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 19:23]], dim=-1)  # [B, 392]
+            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 18:]], dim=-1)  # [B, 396]
             vec_i = self.pkmn_fc(full_i)
 
             # 빈 슬롯(HP stat == 0)인 경우 인코딩 벡터 0 처리
@@ -364,18 +490,18 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         
         for i in range(6):
             cat_i = opp_team_cat[:, i, :]       # [B, 10]
-            num_i = opp_team_num[:, i, :]        # [B, 23]
-            mv_num_i = opp_move_num[:, i, :, :]  # [B, 4, 44]
+            num_i = opp_team_num[:, i, :]        # [B, 27] (battle 11 + species_stats 7 + 팀프리뷰만 봄 1 + 상대 슬롯 증거 8)
+            mv_num_i = opp_move_num[:, i, :, :]  # [B, 4, 46]
 
-            battle_num_i = num_i[:, :12]         # [B, 12]
-            species_stats_i = num_i[:, 12:19]    # [B, 7]
+            battle_num_i = num_i[:, :11]         # [B, 11]
+            species_stats_i = num_i[:, 11:18]    # [B, 7]
 
             it, ab, t1, t2, st = cat_i[:, 0], cat_i[:, 1], cat_i[:, 2], cat_i[:, 3], cat_i[:, 4]
             mvs = cat_i[:, 5:9]
 
             cat_emb = self.embeddings(species_stats_i, it, ab, t1, t2, st, mvs, mv_num_i)
             tera_emb = self.embeddings.type_embed(cat_i[:, 9])  # [B, 16]
-            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 19:23]], dim=-1)  # [B, 392]
+            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 18:]], dim=-1)  # [B, 396]
             vec_i = self.pkmn_fc(full_i)
 
             is_empty = (species_stats_i[:, 0] == 0.0).unsqueeze(-1)
@@ -383,21 +509,12 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
             opp_pkmn_vectors.append(vec_i.unsqueeze(1))
 
-            is_act = battle_num_i[:, 0].unsqueeze(-1)
-            opp_active_vec = opp_active_vec + vec_i * is_act
-
         opp_team_stack = torch.cat(opp_pkmn_vectors, dim=1) # [B, 6, 128]
-        
-        # --- C. Transformer Self-Attention (src_key_padding_mask 적용!) ---
-        my_team_attended = self.my_team_attention(my_team_stack, src_key_padding_mask=my_team_pad_mask)
-        opp_team_attended = self.opp_team_attention(opp_team_stack, src_key_padding_mask=opp_team_pad_mask)
-
-        # --- C.2 크로스 어텐션 (내 팀 -> 상대 팀) ---
-        # 상대 슬롯이 전부 마스킹되면 softmax가 NaN -> 그 샘플만 마스크 해제 (값은 0 벡터)
-        cross_mask = opp_team_pad_mask & ~opp_team_pad_mask.all(dim=1, keepdim=True)
-        cross, _ = self.cross_attn(my_team_attended, opp_team_attended, opp_team_attended,
-                                   key_padding_mask=cross_mask, need_weights=False)
-        my_team_attended = self.cross_norm(my_team_attended + cross)  # [B, 6, 128]
+        opp_active_vec = (opp_team_stack * opp_team_num[:, :, 0:1]).sum(dim=1)  # [B, 128]
+        # --- C. 팀 매치업: (팀 내부 셀프어텐션 -> 양방향 크로스어텐션) 을 cross_rounds번 반복 ---
+        my_team_attended, opp_team_attended = my_team_stack, opp_team_stack
+        for block in self.team_cross:
+            my_team_attended, opp_team_attended = block(my_team_attended, opp_team_attended, my_team_pad_mask, opp_team_pad_mask)
         my_active_ctx = (my_team_attended * my_team_num[:, :, 0:1]).sum(dim=1)  # [B, 128]
 
         # --- D. 마스크가 적용된 안전한 Mean + Max Pooling ---
@@ -451,13 +568,18 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         
         # --- G. 출력 헤드 ---
         # G.1 후보별 세부 점수 (기술 0-3 일반, 4-7 Z/테라, 교체 8-13, 14-21 미사용)
-        mv = self.move_score(torch.cat([
+        mv_in = torch.cat([
             latent.unsqueeze(1).expand(-1, 4, -1), my_active_moves,
             my_active_ctx.unsqueeze(1).expand(-1, 4, -1)
-        ], dim=-1))                                                                   # [B, 4, 2]
-        sw = self.switch_score(torch.cat([
-            latent.unsqueeze(1).expand(-1, 6, -1), my_team_attended
-        ], dim=-1)).squeeze(-1)                                                       # [B, 6]
+        ], dim=-1)
+        sw_in = torch.cat([latent.unsqueeze(1).expand(-1, 6, -1), my_team_attended], dim=-1)
+        mv = self.move_score(mv_in)                                                   # [B, 4, 2]
+        sw = self.switch_score(sw_in)                                                 # [B, 6, 1]
+        if self.deep_heads:
+            opp_ctx = opp_active_vec
+            mv = mv + self.move_deep(torch.cat([mv_in, opp_ctx.unsqueeze(1).expand(-1, 4, -1)], dim=-1))
+            sw = sw + self.switch_deep(torch.cat([sw_in, opp_ctx.unsqueeze(1).expand(-1, 6, -1)], dim=-1))
+        sw = sw.squeeze(-1)                                                           # [B, 6]
         detail = torch.cat([mv[..., 0], mv[..., 1], sw, latent.new_full((B, 8), -1e9)], dim=1)  # [B, 22]
 
         # G.2 계층 결합: log π(a) = log π(유형) + log π(세부 | 유형)
@@ -474,7 +596,6 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         policy_logits = torch.where(self.is_switch, lp_type[:, 1:2] + lp_switch, lp_type[:, 0:1] + lp_move)
 
         opp_action_logits = self.opp_action_head(latent)   # [B, 22]
-        opp_item_logits = self.opp_item_belief_head(latent)# [B, 50]
         value = self.value_head(latent)                    # [B, 1]
 
         # --- H. 상대 행동 마스킹 ---
@@ -484,7 +605,6 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         return {
             "policy_logits": policy_logits,
             "opp_action_logits": opp_action_logits,
-            "opp_item_logits": opp_item_logits,
             "value": value,
         }
 
@@ -536,3 +656,27 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
 
 PokemonBattleNet = DeepPokemonBattleTransformerNet
+
+
+def save_ckpt(model: nn.Module, path: str):
+    """가중치 저장 + 구조 인자를 <path>.cfg.json에 기록 (기본 구조 모델도 기록해 둠)"""
+    torch.save(model.state_dict(), path)
+    with open(path + ".cfg.json", "w", encoding="utf-8") as f:
+        json.dump(getattr(model, "cfg", {}), f)
+
+
+def model_from_ckpt(path: str, map_location="cpu") -> nn.Module:
+    """체크포인트 옆 .cfg.json이 있으면 그 구조로, 없으면 기본 구조로 모델을 만들어 가중치 로드.
+    cfg.json 없는 체크포인트(예: team_cross 이전의 all11)는 지금 기본 구조로 지어지는데, 그 체크포인트에
+    없는 새 모듈(team_cross 등)은 load_compatible이 무작위로 남겨둠 — h2h/eval/KL 기준(ref)으로 이걸
+    그대로 쓰면 "학습된 척하는 무작위 조각"이 섞여 들어가는 사고가 난 적 있어 경고를 남김."""
+    cfg_path = path + ".cfg.json"
+    has_cfg = os.path.exists(cfg_path)
+    cfg = json.load(open(cfg_path, encoding="utf-8")) if has_cfg else {}
+    if not has_cfg:
+        print(f"  ⚠️ {path}에 .cfg.json 없음 → 기본 구조로 생성. 이 체크포인트가 모르는 새 모듈(예: team_cross)은 "
+              f"무작위로 남습니다 — 기준/비교 모델로 쓴다면 cfg.json 있는(구조가 맞는) 체크포인트를 쓰세요.")
+    model = DeepPokemonBattleTransformerNet(**cfg)
+    load_compatible(model, torch.load(path, map_location=map_location))
+    return model
+

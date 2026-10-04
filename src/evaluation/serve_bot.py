@@ -35,7 +35,7 @@ async def main(args):
     print(f"✅ 모델 로드 완료 (확장: {expanded}, 버림: {skipped})")
 
     # 2. 사용할 팀 로드
-    pool_data = json.load(open("data/team_pool.json", encoding="utf-8-sig"))["teams"]
+    pool_data = json.load(open("data/team_pool_train_a.json", encoding="utf-8-sig"))["teams"]
     
     if args.team == "random":
         print("팀 설정: 매 판 랜덤한 팀을 사용합니다.")
@@ -73,7 +73,7 @@ async def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--bot_name", default="AntiGravityBot", help="쇼다운에서 봇이 사용할 닉네임")
-    ap.add_argument("--ckpt", default="checkpoints/deep_checkpoint_ppo_rct.pt", help="사용할 모델 체크포인트 경로")
+    ap.add_argument("--ckpt", default="checkpoints/supervised_v2.pt", help="사용할 모델 체크포인트 경로")
     ap.add_argument("--team", default="random", help="봇이 사용할 팀 이름 (ex: 'HO Physical', 'Stall'), 'random' 지정 시 매 판 랜덤")
     ap.add_argument("--search", type=float, default=None, help="1턴 탐색 람다 값 (기본값: 탐색 안함)")
     

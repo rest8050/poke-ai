@@ -27,7 +27,7 @@ assert eff("dragonclaw", mon("sylveon")) == 0                         # 타입 �
 assert eff("earthquake", mon("rotomwash")) == 0                       # 부유 (특성 후보 1개)
 assert eff("earthquake", mon("gholdengo")) == 2                       # 강철 2배 × 고스트 1배
 assert eff("earthquake", mon("gholdengo", item="airballoon")) == 0    # 풍선
-assert eff("surf", mon("gastrodon")) == 0                             # 특성 미공개 → 세트 추론(마중물)
+assert eff("surf", mon("gastrodon")) == 1                             # 특성 미공개(후보 여러 개) → 추정 없이 타입 상성만
 assert eff("surf", mon("gastrodon", ability="stickyhold")) == 1       # 공개된 특성이 추론보다 우선
 assert eff("dragonclaw", mon("garchomp", tera="fairy")) == 0          # 테라 후 타입
 assert eff("swordsdance", mon("garchomp")) == 1                       # 변화기 = 등배 처리

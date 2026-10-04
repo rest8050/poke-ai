@@ -80,13 +80,13 @@ def cell(battle, me, opp, action, opp_move):
     return dealt - taken + (0.5 if dealt >= 1 else 0.0) - (0.5 if taken >= 1 else 0.0)
 
 
-def search_pick(battle, probs, lam=0.5, k=3):
-    """probs: [22] 정책 확률 (마스킹 반영). 고를 게 없으면 None"""
+def _candidate_values(battle, probs, k):
+    """(후보 [(행동, 디코딩)], 평가된 후보의 1턴 가치 {행동: 값}, 중립값). 후보 없으면 cands=[]"""
     me, opp = battle.active_pokemon, battle.opponent_active_pokemon
     cands = [(a, decode_action(battle, a)) for a in probs.topk(k).indices.tolist() if probs[a] > 0]
     cands = [(a, d) for a, d in cands if d is not None]
     if not cands or me is None or opp is None:
-        return cands[0][0] if cands else None
+        return cands, None, 0.0
 
     opp_moves = opponent_moves(battle, opp)
     values = {}
@@ -96,5 +96,12 @@ def search_pick(battle, probs, lam=0.5, k=3):
         cells = [cell(battle, me, opp, d, om) for om in opp_moves]
         values[a] = 0.5 * min(cells) + 0.5 * sum(cells) / len(cells)
     # ponytail: 변화기는 평가된 후보들의 평균(중립)을 줘서 정책 확률로만 갈리게 함
-    neutral = sum(values.values()) / len(values) if values else 0.0
+    return cands, values, sum(values.values()) / len(values) if values else 0.0
+
+
+def search_pick(battle, probs, lam=0.5, k=3):
+    """probs: [22] 정책 확률 (마스킹 반영). 고를 게 없으면 None"""
+    cands, values, neutral = _candidate_values(battle, probs, k)
+    if values is None:
+        return cands[0][0] if cands else None
     return max(cands, key=lambda c: lam * math.log(probs[c[0]].item()) + (1 - lam) * values.get(c[0], neutral))[0]

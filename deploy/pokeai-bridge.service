@@ -1,0 +1,22 @@
+[Unit]
+Description=PokeAI bridge (model inference for Cobblemon RCT trainers)
+After=network.target
+
+[Service]
+User=opc
+WorkingDirectory=/home/opc/pokeai-bridge
+Environment=PYTHONPATH=/home/opc/pokeai-bridge
+Environment=POKEAI_CKPT=checkpoints/supervised_v2_fp_v10boot.pt
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+ExecStart=/home/opc/pokeai-bridge/venv/bin/python -m src.core.bridge_server
+Restart=always
+RestartSec=5
+# 게임 서버 보호: 낮은 우선순위, CPU/메모리 상한, 메모리가 부족하면 이 서비스가 먼저 종료되도록
+Nice=10
+CPUQuota=50%
+MemoryMax=1500M
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target

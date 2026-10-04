@@ -11,7 +11,6 @@ poke-ai/
 ├── requirements.txt   # 필요한 파이썬 패키지 목록
 ├── model.py           # PyTorch 신경망 아키텍처 (Policy + Opponent Predictor + Value)
 ├── player.py          # poke-env & RCT JSON 전황 데이터를 상태 벡터로 인코딩
-├── server.py          # 마인크래프트 RCT 모드 연동용 FastAPI 추론 서버 (http://localhost:8000)
 ├── train.py           # 상대 행동 예측(Auxiliary Loss) 보조 학습 루프 템플릿
 └── README.md          # 프로젝트 사용 가이드
 ```
@@ -37,13 +36,9 @@ python train.py
 
 ---
 
-## 🚀 3. AI 추론 서버 실행 (FastAPI)
+## 🚀 3. AI 추론 서버
 
-```bash
-python server.py
-```
-* 서버가 가동되면 `http://localhost:8000/predict` 엔드포인트를 통해 전황 상태를 전송받고 최적의 스킬/교체 행동을 응답합니다.
-* Swagger UI 테스트: `http://localhost:8000/docs`
+마인크래프트 모드 연동 서버는 삭제됨 (텐서 입력 방식이라 현재 모델과 어긋남). 프로토콜 원문 입력 방식으로 추후 새로 작성.
 
 ---
 

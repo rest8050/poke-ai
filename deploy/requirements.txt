@@ -1,0 +1,7 @@
+# OCI(aarch64, Python 3.12)용. PyPI의 aarch64 torch는 CPU 전용 빌드
+torch==2.7.1
+numpy>=2.0.2
+poke-env==0.16.1
+fastapi
+uvicorn
+pydantic

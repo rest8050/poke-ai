@@ -1,7 +1,13 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 logs/
-# 학습 중 계속 덮어쓰는 체크포인트는 제외, 기준선은 git add -f 로 따로 고정
-checkpoints/*.pt
-data/metamon/
-data/team_pool_metamon*.json
+# 학습 데이터·체크포인트는 용량과 라이선스(Metamon CC BY-NC, Foul Play GPL) 때문에 올리지 않음. 실행에 필요한 작은 파일만 예외
+data/*
+!data/vocab.json
+!data/entity_features.npz
+checkpoints/
+deploy/dist/
+mod/pokeai/out/
+mod/pokeai/*.jar
+mod/pokeai/rcon.py

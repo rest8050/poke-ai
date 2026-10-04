@@ -1,6 +1,5 @@
-import torch
-from src.core.model import DeepPokemonBattleTransformerNet, PokemonBattleNet
-from src.core.tensor_encoder import BattleTensorEncoder, VocabManager
+from src.core.model import DeepPokemonBattleTransformerNet
+from src.core.tensor_encoder import BattleTensorEncoder
 
 try:
     from poke_env.player import Player
@@ -10,14 +9,6 @@ except ImportError:
     POKE_ENV_AVAILABLE = False
     Player = object
     AbstractBattle = object
-
-
-# 호환성을 위한 FeatureExtractor 포워딩
-class FeatureExtractor:
-    @staticmethod
-    def extract_from_battle(battle, device="cpu", vocab_path="data/vocab.json"):
-        encoder = BattleTensorEncoder(vocab_path=vocab_path, device=device)
-        return encoder.encode_battle(battle)
 
 
 if POKE_ENV_AVAILABLE:
