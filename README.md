@@ -42,38 +42,4 @@ python train.py
 
 ---
 
-## 🔗 4. 마인크래프트 RCT 모드 연동 방법
 
-마인크래프트 RCT 모드의 커스텀 `BattleAI` 클래스에서 턴마다 아래 형식으로 POST 요청을 보냅니다:
-
-**Request (`POST /predict`):**
-```json
-{
-  "battle_id": "battle_001",
-  "trainer_name": "Ace_Trainer_Red",
-  "active": {
-    "name": "Pikachu",
-    "hp_percent": 0.85,
-    "level": 50,
-    "status": null,
-    "moves": ["Thunderbolt", "Volt Tackle", "Iron Tail", "Quick Attack"]
-  },
-  "opponent": {
-    "name": "Charizard",
-    "hp_percent": 1.0,
-    "status": null
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "action_type": "move",
-  "action_index": 0,
-  "chosen_action": "Thunderbolt",
-  "predicted_opponent_action": 1,
-  "confidence": 0.942,
-  "state_value": 0.821
-}
-```
