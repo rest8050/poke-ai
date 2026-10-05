@@ -45,7 +45,7 @@ from src.core.player import SmartPokemonPlayer
 from src.core.rct_player import RCTBattleAIPlayer, _id, eff_move
 from src.core.search import decode_action, search_pick
 from src.core.set_prior import predict as predict_set
-from src.training.train_ppo_rct import RandomPoolTeambuilder, load_team_pool
+from src.core.team_pool import RandomPoolTeambuilder, load_team_pool
 
 warnings.filterwarnings("ignore")
 OPPONENTS = {"rct": RCTBattleAIPlayer, "heuristic": SimpleHeuristicsPlayer, "random": RandomPlayer}

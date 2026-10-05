@@ -12,7 +12,7 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration
 
 from src.core.model import model_from_ckpt
 from src.evaluation.analyze_model import LoggingPlayer
-from src.training.train_ppo_rct import RandomPoolTeambuilder
+from src.core.team_pool import RandomPoolTeambuilder
 
 
 def make(ckpt, name, pool):

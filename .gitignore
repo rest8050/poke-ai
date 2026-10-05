@@ -11,3 +11,7 @@ deploy/dist/
 mod/pokeai/out/
 mod/pokeai/*.jar
 mod/pokeai/rcon.py
+
+# 평가 결과: 장부만 올리고 나머지 산출물/잠금 파일은 제외
+results/*
+!results/ledger.jsonl

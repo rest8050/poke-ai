@@ -19,7 +19,7 @@ from poke_env.teambuilder import Teambuilder
 
 from src.core.model import model_from_ckpt
 from src.evaluation.analyze_model import LoggingPlayer
-from src.training.train_ppo_rct import RandomPoolTeambuilder
+from src.core.team_pool import RandomPoolTeambuilder
 
 
 def _id(x):

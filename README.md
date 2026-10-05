@@ -43,3 +43,10 @@ python train.py
 ---
 
 
+## 평가 체계 (SPRT)
+모델 비교는 고정 판 수 대신 순차 검정(SPRT)으로 한다: 승률 50% 대비 ±δ를 α=β=5%로 가리고, 결론이 나는 즉시 멈춘다.
+- `python tools/arena.py <후보> <챔피언> [--delta 0.03] [--cap 10000]` : 풀(holdout/rare/randomset)을 균등 혼합해 대전, 판마다 `results/ledger.jsonl`에 기록. 종료 코드 0=낫다 1=나쁘다 2=차이 없음 3=상한/중단. 판당 제한 시간 초과는 `void`(집계 제외)
+- `python tools/sprt.py <a> <b>` : 장부에 쌓인 결과로 현재 판정 조회 (옛 결과를 합친 건 참고용)
+- `python tools/bt_report.py --ref v10boot` : 장부 전체의 Bradley–Terry 레이팅(Elo)과 95% 구간
+- `python tools/ledger.py backfill` : 기존 h2h 요약 파일을 장부에 이식
+기본 관문은 δ=3%p(평균 약 2.4천 판), 통과한 후보는 δ=2%p(평균 약 5천 판)로 새 판에서 한 번 더 확인한 뒤 챔피언으로 올린다. 검증: `PYTHONPATH=. python tests/test_sprt.py`

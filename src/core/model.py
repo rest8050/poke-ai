@@ -254,17 +254,13 @@ class DeepPokemonBattleTransformerNet(nn.Module):
                  num_layers: int = 2,
                  entity_features: bool = True,
                  deep_heads: bool = False,
-                 history_mode: str = "flat",
                  cross_rounds: int = 2,
                  head_width: int = 128):
         super().__init__()
-        assert history_mode in ("flat", "typed"), history_mode
-        self.history_mode = history_mode
         self.cross_rounds = cross_rounds
         # 체크포인트 옆 .cfg.json에 저장할 구조 인자 (기본 구조와 다른 모델을 다시 만들 때 필요)
         self.cfg = dict(pokemon_embed_dim=pokemon_embed_dim, history_dim=history_dim, latent_dim=latent_dim,
-                        num_layers=num_layers, history_mode=history_mode, cross_rounds=cross_rounds,
-                        head_width=head_width)
+                        num_layers=num_layers, cross_rounds=cross_rounds, head_width=head_width)
 
         self.pokemon_embed_dim = pokemon_embed_dim
         self.action_dim = self.ACTION_DIM
@@ -292,14 +288,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         # 히스토리: 배틀의 모든 턴 요약을 시퀀스로 보는 인과 트랜스포머 (이전 GRUCell 대체)
         # 턴 요약 = 아군액티브(128) + 상대액티브(128) + 아군팀요약(256) + 상대팀요약(256) + 필드(64) = 832
         turn_dim = pokemon_embed_dim * 2 + team_dim * 2 + 64
-        if history_mode == "typed":
-            # 유형별 토큰: 턴마다 [내 쪽, 상대 쪽, 필드] 3개 토큰. 각자 따로 투영해서 어텐션이 유형별로 조회할 수 있게 함
-            self.my_tok = nn.Linear(pokemon_embed_dim + team_dim, history_dim)
-            self.opp_tok = nn.Linear(pokemon_embed_dim + team_dim, history_dim)
-            self.field_tok = nn.Linear(64, history_dim)
-            self.type_embed = nn.Embedding(3, history_dim)
-        else:
-            self.turn_proj = nn.Linear(turn_dim, history_dim)
+        self.turn_proj = nn.Linear(turn_dim, history_dim)
         self.turn_pos = nn.Embedding(MAX_TURNS, history_dim)
         seq_layer = nn.TransformerEncoderLayer(
             d_model=history_dim, nhead=4, dim_feedforward=history_dim * 2, dropout=0.0,
@@ -307,7 +296,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         )
         self.history_seq = nn.TransformerEncoder(seq_layer, num_layers=num_layers, enable_nested_tensor=False)
         # 출력 투영을 0으로 시작 → 처음엔 히스토리 = 0 벡터 (기존 체크포인트의 나머지 부분이 안정적으로 이어지도록)
-        self.history_out = nn.Linear(history_dim * (3 if history_mode == "typed" else 1), history_dim)
+        self.history_out = nn.Linear(history_dim, history_dim)
         nn.init.zeros_(self.history_out.weight)
         nn.init.zeros_(self.history_out.bias)
 
@@ -322,7 +311,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
             nn.LayerNorm(latent_dim),
             nn.GELU()
         )
-        
+
         # 팀-매치업 블록: 셀프어텐션(팀 내부 재조율) -> 양방향 크로스어텐션(상대 팀과 대조) 을 cross_rounds번 반복.
         # 라운드가 반복돼야 "상대를 보고 알게 된 것"을 팀원끼리 다시 조율할 수 있음 (기존엔 셀프->크로스 딱 1번뿐이었음)
         self.team_cross = nn.ModuleList([TeamCrossBlock(pokemon_embed_dim, team_dim) for _ in range(cross_rounds)])
@@ -408,21 +397,6 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         B, T = turn_seq.size(0), turn_seq.size(1)
         dev = turn_seq.device
         pos = torch.arange(T, device=dev).clamp(max=MAX_TURNS - 1)
-        if self.history_mode == "typed":
-            pe = self.pokemon_embed_dim
-            td = 2 * pe  # 팀 요약 차원 (mean+max)
-            # turn_input = [내 액티브(pe), 상대 액티브(pe), 내 팀 요약(td), 상대 팀 요약(td), 필드(64)]
-            my = torch.cat([turn_seq[..., :pe], turn_seq[..., 2 * pe:2 * pe + td]], dim=-1)
-            opp = torch.cat([turn_seq[..., pe:2 * pe], turn_seq[..., 2 * pe + td:2 * pe + 2 * td]], dim=-1)
-            fld = turn_seq[..., 2 * pe + 2 * td:]
-            tok = torch.stack([self.my_tok(my), self.opp_tok(opp), self.field_tok(fld)], dim=2)      # [B, T, 3, H]
-            tok = tok + self.type_embed.weight[None, None] + self.turn_pos(pos)[None, :, None]
-            x = tok.reshape(B, T * 3, -1)
-            turn_id = torch.arange(T, device=dev).repeat_interleave(3)
-            blocked = turn_id[None, :] > turn_id[:, None]   # 미래 턴의 토큰은 못 봄 (같은 턴 토큰끼리는 서로 봄)
-            mask = torch.zeros(T * 3, T * 3, device=dev).masked_fill(blocked, float("-inf"))
-            h = self.history_seq(x, mask=mask).reshape(B, T, -1)                                     # [B, T, 3H]
-            return self.history_out(h)
         x = self.turn_proj(turn_seq) + self.turn_pos(pos)
         causal = torch.triu(torch.full((T, T), float("-inf"), device=dev), diagonal=1)
         return self.history_out(self.history_seq(x, mask=causal))
@@ -444,9 +418,9 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         device = my_team_cat.device
         
         # --- 패딩 마스크 생성 (base_stats HP가 0인 빈/미공개 슬롯은 True) ---
-        # my_team_num[:, :, 12] = hp/255 (정규화된 기본 HP 스탯), 0이면 미사용 슬롯
-        my_team_pad_mask = (my_team_num[:, :, 12] == 0.0)   # [B, 6] (Bool)
-        opp_team_pad_mask = (opp_team_num[:, :, 12] == 0.0) # [B, 6] (Bool)
+        # num[:, :, 11] = 기본 HP 종족값/255 (12는 공격). 0이면 미사용 슬롯 — 아래 is_empty(species_stats[:, 0])와 같은 기준
+        my_team_pad_mask = (my_team_num[:, :, 11] == 0.0)   # [B, 6] (Bool)
+        opp_team_pad_mask = (opp_team_num[:, :, 11] == 0.0) # [B, 6] (Bool)
 
         # --- A. 내 팀 6마리 인코딩 ---
         my_pkmn_vectors = []
@@ -563,7 +537,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
             opp_active_vec, opp_team_summary,
             field_features, history
         ], dim=-1) # [B, 1088]
-        
+
         latent = self.fusion(combined_all) # [B, 256]
         
         # --- G. 출력 헤드 ---
@@ -658,6 +632,18 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 PokemonBattleNet = DeepPokemonBattleTransformerNet
 
 
+def build_model(cfg: dict) -> nn.Module:
+    """구조 인자로 모델 생성: {"model": "entity"}면 model_v2.EntityPokemonNet, 아니면 기존 구조"""
+    cfg = dict(cfg)
+    for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
+        if cfg.pop(k, default) != default:
+            raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
+    if cfg.pop("model", "v1") == "entity":
+        from src.core.model_v2 import EntityPokemonNet
+        return EntityPokemonNet(**cfg)
+    return DeepPokemonBattleTransformerNet(**cfg)
+
+
 def save_ckpt(model: nn.Module, path: str):
     """가중치 저장 + 구조 인자를 <path>.cfg.json에 기록 (기본 구조 모델도 기록해 둠)"""
     torch.save(model.state_dict(), path)
@@ -676,7 +662,7 @@ def model_from_ckpt(path: str, map_location="cpu") -> nn.Module:
     if not has_cfg:
         print(f"  ⚠️ {path}에 .cfg.json 없음 → 기본 구조로 생성. 이 체크포인트가 모르는 새 모듈(예: team_cross)은 "
               f"무작위로 남습니다 — 기준/비교 모델로 쓴다면 cfg.json 있는(구조가 맞는) 체크포인트를 쓰세요.")
-    model = DeepPokemonBattleTransformerNet(**cfg)
+    model = build_model(cfg)
     load_compatible(model, torch.load(path, map_location=map_location))
     return model
 

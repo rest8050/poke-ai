@@ -25,12 +25,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.core.model import DeepPokemonBattleTransformerNet, load_compatible, model_from_ckpt, save_ckpt
+from src.core.model import DeepPokemonBattleTransformerNet, build_model, load_compatible, model_from_ckpt, save_ckpt
 from src.core.tensor_encoder import MOVE_NUM_DIM
 from src.training.replay_dataset import OBS_KEYS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-KEYS = OBS_KEYS + ["action_mask", "target", "value_target", "action_taken"]
+KEYS = OBS_KEYS + ["action_mask", "target", "action_taken"]
+GAMMA = 0.995  # replay_dataset.py / build_fp_dataset.py와 동일
 
 
 def make_batches(data, offsets, idx, size, shuffle):
@@ -42,14 +43,28 @@ def make_batches(data, offsets, idx, size, shuffle):
         b = {k: torch.from_numpy(np.concatenate([data[k][offsets[j]:offsets[j + 1]] for j in sel])) for k in KEYS}
         b = {k: v.float() if v.dtype == torch.float16 else v for k, v in b.items()}
         lens = [offsets[j + 1] - offsets[j] for j in sel]
+        # 가치 타겟 = 할인된 최종 결과 γ^(남은 턴)·(±1) → 가치 헤드가 승패 기대값(승률)을 직접 배움 (예전 저장값 value_target은 Φ를 뺀 차이값이라 안 씀)
+        b["value_target"] = torch.cat([GAMMA ** torch.arange(n - 1, -1, -1, dtype=torch.float32) * float(data["outcome"][j]) for j, n in zip(sel, lens)])
         b["seq_index"] = torch.cat([torch.full((n,), s) for s, n in enumerate(lens)])
         b["time_index"] = torch.cat([torch.arange(n) for n in lens])
         b["n_seq"] = len(sel)
         yield b
 
 
-def pg_loss(logp, b, value_target):
-    """정책 그라디언트 보조 손실: 실제 승패에서 온 advantage(value_target, 이미 베이스라인 뺌)로
+def shape_target(t, prune, temp):
+    """교사 분포 정리: prune 미만 확률 행동은 잡음(탐색 방문 수의 꼬리)으로 보고 0 → 재정규화, temp<1이면 분포를 날카롭게(p^(1/temp)).
+    최상위 행동은 항상 남김 → argmax 불변. 둘 다 기본값(0, 1)이면 원본 그대로."""
+    if prune > 0:
+        t = torch.where((t >= prune) | (t == t.max(-1, keepdim=True).values), t, torch.zeros_like(t))
+        t = t / t.sum(-1, keepdim=True)
+    if temp != 1.0:
+        t = t.clamp_min(0) ** (1.0 / temp)
+        t = t / t.sum(-1, keepdim=True)
+    return t
+
+
+def pg_loss(logp, b, adv):
+    """정책 그라디언트 보조 손실: 실제 승패에서 온 advantage(adv = 할인된 결과 − 현재 가치 예측)로
     Foul Play가 실제 그 판에서 둔 수의 확률을 가중. 배치 내 정규화로 판당 표본 1개짜리 큰 분산을 줄임.
     action_taken == -1(실제 선택이 우리 22칸에 안 매칭된 결정)은 제외."""
     valid = b["action_taken"] >= 0
@@ -57,30 +72,14 @@ def pg_loss(logp, b, value_target):
         return logp.new_zeros(())
     a_idx = b["action_taken"].clamp(min=0)
     logp_a = logp.gather(-1, a_idx.unsqueeze(-1)).squeeze(-1)
-    adv = value_target
     if valid.sum() > 1:
         m, s = adv[valid].mean(), adv[valid].std().clamp_min(1e-6)
         adv = (adv - m) / s
     return -(logp_a * adv.detach() * valid.float()).sum() / valid.float().sum().clamp_min(1)
 
 
-def boot_value_target(b, ref_value, args):
-    """value_target을 손으로 짠 잠재함수(Φ) 대신 기준 모델(ref)의 학습된 가치 헤드로 부트스트랩.
-    target(t) = γ^H·V_ref(s_{t+H}) − V_ref(s_t) (같은 판 안에서 H턴 뒤가 있을 때만).
-    배틀 끝 H턴 이내라 미래 시점이 없으면 npz에 저장된 기존 Φ 기반 value_target으로 대체
-    (근사 — 그 구간만 옛 방식 편향이 남음. --boot-horizon 0이면 이 함수 자체를 안 씀 = 기존 동작 그대로).
-    ref_value: ref.forward_sequences(...)["value"]를 [N]으로 편 것 (no_grad로 이미 계산됨)."""
-    H = args.boot_horizon
-    n = ref_value.shape[0]
-    idx = torch.arange(n, device=ref_value.device)
-    fut = (idx + H).clamp(max=n - 1)
-    same_battle = (idx + H < n) & (b["seq_index"][fut] == b["seq_index"])
-    boot = (args.gamma ** H) * ref_value[fut] - ref_value
-    return torch.where(same_battle, boot, b["value_target"])
-
-
 def run(model, ref, data, offsets, idx, args, train, opt=None):
-    model.train(bool(train and not args.no_dropout))  # 학습 중에는 드롭아웃(트랜스포머/융합층 0.1)을 켬 → 오래된 데이터를 반복해서 외우는 것을 늦춤. 검증은 항상 끔
+    model.train(bool(train))  # 학습 중에는 드롭아웃(트랜스포머/융합층 0.1)을 켬 → 오래된 데이터를 반복해서 외우는 것을 늦춤. 검증은 항상 끔
     tot = dict(ce=0.0, v=0.0, kl=0.0, pg=0.0, agree=0, n=0, chg=0, chg_agree=0)
     for b in make_batches(data, offsets, idx, args.batch_battles, train):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
@@ -88,13 +87,20 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
             out = model.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
             with torch.no_grad():
                 ref_out = ref.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
-            vt = boot_value_target(b, ref_out["value"].view(-1), args) if args.boot_horizon > 0 else b["value_target"]
             logp = F.log_softmax(out["policy_logits"], -1)
-            ce = -(b["target"] * logp).sum(-1).mean()
-            v = F.mse_loss(out["value"].view(-1), vt)
+            ce_i = -(shape_target(b["target"], args.target_prune, args.target_temp) * logp).sum(-1)
+            ce = ce_i.mean()   # 보고용 (가중치 없음)
+            ce_loss = ce
+            if args.switch_weight != 1.0:   # 자발 결정(기술/교체 둘 다 가능) 중 교사가 교체를 고른 결정의 CE를 더 크게
+                am = b["action_mask"]
+                vol = am[:, :8].any(-1) & am[:, 8:14].any(-1)
+                tsw = (b["target"].argmax(-1) >= 8) & (b["target"].argmax(-1) < 14) & vol
+                w = 1.0 + (args.switch_weight - 1.0) * tsw.float()
+                ce_loss = (w * ce_i).sum() / w.sum()
+            v = F.mse_loss(out["value"].view(-1), b["value_target"])
             kl = F.kl_div(logp, F.softmax(ref_out["policy_logits"], -1), reduction="batchmean")
-            pg = pg_loss(logp, b, vt)
-            loss = ce + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg
+            pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
+            loss = ce_loss + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg
         if train:
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
@@ -150,6 +156,7 @@ def load(pattern, fp16=False):
         assert pos == total, (k, pos, total)
         data[k] = out
         del first
+    data["outcome"] = np.concatenate([p["outcome"] for p in parts])
     lens = np.concatenate([p["lens"] for p in parts])
     return data, np.concatenate([[0], np.cumsum(lens)]), lens, files
 
@@ -163,7 +170,7 @@ def main(args):
     print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판")
 
     arch = json.loads(args.arch) if args.arch else {}
-    model = DeepPokemonBattleTransformerNet(**arch)
+    model = build_model(arch)
     if args.init != "none":
         expanded, skipped = load_compatible(model, torch.load(args.init, map_location="cpu"))
         # load_compatible이 체크포인트에 깊은 헤드 키가 있으면 model.enable_deep_heads()를 자동 호출해 파라미터를 늘릴 수 있음
@@ -186,8 +193,6 @@ def main(args):
         raise SystemExit("❌ --init none이면 --aux-teacher가 필요함 (KL 기준 모델)")
     ref = model_from_ckpt(ref_path)
     print(f"모델 {tot/1e6:.2f}M 구조 {arch or '기본'} | 시작 {args.init} | KL 기준 {ref_path}")
-    if args.deep_heads:
-        model.enable_deep_heads()  # 시작 출력은 그대로(0 초기화). ref는 시작 정책 그대로 두어 KL 기준점이 됨
     model.to(DEVICE)
     ref.to(DEVICE).eval()
     for p in ref.parameters():
@@ -231,10 +236,9 @@ if __name__ == "__main__":
     ap.add_argument("--data", default="data/fp_selfplay/ms100/fp_data*.npz", help="build_fp_dataset.py 출력 (glob)")
     ap.add_argument("--init", default="checkpoints/supervised_v2_fp_all8a.pt", help="시작 체크포인트. 앞으로는 BC가 아니라 직전 최신 모델에서 이어서 학습")
     ap.add_argument("--out", default="checkpoints/supervised_v2_fp_next.pt")
-    ap.add_argument("--arch", default="", help="모델 구조 JSON. 예: {\"pokemon_embed_dim\":192,\"history_dim\":384,\"latent_dim\":384,\"num_layers\":3,\"history_mode\":\"typed\"}. 비우면 기본 구조")
+    ap.add_argument("--arch", default="", help="모델 구조 JSON. 예: {\"pokemon_embed_dim\":192,\"history_dim\":384,\"latent_dim\":384,\"num_layers\":3}. 비우면 기본 구조")
     ap.add_argument("--aux-teacher", default="", help="KL 기준 모델 체크포인트 (기본: --init). --init none(처음부터 학습)일 때 필수")
     ap.add_argument("--kl-final", type=float, default=1.0, help="마지막 에폭의 KL 계수 배율 (첫 에폭 1.0에서 선형 변화). 예: 0.2")
-    ap.add_argument("--no-dropout", action="store_true", help="학습 중 드롭아웃을 끔 (2026-09-27 이전 동작). 기본은 켬")
     ap.add_argument("--fp16-store", action="store_true", help="관측 배열을 float16으로 메모리에 보관 (데이터가 커서 RAM이 모자랄 때). 값 정밀도는 약 3자리")
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-3, help="피크 학습률. 스윕(코사인, 학생 상태 홀드아웃 CE): 1e-3 1.5005 / 2e-3 1.4906 / 3e-3 1.4958 / 4e-3 1.5034")
@@ -244,11 +248,10 @@ if __name__ == "__main__":
     ap.add_argument("--batch-battles", type=int, default=32)
     ap.add_argument("--value-coef", type=float, default=0.25)
     ap.add_argument("--kl-coef", type=float, default=0.05, help="시작 정책과의 KL (클수록 시작 정책 유지). 최적해가 (교사 + 계수*시작정책)/(1+계수) 혼합이라 크면 시작 정책 쪽으로 끌려감")
-    ap.add_argument("--pg-coef", type=float, default=0.0, help="실제 승패(value_target=advantage) 기반 정책 그라디언트 보조 손실 가중치. "
+    ap.add_argument("--pg-coef", type=float, default=0.0, help="실제 승패(할인된 결과 − 가치 예측 = advantage) 기반 정책 그라디언트 보조 손실 가중치. "
                     "0=끔(기본, 기존 동작 그대로). 장기 자산(장판/트릭룸/날씨) 신용 할당을 정책에도 흘려보내려는 실험적 항 — 작게(0.03~0.1) 시작할 것")
+    ap.add_argument("--target-prune", type=float, default=0.0, help="교사 분포에서 이 확률 미만인 행동을 0으로 (예: 0.05). 0=끔. 검증 CE도 정리된 타깃 기준이라 다른 설정과 숫자 비교 불가")
+    ap.add_argument("--target-temp", type=float, default=1.0, help="교사 분포를 p^(1/temp)로 날카롭게 (예: 0.75). 1=끔")
+    ap.add_argument("--switch-weight", type=float, default=1.0, help="자발 결정 중 교사가 교체를 고른 결정의 CE 가중치 (예: 2.5). 1=끔. 보고되는 CE는 가중치 없는 값")
     ap.add_argument("--val-frac", type=float, default=0.1)
-    ap.add_argument("--deep-heads", action="store_true", help="기술/교체 점수 헤드에 깊은 잔차 가지를 추가 (model.ResHead). 이미 켜진 체크포인트는 자동 감지")
-    ap.add_argument("--boot-horizon", type=int, default=0, help="value_target을 손짠 잠재함수(Φ) 대신 ref의 학습된 가치 헤드로 H턴 부트스트랩"
-                    "(target=γ^H·V_ref(s+H)-V_ref(s), 배틀 끝 H턴 이내면 기존 Φ 기반 값으로 대체). 0=끔(기존 동작 그대로)")
-    ap.add_argument("--gamma", type=float, default=0.995, help="--boot-horizon 할인율 (replay_dataset.py 기본값과 동일)")
     main(ap.parse_args())

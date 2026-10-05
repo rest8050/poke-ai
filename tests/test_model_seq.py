@@ -15,7 +15,7 @@ def random_obs(n, gen):
     opp_cat = torch.randint(1, 8, (n, 6, 11), generator=gen)
     my_num = torch.rand(n, 6, NUM_DIM, generator=gen); my_num[:, :, 0] = 0; my_num[:, 0, 0] = 1
     opp_num = torch.rand(n, 6, NUM_DIM, generator=gen); opp_num[:, :, 0] = 0; opp_num[:, 1, 0] = 1
-    opp_num[:, 4:, 12:19] = 0  # 미공개 상대 슬롯
+    opp_num[:, 4:, 11:19] = 0  # 미공개 상대 슬롯 (종족값 전부 0 = 패딩)
     return [my_cat, my_num, torch.rand(n, 6, 4, 46, generator=gen), opp_cat, opp_num,
             torch.rand(n, 6, 4, 46, generator=gen), torch.rand(n, FIELD_DIM, generator=gen)]
 

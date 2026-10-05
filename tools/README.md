@@ -1,7 +1,7 @@
 # tools/ 자주 쓰는 명령어
 
 모든 명령은 `poke-ai` 폴더에서 bash로 실행 (경로는 `C:/Users/lsh/Desktop/orcl_server`, 파이썬은 kosa conda 환경 `/c/Users/lsh/anaconda3/envs/kosa/python.exe`).
-Foul Play(Docker) 관련 스크립트는 Docker 실행 중 + 이미지 `fp-runner` 필요. Showdown 서버(:8000)는 `train_bc_chain.sh`만 알아서 켜고 끄고, `fp_eval.sh`/`fp_selfplay.sh`/`analyze_model.py`는 미리 수동으로 켜둬야 함.
+Foul Play(Docker) 관련 스크립트는 Docker 실행 중 + 이미지 `fp-runner` 필요. Showdown 서버(:8000)는 `fp_selfplay.sh`·`analyze_model.py`·`arena.py` 실행 전에 미리 수동으로 켜둬야 함.
 
 ## 0. Showdown 서버 켜기/끄기 (수동 필요할 때)
 
@@ -54,13 +54,9 @@ node tools/dump_entities.js
 python tools/build_entity_features.py
 ```
 
-## 2. BC 학습 (사람 리플레이)
+## 2. BC 학습
 
-```bash
-bash tools/train_bc_chain.sh          # 샤드 4덩어리 전부 이어서 학습 + A/B/C 평가까지
-bash tools/train_bc_chain.sh 3 4      # 덩어리 3~4만 이어서 (덩어리 1~2는 이미 끝난 상태)
-```
-체크포인트: `checkpoints/supervised_v2.pt`, 로그: `logs/train_v2_results.txt`.
+BC 학습 코드(`train_bc.py`)는 정리해서 삭제함. 현재 계보는 Foul Play 증류만 이어가며 BC 원본 체크포인트는 `checkpoints/supervised_v2.pt`로 보존. 코드가 필요하면 GitHub 커밋 `ee0df15`에 있음.
 
 ## 3. Foul Play 데이터 수집 (탐색 교사 데이터)
 
@@ -107,14 +103,11 @@ python src/training/train_fp_distill.py --data "data/fp_selfplay/ms300/fp_data*.
 ## 5. 평가
 
 ```bash
-# Foul Play와 직접 붙어서 승률 (Showdown 서버 미리 켜둘 것)
-bash tools/fp_eval.sh 4 20 50 ev01 checkpoints/supervised_v2.pt
+# 모델끼리 승률 비교 (SPRT): python tools/arena.py <새모델> <기준모델> --delta 0.03  (README 본문 '평가 체계' 참고)
 
 # RCT/휴리스틱 상대로 홀드아웃 풀 평가
 python src/evaluation/analyze_model.py --ckpt checkpoints/supervised_v2.pt --mode argmax \
   --battles 1000 --opponent rct --pool data/team_pool_metamon_holdout.json --workers 6
-
-python tools/summ_eval.py supervised_v2 metamon_holdout   # 방금 낸 analyze_model.py 결과 한 줄 요약
 ```
 
 평가는 항상 holdout(A)/rare(B)/randomset(C) 풀에만. 학습 풀(train_a*, rare_train*, randomset_train3)로 평가하지 말 것.
