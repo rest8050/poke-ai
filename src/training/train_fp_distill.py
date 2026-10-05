@@ -84,9 +84,12 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
     for b in make_batches(data, offsets, idx, args.batch_battles, train):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
-            out = model.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
-            with torch.no_grad():
-                ref_out = ref.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.bf16):   # 손실 계산은 아래에서 float32로
+                out = model.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
+                with torch.no_grad():
+                    ref_out = ref.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
+            out = {k: v.float() for k, v in out.items()}
+            ref_out = {k: v.float() for k, v in ref_out.items()}
             logp = F.log_softmax(out["policy_logits"], -1)
             ce = -(shape_target(b["target"], args.target_prune, args.target_temp) * logp).sum(-1).mean()
             v = F.mse_loss(out["value"].view(-1), b["value_target"])
@@ -244,5 +247,6 @@ if __name__ == "__main__":
                     "0=끔(기본, 기존 동작 그대로). 장기 자산(장판/트릭룸/날씨) 신용 할당을 정책에도 흘려보내려는 실험적 항 — 작게(0.03~0.1) 시작할 것")
     ap.add_argument("--target-prune", type=float, default=0.0, help="교사 분포에서 이 확률 미만인 행동을 0으로 (예: 0.05). 0=끔. 검증 CE도 정리된 타깃 기준이라 다른 설정과 숫자 비교 불가")
     ap.add_argument("--target-temp", type=float, default=1.0, help="교사 분포를 p^(1/temp)로 날카롭게 (예: 0.75). 1=끔")
+    ap.add_argument("--bf16", action="store_true", help="bfloat16 자동 혼합정밀도 (큰 모델에서 GPU 메모리/시간 크게 절약)")
     ap.add_argument("--val-frac", type=float, default=0.1)
     main(ap.parse_args())

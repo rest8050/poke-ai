@@ -638,9 +638,13 @@ def build_model(cfg: dict) -> nn.Module:
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
-    if cfg.pop("model", "v1") == "entity":
+    kind = cfg.pop("model", "v1")
+    if kind == "entity":
         from src.core.model_v2 import EntityPokemonNet
         return EntityPokemonNet(**cfg)
+    if kind == "v3":
+        from src.core.model_v3 import EntityPokemonNetV3
+        return EntityPokemonNetV3(**cfg)
     return DeepPokemonBattleTransformerNet(**cfg)
 
 
