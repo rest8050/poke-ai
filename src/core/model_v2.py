@@ -17,11 +17,10 @@ class EntityPokemonNet(nn.Module):
 
     def __init__(self, vocab_path: str = "data/vocab.json", d_model: int = 192, n_layers: int = 4, n_heads: int = 6,
                  ff_mult: int = 4, dropout: float = 0.0, history_dim: int = 256, hist_layers: int = 2, latent_dim: int = 256,
-                 head_width: int = 128, field_dim: int = 58, entity_features: bool = True, switch_ctx: bool = False):
+                 head_width: int = 128, field_dim: int = 58, entity_features: bool = True):
         super().__init__()
         self.cfg = dict(model="entity", d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
-                        history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width, switch_ctx=switch_ctx)
-        self.switch_ctx = switch_ctx
+                        history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width)
         d = self.d = d_model
         self.latent_dim = latent_dim
         self.embeddings = PokemonEmbeddingLayer(vocab_path=vocab_path, feature_path="data/entity_features.npz" if entity_features else "")
@@ -47,10 +46,8 @@ class EntityPokemonNet(nn.Module):
         self.fusion = nn.Sequential(nn.Linear(d + history_dim, latent_dim * 2), nn.LayerNorm(latent_dim * 2), nn.GELU(), nn.Dropout(0.1),
                                     nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
         self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d, head_width), nn.GELU(), nn.Linear(head_width, 2))
-        # switch_ctx: 교체/기술 판단(type_head)과 교체 후보 점수가 상대 활성·내 활성·(후보와 상대 활성의 곱)을 직접 봄
-        #   type_head 입력 = [latent, 내 활성, 상대 활성, 교체 가능 후보 중 최댓값 풀링] / 후보 점수 입력 = [latent, 후보, 상대 활성, 내 활성, 후보*상대 활성]
-        self.switch_score = nn.Sequential(nn.Linear(latent_dim + (4 if switch_ctx else 1) * d, head_width), nn.GELU(), nn.Linear(head_width, 1))
-        self.type_head = nn.Linear(latent_dim + (3 * d if switch_ctx else 0), 2)
+        self.switch_score = nn.Sequential(nn.Linear(latent_dim + d, head_width), nn.GELU(), nn.Linear(head_width, 1))
+        self.type_head = nn.Linear(latent_dim, 2)
         is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
         is_switch[8:14] = True
         self.register_buffer("is_switch", is_switch, persistent=False)
@@ -85,8 +82,7 @@ class EntityPokemonNet(nn.Module):
         a = my_team_num[:, :, 0].argmax(1)
         ar = torch.arange(B, device=dev)
         my_mv = out[:, 12:60].view(B, 12, 4, d)[:, :6]
-        oa = opp_team_num[:, :, 0].argmax(1)
-        return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, a], "active_mv": my_mv[ar, a], "opp_active_mon": out[:, 6:12][ar, oa]}
+        return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, a], "active_mv": my_mv[ar, a]}
 
     def _history(self, turn_seq):
         B, T = turn_seq.size(0), turn_seq.size(1)
@@ -100,17 +96,9 @@ class EntityPokemonNet(nn.Module):
         latent = self.fusion(torch.cat([enc["cls"], history], -1))
         mv_in = torch.cat([latent[:, None].expand(-1, 4, -1), enc["active_mv"], enc["active_mon"][:, None].expand(-1, 4, -1)], -1)
         sw_in = torch.cat([latent[:, None].expand(-1, 6, -1), enc["my_mon"]], -1)
-        type_in = latent
-        if self.switch_ctx:
-            act, opp = enc["active_mon"], enc["opp_active_mon"]
-            ok = action_mask[:, 8:14] if action_mask is not None else torch.ones(B, 6, dtype=torch.bool, device=latent.device)
-            bench = enc["my_mon"].masked_fill(~ok[..., None], -1e4).max(1).values
-            bench = torch.where(ok.any(1, keepdim=True), bench, torch.zeros_like(bench))          # 교체 가능한 후보가 없으면 0
-            type_in = torch.cat([latent, act, opp, bench], -1)
-            sw_in = torch.cat([sw_in, opp[:, None].expand(-1, 6, -1), act[:, None].expand(-1, 6, -1), enc["my_mon"] * opp[:, None]], -1)
         mv, sw = self.move_score(mv_in), self.switch_score(sw_in).squeeze(-1)
         detail = torch.cat([mv[..., 0], mv[..., 1], sw, latent.new_full((B, 8), -1e9)], 1)
-        type_logits = self.type_head(type_in)
+        type_logits = self.type_head(latent)
         if action_mask is not None:
             detail = detail.masked_fill(~action_mask, -1e9)
             no_move = ~(action_mask & ~self.is_switch).any(dim=1)

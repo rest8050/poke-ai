@@ -88,19 +88,11 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
             with torch.no_grad():
                 ref_out = ref.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
             logp = F.log_softmax(out["policy_logits"], -1)
-            ce_i = -(shape_target(b["target"], args.target_prune, args.target_temp) * logp).sum(-1)
-            ce = ce_i.mean()   # 보고용 (가중치 없음)
-            ce_loss = ce
-            if args.switch_weight != 1.0:   # 자발 결정(기술/교체 둘 다 가능) 중 교사가 교체를 고른 결정의 CE를 더 크게
-                am = b["action_mask"]
-                vol = am[:, :8].any(-1) & am[:, 8:14].any(-1)
-                tsw = (b["target"].argmax(-1) >= 8) & (b["target"].argmax(-1) < 14) & vol
-                w = 1.0 + (args.switch_weight - 1.0) * tsw.float()
-                ce_loss = (w * ce_i).sum() / w.sum()
+            ce = -(shape_target(b["target"], args.target_prune, args.target_temp) * logp).sum(-1).mean()
             v = F.mse_loss(out["value"].view(-1), b["value_target"])
             kl = F.kl_div(logp, F.softmax(ref_out["policy_logits"], -1), reduction="batchmean")
             pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
-            loss = ce_loss + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg
+            loss = ce + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg
         if train:
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
@@ -252,6 +244,5 @@ if __name__ == "__main__":
                     "0=끔(기본, 기존 동작 그대로). 장기 자산(장판/트릭룸/날씨) 신용 할당을 정책에도 흘려보내려는 실험적 항 — 작게(0.03~0.1) 시작할 것")
     ap.add_argument("--target-prune", type=float, default=0.0, help="교사 분포에서 이 확률 미만인 행동을 0으로 (예: 0.05). 0=끔. 검증 CE도 정리된 타깃 기준이라 다른 설정과 숫자 비교 불가")
     ap.add_argument("--target-temp", type=float, default=1.0, help="교사 분포를 p^(1/temp)로 날카롭게 (예: 0.75). 1=끔")
-    ap.add_argument("--switch-weight", type=float, default=1.0, help="자발 결정 중 교사가 교체를 고른 결정의 CE 가중치 (예: 2.5). 1=끔. 보고되는 CE는 가중치 없는 값")
     ap.add_argument("--val-frac", type=float, default=0.1)
     main(ap.parse_args())
