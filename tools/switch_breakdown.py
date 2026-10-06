@@ -1,5 +1,5 @@
 """교체 판단 분해 진단: python tools/switch_breakdown.py <모델이름> ...  (checkpoints/supervised_v2_fp_<이름>.pt, dg2_ho 기준)
-교사가 교체한 결정에서 학생이 교체하는 비율/후보 정확도, 교사가 기술을 고른 결정에서 교체로 새는 비율/기술 정확도. 두 모델(pilA, pilB)이 있으면 정확 일치 증가분을 구간별로 분해"""
+교사가 교체한 결정에서 학생이 교체하는 비율/후보 정확도, 교사가 기술을 고른 결정에서 교체로 새는 비율/기술 정확도. 두 모델(v1_pilot, ent_pilot)이 있으면 정확 일치 증가분을 구간별로 분해"""
 import sys, numpy as np, torch
 sys.path.insert(0, ".")
 from src.core.model import model_from_ckpt
@@ -35,6 +35,6 @@ for name in sys.argv[1:]:
     print(f"  교사=교체: 학생도 교체 {r['sw_recall']:.3f} | 정확한 교체 후보까지 일치 {r['sw_exact']:.3f} | (교체 선택한 경우 후보 정확도 {r['sw_which']:.3f})")
     print(f"  교사=기술: 학생이 교체로 샘 {r['mv_false_sw']:.3f} | 정확한 기술 일치 {r['mv_exact']:.3f} | (기술 선택한 경우 기술 정확도 {r['mv_which']:.3f})")
     print(f"  학생이 교체를 고른 것 중 교사도 교체 {r['sw_prec']:.3f}")
-if "pilA" in res and "pilB" in res:
-    a, b = res["pilA"], res["pilB"]; s = a["share_sw"]
+if "v1_pilot" in res and "ent_pilot" in res:
+    a, b = res["v1_pilot"], res["ent_pilot"]; s = a["share_sw"]
     print(f"정확 일치 증가분 분해: 교사=교체 구간 {s*(b['sw_exact']-a['sw_exact'])*100:+.2f}%p, 교사=기술 구간 {(1-s)*(b['mv_exact']-a['mv_exact'])*100:+.2f}%p")

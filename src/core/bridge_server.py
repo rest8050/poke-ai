@@ -5,12 +5,18 @@
 2) poke-env Battle에 반영 → 학습 때와 같은 인코더 → 신경망(all8a) → 행동 하나를 돌려준다.
 행동은 {"kind": "move", "id", "tera"} / {"kind": "switch", "uuid"} / {"kind": "default"}.
 
-실행: python -m src.core.bridge_server            (기본 127.0.0.1:8765, 체크포인트는 환경변수 POKEAI_CKPT)
+실행: python -m src.core.bridge_server            (기본 127.0.0.1:8765)
+
+모델 교체: 서비스 재시작 없이 포인터 파일(기본 checkpoints/CURRENT, 환경변수 POKEAI_POINTER)에 체크포인트 파일 이름 한 줄을 쓰면 된다.
+  - 새 배틀(세션)이 시작될 때 포인터가 바뀐 걸 발견하면(최대 5초 지연) 새 모델을 읽어 예열한 뒤 바꿔 끼움. 진행 중인 배틀은 시작한 모델로 끝까지 둠
+    (히스토리 상태가 모델마다 달라서). 읽기에 실패하면 이전 모델을 그대로 쓰고 경고만 남김. 포인터가 없으면 환경변수 POKEAI_CKPT.
+  - 구조는 체크포인트 옆 .cfg.json으로 복원(model_from_ckpt) — 새 구조는 코드(src/core)가 서버에 있어야 함 (deploy/push_model.sh --code)
 """
 import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import OrderedDict
 from typing import List, Optional
@@ -22,12 +28,14 @@ from pydantic import BaseModel
 
 from poke_env.battle import Battle
 
-from src.core.model import DeepPokemonBattleTransformerNet, load_compatible
+from src.core.model import model_from_ckpt
 from src.core.rct_player import eff_move
 from src.core.search import decode_action
 from src.core.tensor_encoder import BattleTensorEncoder
 
-CKPT = os.environ.get("POKEAI_CKPT", "checkpoints/supervised_v2_fp_all8a.pt")
+CKPT = os.environ.get("POKEAI_CKPT", "checkpoints/supervised_v2_fp_all8a.pt")      # 포인터 파일이 없을 때 쓰는 기본값
+POINTER = os.environ.get("POKEAI_POINTER", "checkpoints/CURRENT")                   # 한 줄: 체크포인트 파일 이름(포인터와 같은 폴더) 또는 경로
+RECHECK_SEC = 5.0
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 DETAILS_RE = re.compile(r"([^|,\"]+), (" + UUID + r")")           # "Monferno, <uuid>, L69, M" → 종 이름 ↔ uuid
 IDENT_RE = re.compile(r"(p[12][abc]?): (" + UUID + r")")            # "p1a: <uuid>" → "p1a: Monferno"
@@ -37,14 +45,11 @@ log = logging.getLogger("bridge")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 torch.set_num_threads(1)
 
-model = DeepPokemonBattleTransformerNet()
-load_compatible(model, torch.load(CKPT, map_location="cpu"))
-model.eval()
 encoder = BattleTensorEncoder()
 
 
-def warmup():
-    """서버 시작 때 모델을 한 번 돌려 둠 (첫 호출이 0.5초 걸리는 초기화를 배틀 중에 겪지 않도록)."""
+def warmup(model):
+    """모델을 한 번 돌려 둠 (첫 호출이 0.5초 걸리는 초기화를 배틀 중에 겪지 않도록)."""
     from src.core.tensor_encoder import FIELD_DIM, NUM_DIM
     g = torch.Generator().manual_seed(0)
     my_num = torch.rand(1, 6, NUM_DIM, generator=g)
@@ -61,15 +66,60 @@ def warmup():
     log.info("모델 예열 완료 (%.0fms)", (time.perf_counter() - t0) * 1000)
 
 
-warmup()
+class ModelHolder:
+    """현재 모델 보관 + 포인터 파일 감시. 새 세션이 시작될 때만 확인해서(최대 RECHECK_SEC마다) 진행 중인 배틀의 모델은 안 바뀜."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.model, self.name, self.sig, self.loaded_at, self.checked = None, None, None, 0.0, 0.0
+        self.refresh(force=True)
+
+    @staticmethod
+    def target():
+        if os.path.exists(POINTER):
+            name = open(POINTER, encoding="utf-8").read().strip().splitlines()[0].strip()
+            path = name if os.path.isabs(name) or os.path.dirname(name) else os.path.join(os.path.dirname(POINTER) or ".", name)
+        else:
+            path = CKPT
+        return path
+
+    def refresh(self, force=False):
+        now = time.time()
+        if not force and now - self.checked < RECHECK_SEC:
+            return self.model
+        with self.lock:
+            self.checked = now
+            try:
+                path = self.target()
+                cfg = path + ".cfg.json"
+                sig = (path, os.path.getmtime(path), os.path.getmtime(cfg) if os.path.exists(cfg) else 0)
+                if sig == self.sig:
+                    return self.model
+                model = model_from_ckpt(path)
+                model.eval()
+                warmup(model)
+                log.info("모델 교체: %s -> %s", self.name, os.path.basename(path))
+                self.model, self.name, self.sig, self.loaded_at = model, os.path.basename(path), sig, now
+            except Exception as e:                      # 실패하면 이전 모델 유지 (처음 시작이면 서버가 뜨지 못하게 그대로 예외)
+                if self.model is None:
+                    raise
+                log.error("모델 교체 실패, 이전 모델(%s) 유지: %s", self.name, e)
+        return self.model
+
+
+holder = ModelHolder()
 app = FastAPI(title="PokeAI bridge")
 sessions: "OrderedDict[str, Session]" = OrderedDict()
 MAX_SESSIONS = 200
 
 
 class Session:
-    def __init__(self, side: str):
+    def __init__(self, side: str, model, model_name: str):
         self.side = side
+        self.model = model            # 배틀 시작 때의 모델로 끝까지 (히스토리 상태가 모델마다 다름)
+        self.model_name = model_name
+        self.battle_id = ""
+        self.stats_checked = False
         self.battle: Optional[Battle] = None
         self.history = None
         self.species_of_uuid = {}   # uuid → 종 이름 (프로토콜의 UUID 이름을 poke-env가 아는 이름으로 바꾸는 표)
@@ -251,7 +301,7 @@ def pick(sess: Session):
         return {"kind": "default", "why": "선택 가능한 행동 없음"}
     tensors = encoder.encode_battle(battle)
     mask = tensors[7]
-    idx, probs, _, value, sess.history = model.get_action(*tensors[:7], sess.history, mask)
+    idx, probs, _, value, sess.history = sess.model.get_action(*tensors[:7], sess.history, mask)
     decoded = decode_action(battle, idx)
     decode_fn = lambda i: decode_action(battle, i)  # noqa: E731
     idx, decoded = avoid_redundant_trickroom(idx, probs, mask, decoded, decode_fn, _fields_have_trickroom(battle))
@@ -259,7 +309,11 @@ def pick(sess: Session):
     # 재학습 전까진 안전장치로 유지. 재학습 끝나면 순수 성능 확인차 다시 꺼볼 것.
     idx, decoded = avoid_bad_weatherball(idx, probs, mask, decoded, decode_fn, battle)
     top = torch.topk(probs[0], 3)
-    info = {"preview": len(battle.teampreview_opponent_team), "seen": len(battle.opponent_team), "idx": int(idx), "value": round(float(value), 3),
+    if not sess.stats_checked and battle.team:             # 내 팀 실능력치가 요청에서 들어오는지 한 번 확인 (매치업 특징은 실능력치를 전제로 함)
+        sess.stats_checked = True
+        miss = [k for k, m in battle.team.items() if not all((getattr(m, "stats", None) or {}).get(x) for x in ("hp", "atk", "def", "spa", "spd", "spe"))]
+        log.info("[%s] 내 팀 실능력치 %s", sess.battle_id[:8], "모두 있음" if not miss else f"누락: {miss}")
+    info = {"model": sess.model_name, "preview": len(battle.teampreview_opponent_team), "seen": len(battle.opponent_team), "idx": int(idx), "value": round(float(value), 3),
             "top": [(int(i), round(float(p), 3)) for p, i in zip(top.values, top.indices)]}
     if decoded is None:
         return {"kind": "default", "why": f"행동 {idx} 실행 불가", **info}
@@ -274,7 +328,14 @@ def pick(sess: Session):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ckpt": CKPT, "sessions": len(sessions)}
+    return {"status": "ok", "ckpt": holder.name, "loaded_age_s": round(time.time() - holder.loaded_at), "pointer": POINTER, "sessions": len(sessions)}
+
+
+@app.post("/reload")
+def reload_model():
+    """포인터를 지금 바로 다시 확인 (보통은 새 배틀이 시작될 때 자동)"""
+    holder.refresh(force=True)
+    return health()
 
 
 @app.post("/choose")
@@ -282,7 +343,9 @@ def choose(req: ChooseRequest):
     t0 = time.perf_counter()
     sess = sessions.get(req.battle_id)
     if sess is None:
-        sess = sessions[req.battle_id] = Session(req.side)
+        holder.refresh()
+        sess = sessions[req.battle_id] = Session(req.side, holder.model, holder.name)
+        sess.battle_id = req.battle_id
         while len(sessions) > MAX_SESSIONS:
             sessions.popitem(last=False)
     sess.n_calls += 1

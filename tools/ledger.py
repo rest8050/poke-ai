@@ -109,13 +109,13 @@ def balanced(game_rows):
 
 # 지금까지 돌린 대전 중 결과 파일이 남아 있는 것 (파일에 풀별 줄이 있음). 파일이 덮어써진 것은 값을 직접 적음
 KNOWN_FILES = [
-    ("logs/h2h_summary_v12r3_run1.txt", "v12r3", "v10boot"), ("logs/h2h_summary_v12r3_run2.txt", "v12r3", "v10boot"),
-    ("logs/h2h_summary_v11head.txt", "v11head", "v10boot"),
-    ("logs/h2h_summary_v13_run1.txt", "v13deep", "v12r3"), ("logs/h2h_summary_v13_run2.txt", "v13deep", "v12r3"),
-    ("logs/h2h_summary_v14pair_all.txt", "v14pair", "v12r3"), ("logs/h2h_summary_v14res_all.txt", "v14res", "v12r3"),
+    ("logs/h2h_summary_v12r3_run1.txt", "v1_full_r3", "v1_full_boot"), ("logs/h2h_summary_v12r3_run2.txt", "v1_full_r3", "v1_full_boot"),
+    ("logs/h2h_summary_v11head.txt", "v11head", "v1_full_boot"),
+    ("logs/h2h_summary_v13_run1.txt", "v13deep", "v1_full_r3"), ("logs/h2h_summary_v13_run2.txt", "v13deep", "v1_full_r3"),
+    ("logs/h2h_summary_v14pair_all.txt", "v14pair", "v1_full_r3"), ("logs/h2h_summary_v14res_all.txt", "v14res", "v1_full_r3"),
 ]
-KNOWN_COUNTS = [  # (출처, a, b, {풀: (a승, b승)})  — 대화 중 기록된 값 (v12r3 대 v12r1은 875판+1000판 중 A풀 일부가 중단돼 있음)
-    ("v12r3_vs_v12r1", "v12r3", "v12r1", {"A": (473, 402), "B": (501, 499), "C": (492, 508)}),
+KNOWN_COUNTS = [  # (출처, a, b, {풀: (a승, b승)})  — 대화 중 기록된 값 (v1_full_r3 대 v12r1은 875판+1000판 중 A풀 일부가 중단돼 있음)
+    ("v12r3_vs_v12r1", "v1_full_r3", "v12r1", {"A": (473, 402), "B": (501, 499), "C": (492, 508)}),
 ]
 
 

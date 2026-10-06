@@ -5,6 +5,12 @@
    - 어텐션 로짓에 편향 bias[h, i, j] = f_h(배율, 데미지, KO, 공격기여부)를 더함: 내 포켓몬 i <-> 상대 기술 토큰 j, 상대 포켓몬 o <-> 내 기술 토큰 j (층마다 따로 학습)
    - 교체 후보 점수와 교체/기술 판단(type_head)에 후보별·활성 매치업 요약을 직접 입력
 3) 히스토리: 턴 요약 = [CLS, 내 활성 토큰, 상대 활성 토큰, 필드/직전 사건 벡터] (v2는 CLS만)
+4) unrevealed_tokens: 아직 안 드러난 상대 기술 칸도 토큰으로 남기고(미공개 표시 + 숨김 ID 임베딩), 포켓몬 토큰에 공개된 기술 수/4를 더함.
+   (v3full까지는 안 드러난 칸을 어텐션에서 통째로 빼서 "기술을 1개만 가진 포켓몬"과 구분이 안 됐음 — 그 체크포인트는 model_from_ckpt가 False로 복원)
+5) opp_species: 상대 포켓몬에만 종 ID 임베딩을 넣음. 내 쪽은 종 ID를 안 줌(종을 외우지 말고 능력치/기술로 일반화), 상대 쪽은 종별로 흔한 세트(숨겨진 기술/도구/특성)를
+   기억에 의존해 추정하도록: 포켓몬 토큰 입력 + 미공개 기술 칸 토큰에 종 임베딩을 더함. 학습 중 species_dropout 확률로 종을 <unk>로 가려서 처음 보는 종도 능력치만으로 동작하게 함
+6) hidden_head: 상대 포켓몬 토큰에서 숨겨진 기술/도구/특성을 예측하는 보조 헤드 (출력 hid_move/hid_item/hid_ability, 학습은 src/training/hidden_labels.py)
+7) policy: "hier"(잠재 벡터가 기술/교체를 정함, 기존) | "lse"(기술/교체 로짓 = 각 점수의 logsumexp + 학습 보정, 보정 0이면 평탄 softmax와 같음) | "flat"(14칸 전체 softmax)
 인터페이스는 model_v2와 같음 (forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt). arch에 {"model": "v3"}"""
 import torch
 import torch.nn as nn
@@ -29,16 +35,37 @@ class EntityPokemonNetV3(nn.Module):
 
     def __init__(self, vocab_path: str = "data/vocab.json", d_model: int = 256, n_layers: int = 6, n_heads: int = 8,
                  ff_mult: int = 4, dropout: float = 0.0, history_dim: int = 256, hist_layers: int = 2, latent_dim: int = 256,
-                 head_width: int = 192, field_dim: int = 58, entity_features: bool = True):
+                 head_width: int = 192, field_dim: int = 58, entity_features: bool = True,
+                 unrevealed_tokens: bool = True, policy: str = "hier", opp_species: bool = True, species_dropout: float = 0.1, species_dim: int = 32, hidden_head: bool = False):
         super().__init__()
         self.cfg = dict(model="v3", d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
-                        history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width)
+                        history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
+                        unrevealed_tokens=unrevealed_tokens, policy=policy, opp_species=opp_species, species_dropout=species_dropout, species_dim=species_dim, hidden_head=hidden_head)
+        assert policy in ("hier", "lse", "flat"), policy
+        self.hidden_head = hidden_head
+        self.unrevealed_tokens, self.policy, self.opp_species, self.species_dropout = unrevealed_tokens, policy, opp_species, species_dropout
         d = self.d = d_model
         self.n_heads = n_heads
         self.latent_dim = latent_dim
         self.embeddings = PokemonEmbeddingLayer(vocab_path=vocab_path, feature_path="data/entity_features.npz" if entity_features else "")
         self.matchup = Matchup(vocab_path)
-        self.mon_proj = nn.Sequential(nn.Linear(204 + MON_EXTRA, d), nn.LayerNorm(d))
+        self.mon_proj = nn.Sequential(nn.Linear(204 + MON_EXTRA + int(unrevealed_tokens) + (species_dim if opp_species else 0), d), nn.LayerNorm(d))
+        if unrevealed_tokens:
+            self.unk_move = nn.Parameter(torch.zeros(d))                    # 미공개 기술 칸 표시
+        if hidden_head:
+            import json
+            vv = json.load(open(vocab_path, encoding="utf-8"))
+            self.hid_move = nn.Linear(d_model, vv["move"]["<unk>"] + 2)       # id 0..unk+1
+            self.hid_item = nn.Linear(d_model, vv["item"]["<unk>"] + 2)
+            self.hid_ability = nn.Linear(d_model, vv["ability"]["<unk>"] + 2)
+        if opp_species:
+            import json
+            sp = json.load(open(vocab_path, encoding="utf-8"))["species"]
+            self.unk_species = sp["<unk>"]
+            self.species_emb = nn.Embedding(max(sp.values()) + 3, species_dim)
+            nn.init.normal_(self.species_emb.weight, std=0.1)
+            if unrevealed_tokens:
+                self.sp_to_unk = nn.Linear(species_dim, d, bias=False)       # 종이 정하는 "숨겨진 기술에 대한 기대"
         self.move_proj = nn.Sequential(nn.Linear(142 + MV_EXTRA, d), nn.LayerNorm(d))
         self.field_proj = nn.Sequential(nn.Linear(field_dim, d), nn.GELU(), nn.Linear(d, 3 * d))
         self.cls = nn.Parameter(torch.zeros(1, 1, d))
@@ -63,7 +90,11 @@ class EntityPokemonNetV3(nn.Module):
                                     nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
         self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d, head_width), nn.GELU(), nn.Linear(head_width, 2))
         self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_FEAT, head_width), nn.GELU(), nn.Linear(head_width, 1))
-        self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_FEAT + 2, 64), nn.GELU(), nn.Linear(64, 2))
+        if policy != "flat":
+            self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_FEAT + 2, 64), nn.GELU(), nn.Linear(64, 2))
+            if policy == "lse":                                              # 보정 0에서 시작 = 평탄 softmax
+                nn.init.zeros_(self.type_head[2].weight)
+                nn.init.zeros_(self.type_head[2].bias)
         is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
         is_switch[8:14] = True
         self.register_buffer("is_switch", is_switch, persistent=False)
@@ -111,9 +142,17 @@ class EntityPokemonNetV3(nn.Module):
         num = torch.cat([my_team_num, opp_team_num], 1).reshape(B * 12, -1)
         mvn = torch.cat([my_move_num, opp_move_num], 1).reshape(B * 12, 4, -1)
         E = self.embeddings
+        sp_feat = None
+        if self.opp_species:                                                 # 상대 쪽만 종 ID (내 쪽은 0 = 일반화)
+            sid = opp_team_cat[..., 10].long().clamp(0, self.species_emb.num_embeddings - 1)
+            if self.training and self.species_dropout > 0:
+                sid = torch.where(torch.rand(sid.shape, device=dev) < self.species_dropout, torch.full_like(sid, self.unk_species), sid)
+            sp_e = self.species_emb(sid)
+            sp_feat = torch.cat([torch.zeros_like(sp_e), sp_e], 1)           # [B,12,species_dim]
         mon_in = torch.cat([E.species_proj(num[:, 11:18]), E._emb("item", cat[:, 0]), E._emb("ability", cat[:, 1]), E.type_embed(cat[:, 2]),
                             E.type_embed(cat[:, 3]), E.status_embed(cat[:, 4]), E.type_embed(cat[:, 9]), num[:, :11], num[:, 18:],
-                            mon_extra.reshape(B * 12, MON_EXTRA)], -1)
+                            mon_extra.reshape(B * 12, MON_EXTRA)] + ([(mvn.abs().sum(-1) > 0).float().sum(-1, keepdim=True) / 4.0] if self.unrevealed_tokens else [])
+                           + ([sp_feat.reshape(B * 12, -1)] if sp_feat is not None else []), -1)
         raw = E._emb("move", cat[:, 5:9])
         mv_in = torch.cat([E.move_encoder(raw, mvn), raw, mvn, mv_extra.reshape(B * 12, 4, MV_EXTRA)], -1)
         side = torch.arange(12, device=dev) // 6
@@ -126,7 +165,16 @@ class EntityPokemonNetV3(nn.Module):
         cls = self.cls.expand(B, 1, d) + self.role_emb.weight[3]
         x = torch.cat([mon, mv.reshape(B, 48, d), fld, cls], 1)
         mon_pad = (num[:, 11] == 0).view(B, 12)
-        mv_pad = ((mvn.abs().sum(-1) == 0).view(B, 12, 4)) | mon_pad[:, :, None]
+        unrevealed = (mvn.abs().sum(-1) == 0).view(B, 12, 4) & ~mon_pad[:, :, None]
+        if self.unrevealed_tokens:                                           # 안 드러난 칸도 토큰으로 남김 (빈 슬롯의 칸만 마스킹)
+            mv_pad = mon_pad[:, :, None].expand(B, 12, 4)
+            unk = self.unk_move.expand(B, 12, d)
+            if sp_feat is not None:
+                unk = unk + self.sp_to_unk(sp_feat)                          # 종별 기대가 미공개 기술 칸에 실림
+            unk = unk[:, :, None, :].expand(B, 12, 4, d).reshape(B, 48, d)
+            x = torch.cat([x[:, :12], x[:, 12:60] + unrevealed.reshape(B, 48, 1) * unk, x[:, 60:]], 1)
+        else:
+            mv_pad = (mvn.abs().sum(-1) == 0).view(B, 12, 4) | mon_pad[:, :, None]
         pad = torch.cat([mon_pad, mv_pad.reshape(B, 48), mon_pad.new_zeros(B, 4)], 1)
         pad_f = torch.zeros(B, 1, 1, N_TOK, device=dev, dtype=x.dtype).masked_fill(pad[:, None, None, :], float("-inf"))
         for li, layer in enumerate(self.layers):
@@ -136,7 +184,7 @@ class EntityPokemonNetV3(nn.Module):
         my_mon = out[:, :6]
         opp_act = opp_team_num[:, :, 0].argmax(1)
         return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, act_m], "opp_active_mon": out[:, 6:12][ar, opp_act],
-                "active_mv": out[:, 12:60].view(B, 12, 4, d)[:, :6][ar, act_m], "cand": cand, "field": field_vec, "act_m": act_m}
+                "active_mv": out[:, 12:60].view(B, 12, 4, d)[:, :6][ar, act_m], "opp_mon": out[:, 6:12], "cand": cand, "field": field_vec, "act_m": act_m}
 
     def _history(self, turn_seq):
         B, T = turn_seq.size(0), turn_seq.size(1)
@@ -162,20 +210,30 @@ class EntityPokemonNetV3(nn.Module):
         sw_in = torch.cat([latent[:, None].expand(-1, 6, -1), enc["my_mon"], cand], -1)
         mv, sw = self.move_score(mv_in), self.switch_score(sw_in).squeeze(-1)
         detail = torch.cat([mv[..., 0], mv[..., 1], sw, latent.new_full((B, 8), -1e9)], 1)
-        type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr], -1))
         if action_mask is not None:
             detail = detail.masked_fill(~action_mask, -1e9)
-            no_move = ~(action_mask & ~self.is_switch).any(dim=1)
-            no_switch = ~(action_mask & self.is_switch).any(dim=1)
-            type_logits = type_logits.masked_fill(torch.stack([no_move, no_switch], dim=1), -1e9)
-        lp_type = F.log_softmax(type_logits, -1)
-        lp_move = F.log_softmax(detail.masked_fill(self.is_switch, -1e9), -1)
-        lp_switch = F.log_softmax(detail.masked_fill(~self.is_switch, -1e9), -1)
-        policy_logits = torch.where(self.is_switch, lp_type[:, 1:2] + lp_switch, lp_type[:, 0:1] + lp_move)
+        if self.policy == "flat":
+            policy_logits = F.log_softmax(detail, -1)
+        else:
+            type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr], -1))
+            if self.policy == "lse":
+                type_logits = type_logits + torch.stack([torch.logsumexp(detail.masked_fill(self.is_switch, -1e9), -1),
+                                                         torch.logsumexp(detail.masked_fill(~self.is_switch, -1e9), -1)], -1)
+            if action_mask is not None:
+                no_move = ~(action_mask & ~self.is_switch).any(dim=1)
+                no_switch = ~(action_mask & self.is_switch).any(dim=1)
+                type_logits = type_logits.masked_fill(torch.stack([no_move, no_switch], dim=1), -1e9)
+            lp_type = F.log_softmax(type_logits, -1)
+            lp_move = F.log_softmax(detail.masked_fill(self.is_switch, -1e9), -1)
+            lp_switch = F.log_softmax(detail.masked_fill(~self.is_switch, -1e9), -1)
+            policy_logits = torch.where(self.is_switch, lp_type[:, 1:2] + lp_switch, lp_type[:, 0:1] + lp_move)
         opp = self.opp_action_head(latent)
         if opp_action_mask is not None:
             opp = opp.masked_fill(~opp_action_mask, -1e9)
-        return {"policy_logits": policy_logits, "opp_action_logits": opp, "value": self.value_head(latent)}
+        res = {"policy_logits": policy_logits, "opp_action_logits": opp, "value": self.value_head(latent)}
+        if self.hidden_head:
+            res.update(hid_move=self.hid_move(enc["opp_mon"]), hid_item=self.hid_item(enc["opp_mon"]), hid_ability=self.hid_ability(enc["opp_mon"]))
+        return res
 
     def forward(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec,
                 history_state=None, action_mask=None, opp_action_mask=None):

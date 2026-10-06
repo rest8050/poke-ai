@@ -1,6 +1,6 @@
 """후보 대 챔피언 순차 검정(SPRT) 대전: 판이 끝날 때마다 results/ledger.jsonl에 한 줄씩 쓰고, 결론이 나는 즉시 멈춤.
 사용: python tools/arena.py <후보> <챔피언> [--delta 0.03] [--alpha 0.05] [--beta 0.05] [--cap 10000] [--workers 6] [--port 8000]
-  후보/챔피언 = 체크포인트 경로 또는 이름(v12r3 -> checkpoints/supervised_v2_fp_v12r3.pt)
+  후보/챔피언 = 체크포인트 경로 또는 이름(v1_full_r3 -> checkpoints/supervised_v2_fp_v1_full_r3.pt)
   풀(holdout/rare/randomset)을 작업자에 균등 배정하고, 판정은 풀별 판 수를 맞춘 데이터로 함. Showdown이 안 떠 있으면 직접 띄우고 끝나면 내림
   판당 제한 시간(--max-battle-sec) 넘기면 강제 종료하고 'void'로 기록(집계 제외) — 멈춘 판 하나가 전체를 붙잡지 않게
 종료 코드: 0=낫다 1=나쁘다 2=차이 없음 3=상한 도달/비정상 종료"""

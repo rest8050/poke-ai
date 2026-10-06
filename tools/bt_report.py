@@ -1,5 +1,5 @@
 """장부 전체(개별 판 + 이식된 집계)로 Bradley–Terry 레이팅(Elo 척도)과 95% 구간 계산.
-사용: python tools/bt_report.py [--ref v10boot] [--ledger PATH] [--boot 300]
+사용: python tools/bt_report.py [--ref v1_full_boot] [--ledger PATH] [--boot 300]
 구간은 적합된 승률로 쌍별 승수를 다시 뽑아(모수적 부트스트랩) 재적합한 분포. 대전이 이어지지 않은 모델 묶음은 따로 경고"""
 import argparse
 import math
@@ -86,7 +86,7 @@ def components(names, W):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ref", default="v10boot"); ap.add_argument("--ledger", default=LEDGER); ap.add_argument("--boot", type=int, default=300)
+    ap.add_argument("--ref", default="v1_full_boot"); ap.add_argument("--ledger", default=LEDGER); ap.add_argument("--boot", type=int, default=300)
     a = ap.parse_args()
     wins = win_table(read(a.ledger))
     if not wins:

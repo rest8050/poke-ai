@@ -1,6 +1,6 @@
 """AI가 잘 쓰는 강한 팀 선별: 후보 팀마다 '그 팀 하나로 고정한 AI' 대 '래더 팀 풀의 무작위 AI'를 붙여 승률(=팀+운용 실력)을 잰 뒤,
 단계마다 판 수를 늘리며 상위만 남기는 successive halving. 같은 모델이 양쪽을 맡음.
-사용: python tools/team_screen.py run [--model v12r3] [--n0 400] [--k 24,80,160] [--keep 72,24] [--port 8000] [--workers 5]
+사용: python tools/team_screen.py run [--model v1_full_r3] [--n0 400] [--k 24,80,160] [--keep 72,24] [--port 8000] [--workers 5]
   단계별 결과: results/team_screen/stage<i>.jsonl (한 팀 끝날 때마다 한 줄 → 중간에 끊어도 같은 명령으로 이어서 진행)
   최종: data/team_pool_strong.json (마지막 단계 승률 순, 종이 겹치는 팀은 제외) + results/team_screen/final.txt
 선별 점수 = 승수에 사전(평균 45%, 가중 20판)을 더한 사후평균(적은 판 수로 우연히 높은 팀이 올라오는 걸 줄임)
@@ -176,7 +176,7 @@ def final(a, cands):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", nargs="?", default="run")
-    ap.add_argument("--model", default="v12r3"); ap.add_argument("--n0", type=int, default=400)
+    ap.add_argument("--model", default="v1_full_r3"); ap.add_argument("--n0", type=int, default=400)
     ap.add_argument("--k", default="24,80,160"); ap.add_argument("--keep", default="72,24")
     ap.add_argument("--port", type=int, default=8000); ap.add_argument("--workers", type=int, default=5)
     ap.add_argument("--concurrent", type=int, default=12); ap.add_argument("--max-battle-sec", type=int, default=900)

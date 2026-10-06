@@ -666,6 +666,9 @@ def model_from_ckpt(path: str, map_location="cpu") -> nn.Module:
     if not has_cfg:
         print(f"  ⚠️ {path}에 .cfg.json 없음 → 기본 구조로 생성. 이 체크포인트가 모르는 새 모듈(예: team_cross)은 "
               f"무작위로 남습니다 — 기준/비교 모델로 쓴다면 cfg.json 있는(구조가 맞는) 체크포인트를 쓰세요.")
+    if cfg.get("model") == "v3":
+        cfg.setdefault("unrevealed_tokens", False)       # 이 옵션들 이전에 학습한 v3 체크포인트(v3_full 등)는 미공개 기술 칸을 마스킹하던 구조
+        cfg.setdefault("opp_species", False)             # 상대 종 ID 임베딩도 없던 구조
     model = build_model(cfg)
     load_compatible(model, torch.load(path, map_location=map_location))
     return model

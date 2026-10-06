@@ -27,9 +27,11 @@ import torch.nn.functional as F
 
 from src.core.model import DeepPokemonBattleTransformerNet, build_model, load_compatible, model_from_ckpt, save_ckpt
 from src.core.tensor_encoder import MOVE_NUM_DIM
+from src.training.hidden_labels import hidden_loss, vocab_sizes
 from src.training.replay_dataset import OBS_KEYS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+UNK = vocab_sizes()
 KEYS = OBS_KEYS + ["action_mask", "target", "action_taken"]
 GAMMA = 0.995  # replay_dataset.py / build_fp_dataset.py와 동일
 
@@ -80,7 +82,7 @@ def pg_loss(logp, b, adv):
 
 def run(model, ref, data, offsets, idx, args, train, opt=None):
     model.train(bool(train))  # 학습 중에는 드롭아웃(트랜스포머/융합층 0.1)을 켬 → 오래된 데이터를 반복해서 외우는 것을 늦춤. 검증은 항상 끔
-    tot = dict(ce=0.0, v=0.0, kl=0.0, pg=0.0, agree=0, n=0, chg=0, chg_agree=0)
+    tot = dict(ce=0.0, v=0.0, kl=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, chg=0, chg_agree=0)
     for b in make_batches(data, offsets, idx, args.batch_battles, train):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
@@ -95,7 +97,11 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
             v = F.mse_loss(out["value"].view(-1), b["value_target"])
             kl = F.kl_div(logp, F.softmax(ref_out["policy_logits"], -1), reduction="batchmean")
             pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
-            loss = ce + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg
+            hid = ce.new_zeros(())
+            if "hid_move" in out and args.hidden_coef > 0:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
+                hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]}, b, UNK)
+                tot["hid_top4"] += hs.get("move_top4", 0.0) * hs["move_n"]; tot["hid_nb"] += hs["move_n"]
+            loss = ce + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg + args.hidden_coef * hid
         if train:
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
@@ -105,16 +111,16 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
             want, got, ref_a = b["target"].argmax(-1), logp.argmax(-1), ref_out["policy_logits"].argmax(-1)
             chg = want != ref_a  # 탐색이 원래 정책의 선택을 바꾼 결정
         n = len(want)
-        tot["ce"] += ce.item() * n; tot["v"] += v.item() * n; tot["kl"] += kl.item() * n; tot["pg"] += pg.item() * n; tot["n"] += n
+        tot["ce"] += ce.item() * n; tot["v"] += v.item() * n; tot["kl"] += kl.item() * n; tot["pg"] += pg.item() * n; tot["hid"] += hid.item() * n; tot["n"] += n
         tot["agree"] += (got == want).sum().item(); tot["chg"] += chg.sum().item(); tot["chg_agree"] += ((got == want) & chg).sum().item()
     n = max(1, tot["n"])
-    return {"ce": tot["ce"] / n, "v": tot["v"] / n, "kl": tot["kl"] / n, "pg": tot["pg"] / n, "agree": tot["agree"] / n,
+    return {"ce": tot["ce"] / n, "v": tot["v"] / n, "kl": tot["kl"] / n, "pg": tot["pg"] / n, "hid": tot["hid"] / n, "hid_top4": tot["hid_top4"] / max(1, tot["hid_nb"]), "agree": tot["agree"] / n,
             "chg_agree": tot["chg_agree"] / max(1, tot["chg"]), "chg_rate": tot["chg"] / n, "n": tot["n"]}
 
 
 def fmt(r):
     return (f"소프트CE {r['ce']:.4f} | 탐색 선택과 일치 {r['agree']:.3f} | 탐색이 바꾼 결정({r['chg_rate']:.3f})을 따라 함 {r['chg_agree']:.3f} "
-            f"| V {r['v']:.3f} | KL {r['kl']:.4f} | PG {r['pg']:.4f}")
+            f"| V {r['v']:.3f} | KL {r['kl']:.4f} | PG {r['pg']:.4f}" + (f" | 숨김정보 {r['hid']:.3f}(기술 상위4 적중 {r['hid_top4']:.2f})" if r["hid"] else ""))
 
 
 def load(pattern, fp16=False):
@@ -248,5 +254,6 @@ if __name__ == "__main__":
     ap.add_argument("--target-prune", type=float, default=0.0, help="교사 분포에서 이 확률 미만인 행동을 0으로 (예: 0.05). 0=끔. 검증 CE도 정리된 타깃 기준이라 다른 설정과 숫자 비교 불가")
     ap.add_argument("--target-temp", type=float, default=1.0, help="교사 분포를 p^(1/temp)로 날카롭게 (예: 0.75). 1=끔")
     ap.add_argument("--bf16", action="store_true", help="bfloat16 자동 혼합정밀도 (큰 모델에서 GPU 메모리/시간 크게 절약)")
+    ap.add_argument("--hidden-coef", type=float, default=0.0, help="상대 숨겨진 정보(기술/도구/특성) 예측 보조 손실 가중치 (모델에 hidden_head가 있어야 함). 0=끔")
     ap.add_argument("--val-frac", type=float, default=0.1)
     main(ap.parse_args())

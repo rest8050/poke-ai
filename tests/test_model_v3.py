@@ -24,7 +24,10 @@ def random_obs(n, gen):
 
 torch.manual_seed(0)
 gen = torch.Generator().manual_seed(0)
-model = build_model({"model": "v3", "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
+import sys
+POLICY = next((a.split("=")[1] for a in sys.argv if a.startswith("--policy=")), "hier")
+model = build_model({"model": "v3", "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64, "policy": POLICY}).eval()
+print("policy =", POLICY)
 print(f"파라미터 {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M (테스트용 소형)")
 
 lengths = [5, 9, 1, 3]
@@ -60,14 +63,21 @@ with torch.no_grad():
     b2 = model.forward_sequences(obs2, torch.zeros(9, dtype=torch.long), torch.arange(9), 1, masks[1])["policy_logits"]
     assert torch.allclose(a[:6], b2[:6], atol=1e-5) and not torch.allclose(a[6:], b2[6:], atol=1e-3)
 
-    # 4) 패딩 토큰 내용이 바뀌어도 출력 불변 (상대의 빈 슬롯 5~6번째의 포켓몬/기술 입력과 안 드러난 기술칸)
+    # 4) 빈 슬롯(포켓몬 자체가 없음)의 입력은 출력에 영향 없음. 안 드러난 기술 칸은 이제 토큰으로 살아 있어서 영향을 줘야 함
     x = [t.clone() for t in obs[0]]
     y = [t.clone() for t in obs[0]]
     y[3][:, 4:, :] = torch.randint(1, 8, y[3][:, 4:, :].shape)     # 빈 슬롯의 범주 입력
-    y[3][:, :4, 7] = torch.randint(1, 8, y[3][:, :4, 7].shape)    # 안 드러난 기술칸(3번째)의 기술 ID는 패딩이라 무시돼야 함
     o1 = model.forward_sequences(x, torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
     o2 = model.forward_sequences(y, torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
     assert torch.allclose(o1, o2, atol=1e-5), "패딩 슬롯 입력이 출력에 샘: " + str((o1 - o2).abs().max())
+    u = [t.clone() for t in obs[0]]
+    u[5][:, 1, 1:, :] = 0                                           # 상대 활성이 기술을 1개만 공개한 상태 (나머지 3칸 미공개) vs 2개 공개(원래 입력)
+    o_u = model.forward_sequences(u, torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+    assert (o_u - o1).abs().max() > 1e-4, "공개된 기술 수가 출력에 반영돼야 함"
+    u2 = [t.clone() for t in u]
+    u2[3][:, 1, 7:9] = torch.randint(1, 8, u2[3][:, 1, 7:9].shape)   # 미공개 칸의 ID가 바뀌면 (숨김 ID 임베딩이 들어가므로) 출력이 달라져야 함
+    o_u2 = model.forward_sequences(u2, torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+    assert (o_u2 - o_u).abs().max() > 1e-4
 
     # 5) 내 활성의 기술 토큰/후보 포켓몬 정보가 해당 점수에 실제로 영향
     z = [t.clone() for t in obs[0]]
@@ -86,6 +96,35 @@ with torch.no_grad():
         q[5][:, 1, 0, 4] = 0.33; q[5][:, 1, 0, 0] = power
         return model.forward_sequences(q, torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
     assert (alive_obs(0.2)[:, 8:14] - alive_obs(0.9)[:, 8:14]).abs().max() > 1e-4
+# 5d) 상대 종 ID는 출력에 반영되고, 내 쪽 종 ID는 무시 (일반화), 학습 모드에서는 종 임베딩에 기울기가 흐르고 종 가리기(dropout)가 동작
+with torch.no_grad():
+    base_o = model.forward_sequences(obs[0], torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+    so = [t.clone() for t in obs[0]]
+    so[3][:, 1, 10] = obs[0][3][:, 1, 10] + 3                                  # 상대 활성의 종을 다른 종으로
+    o_opp = model.forward_sequences(so, torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+    assert (o_opp - base_o).abs().max() > 1e-4, "상대 종 ID가 출력에 반영돼야 함"
+    sm = [t.clone() for t in obs[0]]
+    sm[0][:, :, 10] = obs[0][0][:, :, 10] + 5                                  # 내 쪽 종 ID
+    o_my = model.forward_sequences(sm, torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+    assert torch.allclose(o_my, base_o, atol=1e-5), "내 쪽 종 ID는 쓰이지 않아야 함"
+model.train()
+model.species_dropout = 1.0
+out_t = model.forward_sequences(obs[0], torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+out_t[:, masks[0][0]].sum().backward()
+assert model.species_emb.weight.grad is not None
+assert int(model.species_emb.weight.grad.abs().sum(-1).nonzero().numel()) == 1, "dropout 1.0이면 <unk> 행에만 기울기가 가야 함"
+model.zero_grad(); model.species_dropout = 0.1; model.eval()
+print("species OK")
+
+# 6b) lse + 보정 0 == 평탄 softmax
+if POLICY == "lse":
+    flat = build_model({**model.cfg, "policy": "flat"}).eval()
+    flat.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith("type_head")}, strict=False)
+    a = model.forward_sequences(obs[0], torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+    b = flat.forward_sequences(obs[0], torch.zeros(5, dtype=torch.long), torch.arange(5), 1, masks[0])["policy_logits"]
+    legal = masks[0]
+    assert torch.allclose(a[legal], b[legal], atol=1e-5), (a[legal] - b[legal]).abs().max()
+    print("lse(보정 0) == flat OK")
 # 6) 체크포인트 왕복
 path = os.path.join(tempfile.mkdtemp(), "m.pt")
 save_ckpt(model, path)
