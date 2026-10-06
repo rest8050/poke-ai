@@ -19,7 +19,7 @@ import torch.nn.functional as F
 sys.path.insert(0, ".")
 from poke_env.data import GenData
 
-from src.core.belief import SetBelief
+from src.core.belief import STAT_SCALE, SetBelief
 from src.core.tensor_encoder import NUM_DIM, VocabManager
 
 TRAIN_POOLS = [("metamon", "data/team_pool_metamon.json", 0.5), ("randomset", "data/team_pool_randomset_train3.json", 0.2),
@@ -28,7 +28,27 @@ TRAIN_POOLS = [("metamon", "data/team_pool_metamon.json", 0.5), ("randomset", "d
 EVAL_POOLS = [("holdout(A)", "data/team_pool_metamon_holdout.json"), ("rare(B)", "data/team_pool_rare.json"), ("randomset(C)", "data/team_pool_randomset.json")]
 REVEAL_P = [0.25, 0.30, 0.20, 0.15, 0.10]    # 공개 기술 수 0~4개 분포 (대전에서 상대 활성의 공개 기술 수 분포와 비슷)
 P_ITEM_KNOWN, P_ABILITY_KNOWN = 0.25, 0.30
+STAT_COEF = 0.5                              # 능력치 회귀 손실 가중 (기술 NLL ~3 대비)
 norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+STATS = ["hp", "atk", "def", "spa", "spd", "spe"]
+NATURES = {"adamant": ("atk", "spa"), "bold": ("def", "atk"), "brave": ("atk", "spe"), "calm": ("spd", "atk"), "careful": ("spd", "spa"), "gentle": ("spd", "def"),
+           "hasty": ("spe", "def"), "impish": ("def", "spa"), "jolly": ("spe", "spa"), "lax": ("def", "spd"), "lonely": ("atk", "def"), "mild": ("spa", "def"),
+           "modest": ("spa", "atk"), "naive": ("spe", "spd"), "naughty": ("atk", "spd"), "quiet": ("spa", "spe"), "rash": ("spa", "spd"), "relaxed": ("def", "spe"),
+           "sassy": ("spd", "spe"), "timid": ("spe", "atk")}      # 올리는 능력치, 내리는 능력치 (나머지는 무보정)
+
+
+def stat_logratio(base, evs, ivs, nature):
+    """레벨 100 실제 능력치 / 매치업의 표준 가정(252노력치, 무보정, 개체값 31)의 로그. base/evs/ivs: hp..spe 6개, nature: 이름(없으면 무보정). 표준: 비-HP 2b+99, HP 2b+204"""
+    up, down = NATURES.get(nature, (None, None))
+    out = []
+    for k, n in enumerate(STATS):
+        if n == "hp":
+            real, std = 2 * base[k] + ivs[k] + evs[k] // 4 + 110, 2 * base[k] + 204
+        else:
+            real = (2 * base[k] + ivs[k] + evs[k] // 4 + 5) * (1.1 if n == up else 0.9 if n == down else 1.0) // 1
+            std = 2 * base[k] + 99
+        out.append(math.log(real / std))
+    return out
 
 
 def parse_team(export, vm, dex):
@@ -45,10 +65,17 @@ def parse_team(export, vm, dex):
             continue
         e = dex[sp]
         item = vm.get_id("item", norm(head[1])) if len(head) > 1 else None   # 어휘 키는 소문자/영숫자만
-        ability = tera = None
+        ability = tera = nature = None
+        evs, ivs = [0] * 6, [31] * 6
         moves = []
         for ln in lines[1:]:
-            if ln.startswith("Ability:"):
+            if ln.startswith("EVs:") or ln.startswith("IVs:"):
+                tgt = evs if ln[0] == "E" else ivs
+                for v, n in re.findall(r"(\d+) (HP|Atk|Def|SpA|SpD|Spe)", ln):
+                    tgt[STATS.index(n.lower())] = int(v)
+            elif ln.strip().endswith(" Nature"):
+                nature = norm(ln.strip()[:-len(" Nature")])
+            elif ln.startswith("Ability:"):
                 ability = vm.get_id("ability", norm(ln.split(":", 1)[1]))
             elif ln.startswith("Tera Type:"):
                 tera = vm.get_id("type", norm(ln.split(":", 1)[1]))
@@ -58,10 +85,12 @@ def parse_team(export, vm, dex):
                     moves.append(mid)
         types = [vm.get_id("type", t) for t in e["types"]][:2]
         st = e["baseStats"]
+        base6 = [st[k] for k in ("hp", "atk", "def", "spa", "spd", "spe")]
         mons.append(dict(species=vm.get_id("species", sp), stats=[st["hp"] / 255, st["atk"] / 255, st["def"] / 255, st["spa"] / 255, st["spd"] / 255, st["spe"] / 255,
                                                            min(1.0, e.get("weightkg", 0) / 500)],
                          types=types + [0] * (2 - len(types)), item=item if item is not None and item < unk["item"] else None,
-                         ability=ability if ability is not None and ability < unk["ability"] else None, moves=moves[:4]))
+                         ability=ability if ability is not None and ability < unk["ability"] else None, moves=moves[:4],
+                         stat=stat_logratio(base6, evs, ivs, nature)))
     return mons
 
 
@@ -79,7 +108,8 @@ def to_arrays(teams, vm, device):
              types=torch.tensor([m["types"] for _, m in rows]), team=torch.tensor([ti for ti, _ in rows]),
              item=torch.tensor([-1 if m["item"] is None else m["item"] for _, m in rows]),
              ability=torch.tensor([-1 if m["ability"] is None else m["ability"] for _, m in rows]),
-             moves=torch.tensor([m["moves"] + [0] * (4 - len(m["moves"])) for _, m in rows]))
+             moves=torch.tensor([m["moves"] + [0] * (4 - len(m["moves"])) for _, m in rows]),
+             stat=torch.tensor([m["stat"] for _, m in rows], dtype=torch.float32) / STAT_SCALE)
     return {k: v.to(device) for k, v in A.items()}, N, hid
 
 
@@ -107,7 +137,7 @@ def make_batch(A, idx, hid, hidden_move_id, gen):
     num[:, 0, 11:18] = A["stats"][idx]
     num[:, 0, 2] = 1.0                                                           # HP 100%
     num[:, 0, 8] = 1.0                                                           # 레벨 100
-    return cat, num, dict(moves=moves, revealed=revealed, item=item, item_hidden=~item_known & (item >= 0), ability=ability, ab_hidden=~ab_known & (ability >= 0))
+    return cat, num, dict(stat=A["stat"][idx], moves=moves, revealed=revealed, item=item, item_hidden=~item_known & (item >= 0), ability=ability, ab_hidden=~ab_known & (ability >= 0))
 
 
 def belief_loss(logits, tgt, unk_move):
@@ -123,6 +153,10 @@ def belief_loss(logits, tgt, unk_move):
     loss = -(lp.gather(1, tgt["moves"]) * target).sum() / n.clamp_min(1)
     top4 = lp.topk(4, -1).indices
     stats = {"move_top4": (((tgt["moves"][:, :, None] == top4[:, None, :]).any(-1) & target).sum() / n.clamp_min(1)).item()}
+    pred = logits["stat"][:, 0].float()
+    loss = loss + STAT_COEF * F.mse_loss(pred, tgt["stat"])
+    stats["stat_mae"] = ((pred - tgt["stat"]).abs().mean() * STAT_SCALE).item()               # 표준 가정과 비교할 기준: stat_base
+    stats["stat_base"] = (tgt["stat"].abs().mean() * STAT_SCALE).item()
     for key, hidden in (("item", "item_hidden"), ("ability", "ab_hidden")):
         m = tgt[hidden]
         if m.any():
@@ -210,11 +244,11 @@ def main():
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step(); sched.step()
         if step % 1000 == 0 or step == args.steps:
-            print(f"[{step}/{args.steps}] 손실 {loss.item():.3f} | 기술 상위4 적중 {st['move_top4']:.3f} | 도구 {st.get('item_top1', 0):.3f} | 특성 {st.get('ability_top1', 0):.3f} | {time.time() - t0:.0f}s", flush=True)
-    print("\n== 검증 (학습에 안 쓴 팀 / 평가용 풀). 지표: 안 드러난 기술의 상위 4 적중률, 숨은 도구/특성의 상위 1/3 적중, 기술 확률 보정 오차(ECE)")
+            print(f"[{step}/{args.steps}] 손실 {loss.item():.3f} | 기술 상위4 적중 {st['move_top4']:.3f} | 도구 {st.get('item_top1', 0):.3f} | 특성 {st.get('ability_top1', 0):.3f} | 능력치 오차 {st['stat_mae']:.3f} (표준가정 {st['stat_base']:.3f}) | {time.time() - t0:.0f}s", flush=True)
+    print("\n== 검증 (학습에 안 쓴 팀 / 평가용 풀). 지표: 안 드러난 기술의 상위 4 적중률, 숨은 도구/특성의 상위 1/3 적중, 기술 확률 보정 오차(ECE), 능력치 배율 오차(표준 가정 252/무보정과 비교)")
     for n, E in evals.items():
         r = evaluate(model, E, hid, unk_move, gen, calib=True)
-        print(f"  {n:14s} 기술 상위4 {r['move_top4']:.3f} | 도구 top1 {r.get('item_top1', 0):.3f} top3 {r.get('item_top3', 0):.3f} | 특성 top1 {r.get('ability_top1', 0):.3f} | ECE {r['ECE']:.3f}")
+        print(f"  {n:14s} 기술 상위4 {r['move_top4']:.3f} | 도구 top1 {r.get('item_top1', 0):.3f} top3 {r.get('item_top3', 0):.3f} | 특성 top1 {r.get('ability_top1', 0):.3f} | ECE {r['ECE']:.3f} | 능력치 오차(로그) {r['stat_mae']:.3f} / 표준가정 {r['stat_base']:.3f}")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({"cfg": model.cfg, "state": {k: v.cpu() for k, v in model.state_dict().items()}}, args.out)
     print("저장:", args.out)

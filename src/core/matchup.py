@@ -8,7 +8,7 @@
   def  [B,6,24,4]  내 포켓몬 i가 상대 기술칸 j(상대 포켓몬 j//4의 j%4번 기술)에 맞을 때: (배율/4, 데미지 비율[최대HP 대비, 1.5 상한 후 /1.5], 확정 KO 가능, 공격기 여부)
   off  [B,6,24,4]  상대 포켓몬 o가 내 기술칸 j(내 포켓몬 j//4의 j%4번 기술)에 맞을 때: 같은 4개
   spd_my [B,6] 내 포켓몬 i의 스피드 / 상대 활성 스피드 (log2, ±2 상한 후 /2), spd_opp [B,6] 상대 포켓몬 o / 내 활성
-근사(ponytail): 레벨 100 가정, 상대 능력치는 종족값 → 252노력치/무보정 추정(2b+99, HP 2b+204), 랜덤 편차는 평균 0.925(KO 판정은 최댓값 1.0),
+근사(ponytail): 레벨 100 가정, 상대 능력치는 종족값 → 252노력치/무보정 추정(2b+99, HP 2b+204; mult를 주면 신념이 예측한 배율을 곱함), 랜덤 편차는 평균 0.925(KO 판정은 최댓값 1.0),
   급소/도구/특성 위력 보정/벽/공중부양 외 특성 면역은 미반영. 테라: 방어는 테라 타입 하나, 공격 자속은 원래 타입 + 테라 타입"""
 import json
 
@@ -48,23 +48,25 @@ class Matchup(nn.Module):
         s = (r * 6).round()
         return torch.where(s >= 0, (2 + s) / 2, 2 / (2 - s))
 
-    def _stats(self, num, mine: bool):
+    def _stats(self, num, mine: bool, mult=None):
         v = num[..., 11:17] * 255.0                                                # hp, atk, def, spa, spd, spe
         if not mine:
             v = torch.cat([2 * v[..., :1] + 204, 2 * v[..., 1:] + 99], -1)
+            if mult is not None:                                                   # 신념이 예측한 노력치/성격 배율 [..., 6] (hp, atk, def, spa, spd, spe)
+                v = v * mult
         st = self._stage(num[..., 3:8])                                            # atk, def, spa, spd, spe
         return v[..., 0], v[..., 1] * st[..., 0], v[..., 2] * st[..., 1], v[..., 3] * st[..., 2], v[..., 4] * st[..., 3], v[..., 5] * st[..., 4]
 
-    def _pair(self, att_cat, att_num, att_mv, att_mine, def_cat, def_num, def_mine):
-        """공격측 6마리(기술 24칸) x 방어측 6마리 → [B, 6(방어), 24(공격 기술칸), 4]"""
-        B = att_cat.size(0)
-        a_hp, a_atk, _, a_spa, _, _ = self._stats(att_num, att_mine)
-        d_hp, _, d_def, _, d_spd, _ = self._stats(def_num, def_mine)
-        rep = lambda x: x.repeat_interleave(4, dim=1)[:, None]                     # [B,6] → [B,1,24]
-        mv = att_mv.reshape(B, 24, -1)
+    def _pair(self, att_cat, att_num, att_mv, att_mine, def_cat, def_num, def_mine, att_mult=None, def_mult=None):
+        """공격측 6마리(마리당 기술 K칸, 보통 4) x 방어측 6마리 → [B, 6(방어), 6K(공격 기술칸), 4]. mult: 상대 쪽 능력치 배율(기본 없음 = 표준 가정)"""
+        B, K = att_cat.size(0), att_mv.size(2)
+        a_hp, a_atk, _, a_spa, _, _ = self._stats(att_num, att_mine, att_mult)
+        d_hp, _, d_def, _, d_spd, _ = self._stats(def_num, def_mine, def_mult)
+        rep = lambda x: x.repeat_interleave(K, dim=1)[:, None]                     # [B,6] → [B,1,6K]
+        mv = att_mv.reshape(B, 6 * K, -1)
         bp, kind, mt = mv[..., 0] * 200.0, mv[..., 4], (mv[..., 6] * 20.0).round().long().clamp(0, TYPE_N - 1)
         a_present = (att_num[..., 11] > 0) & (att_num[..., 1] < 0.5)
-        revealed = (att_mv.abs().sum(-1).reshape(B, 24) > 0) & rep(a_present.float())[:, 0].bool()
+        revealed = (att_mv.abs().sum(-1).reshape(B, 6 * K) > 0) & rep(a_present.float())[:, 0].bool()
         damaging = revealed & (bp > 0) & (kind < 0.85)                             # [B,24]
         phys = (kind < 0.5)[:, None]
         # 공격측: 자속/테라/화상
@@ -77,8 +79,8 @@ class Matchup(nn.Module):
         # 방어측: 타입(테라면 테라 타입 하나)/능력치/특성 면역
         d_t1 = torch.where(def_num[..., 9] > 0.5, def_cat[..., 9], def_cat[..., 2])[..., None]   # [B,6,1]
         d_t2 = torch.where(def_num[..., 9] > 0.5, torch.zeros_like(def_cat[..., 3]), def_cat[..., 3])[..., None]
-        eff = self.chart[mt_.expand(-1, 6, -1), d_t1.clamp(0, TYPE_N - 1).expand(-1, -1, 24)] * \
-            self.chart[mt_.expand(-1, 6, -1), d_t2.clamp(0, TYPE_N - 1).expand(-1, -1, 24)]
+        eff = self.chart[mt_.expand(-1, 6, -1), d_t1.clamp(0, TYPE_N - 1).expand(-1, -1, 6 * K)] * \
+            self.chart[mt_.expand(-1, 6, -1), d_t2.clamp(0, TYPE_N - 1).expand(-1, -1, 6 * K)]
         imm_t = self.ab_immune[def_cat[..., 1].clamp(0, len(self.ab_immune) - 1)][..., None]    # [B,6,1]
         immune = (imm_t == mt_) & (imm_t > 0)
         if self.balloon >= 0:
@@ -96,12 +98,12 @@ class Matchup(nn.Module):
         out = torch.stack([torch.where(dm, eff / 4.0, torch.zeros_like(eff)), frac.clamp(max=1.5) / 1.5, ko, dm.expand_as(eff).float()], -1)
         return out * d_ok[..., None].float()
 
-    def forward(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv):
-        D = self._pair(opp_cat, opp_num, opp_mv, False, my_cat, my_num, True)      # 내 포켓몬이 맞음
-        O = self._pair(my_cat, my_num, my_mv, True, opp_cat, opp_num, False)       # 상대 포켓몬이 맞음
+    def forward(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, opp_mult=None):
+        D = self._pair(opp_cat, opp_num, opp_mv, False, my_cat, my_num, True, att_mult=opp_mult)      # 내 포켓몬이 맞음
+        O = self._pair(my_cat, my_num, my_mv, True, opp_cat, opp_num, False, def_mult=opp_mult)       # 상대 포켓몬이 맞음
         ar = torch.arange(my_num.size(0), device=my_num.device)
         spe_my = self._stats(my_num, True)[5]
-        spe_opp = self._stats(opp_num, False)[5]
+        spe_opp = self._stats(opp_num, False, opp_mult)[5]
         my_act, opp_act = my_num[..., 0].argmax(1), opp_num[..., 0].argmax(1)
         r = lambda a, b: (torch.log2(a.clamp_min(1.0) / b.clamp_min(1.0)).clamp(-2, 2) / 2)
         return {"def": D, "off": O, "spd_my": r(spe_my, spe_opp[ar, opp_act][:, None]), "spd_opp": r(spe_opp, spe_my[ar, my_act][:, None])}

@@ -642,6 +642,9 @@ def build_model(cfg: dict) -> nn.Module:
     if kind == "entity":
         from src.core.model_v2 import EntityPokemonNet
         return EntityPokemonNet(**cfg)
+    if kind == "v4":                                     # v3 + 상위 8개 기술 혼합 위협 + 노력치/성격 예측 (src/core/model_v4.py)
+        from src.core.model_v4 import EntityPokemonNetV4
+        return EntityPokemonNetV4(**cfg)
     if kind == "v3":
         ver = cfg.pop("version", 1)
         if ver >= 3:                                     # 확정 설정이 기본인 현재 구조 (자기 완결형 신념, 옵션 없음)

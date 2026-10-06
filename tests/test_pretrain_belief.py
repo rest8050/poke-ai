@@ -32,6 +32,13 @@ mons = parse_team(export, vm, dex)
 assert len(mons) == 2 and mons[0]["species"] == vm.get_id("species", "garchomp") and len(mons[0]["moves"]) == 4 and len(mons[1]["moves"]) == 2
 assert mons[0]["item"] == vm.get_id("item", "rockyhelmet") and mons[0]["types"] == [vm.get_id("type", "dragon"), vm.get_id("type", "ground")]
 
+from src.training.pretrain_belief import stat_logratio
+base6 = [108, 130, 95, 80, 85, 102]                                           # 한카리아스
+assert max(abs(x) for x in stat_logratio(base6, [252] * 6, [31] * 6, None)) < 1e-9, "252노력치/무보정은 표준 가정과 같아야 함"
+lr = stat_logratio(base6, [0] * 6, [31] * 6, "adamant")                       # 노력치 0, 공격 +10% 특공 -10%
+assert lr[0] < 0 and lr[5] < 0 and lr[1] < lr[2] + 0.2 and lr[3] < lr[2]
+assert abs(mons[0]["stat"][0] - stat_logratio([108, 130, 95, 80, 85, 102], [252, 0, 0, 0, 0, 0], [31] * 6, None)[0]) < 1e-9   # 내보내기의 "EVs: 252 HP" 파싱
+assert mons[0]["stat"][1] < -0.15, "노력치 0 공격 = 표준(252) 대비 크게 낮음"
 dev = torch.device("cpu")
 A, N, hid = to_arrays([mons] * 50, vm, dev)
 gen = torch.Generator().manual_seed(0)

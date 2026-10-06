@@ -44,6 +44,11 @@ assert m(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv)["def"][0][1, 0, 0] == 
 # 기절한 방어측은 0
 my_num[0, 3, 1] = 1.0
 assert m(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv)["def"][0][3, 0].abs().sum() == 0
+# 상대 능력치 배율: 공격측 공격 x0.8 → 데미지 0.8배, 방어측 방어 x0.5 → 데미지 2배 (매치업에 신념의 노력치 예측을 넣는 경로)
+my_num[0, 3, 1] = 0.0
+d0 = m(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv)["def"][0][2, 0, 1]
+mult = torch.ones(1, 6, 6); mult[0, 0, 1] = 0.8
+assert abs(m(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, mult)["def"][0][2, 0, 1] / d0 - 0.8) < 0.02
 print("손계산 OK")
 
 # 실제 데이터에서 인코더와 대조
