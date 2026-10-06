@@ -17,11 +17,13 @@ v3_full이 새 구조 모델로 교체되어 퇴역하면 이 파일과 관련 �
    신념 출력은 detach해서 쓰므로 정책/가치 손실은 신념 모듈에 닿지 않음. --hidden-coef 필요
 8) policy: "hier"(잠재 벡터가 기술/교체를 정함, 기존) | "lse"(기술/교체 로짓 = 각 점수의 logsumexp + 학습 보정, 보정 0이면 평탄 softmax와 같음) | "flat"(14칸 전체 softmax)
 인터페이스는 model_v2와 같음 (forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt). arch에 {"model": "v3"}"""
+import json
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.core.belief import SetBelief, build_move_table
+from src.core.belief import build_move_table
 from src.core.matchup import Matchup
 from src.core.model import MAX_TURNS, DeepPokemonBattleTransformerNet, PokemonEmbeddingLayer
 from src.core.tensor_encoder import MOVE_NUM_DIM
@@ -35,6 +37,28 @@ MON_EXTRA, MV_EXTRA, CAND_FEAT = 7, 3, 9
 
 def _mx(x):           # [..., 4(기술), 4(채널)] 중 앞 3채널(배율, 데미지, KO)의 기술별 최댓값 → [..., 3]
     return x[..., :3].amax(-2)
+
+
+class SetBelief(nn.Module):   # [동결] 트렁크 임베딩을 공유하던 옛 신념 (v3_pilot_belief, v3_pilot 호환용). 새 구조는 src/core/belief.py의 자기 완결형
+    def __init__(self, in_dim, vocab_path="data/vocab.json", species_dim=32, hidden=256, species_dropout=0.3):
+        super().__init__()
+        vv = json.load(open(vocab_path, encoding="utf-8"))
+        self.unk_species = vv["species"]["<unk>"]
+        self.species_dropout = species_dropout
+        self.species_emb = nn.Embedding(max(vv["species"].values()) + 3, species_dim)
+        nn.init.normal_(self.species_emb.weight, std=0.1)
+        self.net = nn.Sequential(nn.Linear(in_dim + species_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU())
+        self.move = nn.Linear(hidden, vv["move"]["<unk>"] + 2)       # id 0..unk+1
+        self.item = nn.Linear(hidden, vv["item"]["<unk>"] + 2)
+        self.ability = nn.Linear(hidden, vv["ability"]["<unk>"] + 2)
+
+    def forward(self, x, species_id):
+        """x [B,6,F] (detach된 입력), species_id [B,6] -> {"move","item","ability"} 로짓 [B,6,V]"""
+        sid = species_id.long().clamp(0, self.species_emb.num_embeddings - 1)
+        if self.training and self.species_dropout > 0:          # 처음 보는 종도 공개 정보/종족값만으로 예측하도록 종을 가림
+            sid = torch.where(torch.rand(sid.shape, device=sid.device) < self.species_dropout, torch.full_like(sid, self.unk_species), sid)
+        h = self.net(torch.cat([x, self.species_emb(sid)], -1))
+        return {"move": self.move(h), "item": self.item(h), "ability": self.ability(h)}
 
 
 class EntityPokemonNetV3Legacy(nn.Module):

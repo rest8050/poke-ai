@@ -27,7 +27,7 @@ def random_obs(n, gen):
 
 torch.manual_seed(0)
 gen = torch.Generator().manual_seed(0)
-model = build_model({"model": "v3", "version": 2, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
+model = build_model({"model": "v3", "version": 3, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
 print(f"파라미터 {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M (테스트용 소형)")
 
 lengths = [5, 9, 1, 3]

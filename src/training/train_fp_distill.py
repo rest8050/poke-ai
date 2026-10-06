@@ -32,6 +32,7 @@ from src.training.replay_dataset import OBS_KEYS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 UNK = vocab_sizes()
+BELIEF_FT_LR_MULT = 0.1   # 사전학습된 신념의 미세조정 학습률 배율 (배틀 상황 입력만 새로 배우면 됨)
 HIDDEN_COEF = 1.0   # 숨김정보 손실 가중치: 신념 모듈 파라미터에만 닿고(입출력 detach) 기울기 클리핑도 따로라서 정책 학습과 간섭하지 않음
 KEYS = OBS_KEYS + ["action_mask", "target", "action_taken"]
 GAMMA = 0.995  # replay_dataset.py / build_fp_dataset.py와 동일
@@ -179,7 +180,7 @@ def main(args):
     val, train = split_ids(data, offsets, args.val_frac)
     print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
-    arch = json.loads(args.arch) if args.arch else {"model": "v3", "version": 2}
+    arch = json.loads(args.arch) if args.arch else {"model": "v3", "version": 3}
     model = build_model(arch)
     if args.init != "none":
         expanded, skipped = load_compatible(model, torch.load(args.init, map_location="cpu"))
@@ -209,7 +210,19 @@ def main(args):
     ref.to(DEVICE).eval()
     for p in ref.parameters():
         p.requires_grad = False
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    pre = args.belief_init
+    if belief_params and pre != "none" and os.path.exists(pre):     # 팀 데이터로 사전학습한 신념을 불러옴 (src/training/pretrain_belief.py) — 낮은 학습률로만 미세조정
+        ck = torch.load(pre, map_location="cpu")
+        model.belief.load_state_dict(ck["state"])
+        belief_lr = BELIEF_FT_LR_MULT
+        print(f"  신념 사전학습 가중치 로드: {pre} (학습률 x{BELIEF_FT_LR_MULT}로 미세조정)")
+    else:
+        belief_lr = 1.0
+        if belief_params:
+            print("  ⚠️ 신념 사전학습 없음 -> 처음부터 함께 학습")
+    other_params = [p for n, p in model.named_parameters() if not n.startswith("belief.")]
+    groups = [{"params": other_params, "lr": args.lr}] + ([{"params": belief_params, "lr": args.lr * belief_lr}] if belief_params else [])
+    opt = torch.optim.AdamW(groups, weight_decay=1e-4)
     if args.sched == "cosine":
         # 웜업(0 → lr) 후 코사인 감쇠(lr → lr × lr_min_ratio). 높은 학습률에서 첫 에폭에 정책이 무너지는 충격을 웜업이, 마지막 지점의 흔들림을 감쇠가 줄임
         import math
@@ -262,5 +275,6 @@ if __name__ == "__main__":
     ap.add_argument("--kl-coef", type=float, default=0.05, help="시작 정책과의 KL (클수록 시작 정책 유지). 최적해가 (교사 + 계수*시작정책)/(1+계수) 혼합이라 크면 시작 정책 쪽으로 끌려감")
     ap.add_argument("--pg-coef", type=float, default=0.0, help="실제 승패(할인된 결과 − 가치 예측 = advantage) 기반 정책 그라디언트 보조 손실 가중치. "
                     "0=끔(기본, 기존 동작 그대로). 장기 자산(장판/트릭룸/날씨) 신용 할당을 정책에도 흘려보내려는 실험적 항 — 작게(0.03~0.1) 시작할 것")
+    ap.add_argument("--belief-init", default="checkpoints/belief.pt", help="사전학습한 신념 가중치(pretrain_belief.py 결과). 파일이 없으면 신념도 처음부터 함께 학습, none이면 사용 안 함")
     ap.add_argument("--val-frac", type=float, default=0.1)
     main(ap.parse_args())

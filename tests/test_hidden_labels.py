@@ -49,7 +49,7 @@ def rnd(n):
             torch.randint(1, 8, (n, 6, 11), generator=g), opp_num, torch.rand(n, 6, 4, 46, generator=g), torch.rand(n, FIELD_DIM, generator=g)]
 o = rnd(4)
 mask = torch.zeros(4, 22, dtype=torch.bool); mask[:, [0, 2, 8]] = True
-m = build_model({"model": "v3", "version": 2, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
+m = build_model({"model": "v3", "version": 3, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
 out = m.forward_sequences(o, torch.zeros(4, dtype=torch.long), torch.arange(4), 1, mask)
 assert out["hid_move"].shape == (4, 6, Vm) and out["hid_item"].shape == (4, 6, Vi) and out["hid_ability"].shape == (4, 6, Va)
 loss, _ = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]},

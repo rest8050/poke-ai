@@ -6,11 +6,12 @@
    - 교체 후보 점수와 교체/기술 판단(type_head)에 후보별·활성 매치업 요약을 직접 입력
 3) 히스토리: 턴 요약 = [CLS, 내 활성 토큰, 상대 활성 토큰, 필드/직전 사건 벡터]을 인과 트랜스포머로 요약
 4) 미공개 기술 칸도 토큰으로 유지 (빈 슬롯만 마스킹) + 포켓몬 토큰에 공개된 기술 수/4. 안 드러난 칸을 통째로 빼면 "기술을 1개만 가진 포켓몬"과 구분이 안 됨
-5) 상대 세트 신념(belief, src/core/belief.py): 종 ID는 신념 모듈에만 들어가고(트렁크에는 없음) 숨김정보 손실(src/training/hidden_labels.py)로만 학습.
+5) 상대 세트 신념(belief, src/core/belief.py): 자기 완결형 모듈(자기 임베딩, 트렁크와 공유 없음). 종 ID는 여기에만 들어가고(트렁크에는 없음) 팀 데이터 사전학습 +
+   배틀에서는 숨김정보 손실(src/training/hidden_labels.py)로만 학습.
    확률 상위 기술을 미공개 칸에 "추측 기술"로 배정해, 그 기술의 위력/타입/분류로 매치업 위협(기대 데미지/KO)을 계산 → 어텐션 편향, 토큰 요약, 교체 헤드에 반영.
-   신념의 입력과 출력은 모두 detach라서 정책/가치 손실은 신념에 닿지 않고(종 조합으로 승패를 외울 수 없음), 숨김정보 손실은 트렁크에 닿지 않음
+   신념 출력은 detach라서 정책/가치 손실은 신념에 닿지 않고(종 조합으로 승패를 외울 수 없음), 신념은 트렁크 입력을 안 쓰므로 숨김정보 손실도 트렁크에 닿지 않음
 인터페이스는 model_v2와 같음 (forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt). 옛 구조(v3_full 등)는 model_v3_legacy.py
-arch: {"model": "v3", "version": 2}"""
+arch: {"model": "v3", "version": 3}"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +41,7 @@ class EntityPokemonNetV3(nn.Module):
                  head_width: int = 192, field_dim: int = 58, entity_features: bool = True,
                  species_dim: int = 32, belief_hidden: int = 256, belief_species_dropout: float = 0.3):
         super().__init__()
-        self.cfg = dict(model="v3", version=2, d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
+        self.cfg = dict(model="v3", version=3, d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
                         history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
                         species_dim=species_dim, belief_hidden=belief_hidden, belief_species_dropout=belief_species_dropout)
         d = self.d = d_model
@@ -48,7 +49,7 @@ class EntityPokemonNetV3(nn.Module):
         self.latent_dim = latent_dim
         self.embeddings = PokemonEmbeddingLayer(vocab_path=vocab_path, feature_path="data/entity_features.npz" if entity_features else "")
         self.matchup = Matchup(vocab_path)
-        self.belief = SetBelief(BASE_IN + 1 + 48, vocab_path, species_dim, belief_hidden, belief_species_dropout)
+        self.belief = SetBelief(vocab_path, species_dim, belief_hidden, belief_species_dropout)
         self.register_buffer("move_table", build_move_table(vocab_path), persistent=False)
         self.guess_proj = nn.Linear(1 + MOVE_NUM_DIM + 48, d)               # 추측 기술(확률, 수치 특징, 기술 임베딩) -> 미공개 칸 토큰
         self.unk_move = nn.Parameter(torch.zeros(d))                        # 미공개 기술 칸 표시
@@ -154,9 +155,8 @@ class EntityPokemonNetV3(nn.Module):
         raw = E._emb("move", cat[:, 5:9])
         revealed = (mvn.abs().sum(-1) > 0)
         n_rev = revealed.float().sum(-1, keepdim=True) / 4.0
-        # 신념: 공개 정보만 보고(detach) 상대의 숨겨진 세트를 예측, 확률 높은 기술을 미공개 칸에 추측 기술로 배정
-        b_in = torch.cat(parts + [n_rev, (raw * revealed[..., None]).sum(1)], -1).view(B, 12, -1)[:, 6:].detach()
-        belief_logits = self.belief(b_in, opp_team_cat[..., 10])
+        # 신념: 상대 팀 텐서를 자기 입력으로 읽어(트렁크와 무관) 숨겨진 세트를 예측, 확률 높은 기술을 미공개 칸에 추측 기술로 배정
+        belief_logits = self.belief(opp_team_cat, opp_team_num)
         guess = self._make_guess(belief_logits, opp_team_cat, opp_move_num, opp_team_num)
         D, O, mon_extra, mv_extra, cand, ar, act_m = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, guess)
         mon_in = torch.cat(parts + [mon_extra.reshape(B * 12, MON_EXTRA), n_rev], -1)
