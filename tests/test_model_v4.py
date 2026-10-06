@@ -140,4 +140,13 @@ with torch.no_grad():
     model.belief.move.bias.copy_(saved_b); model.belief.stat.bias += 4.0     # 상대 능력치 예측이 바뀌면 정책이 달라져야 함
     assert (seq(o)["policy_logits"] - base).abs().max() > 1e-5, "능력치 예측이 정책에 반영돼야 함"
     model.belief.stat.bias.copy_(saved_s)
+    # P_KO = 1 - Π(1 - w·KO), 그럴듯한 최대 데미지는 w >= 0.15인 후보만 (확률 가중 없음)
+    g2 = {"idx": gs["idx"], "w": torch.zeros_like(gs["w"]), "pseudo": torch.zeros_like(gs["pseudo"])}
+    g2["pseudo"][:, :, 0, 0], g2["pseudo"][:, :, 0, 4], g2["pseudo"][:, :, 0, 6] = 1.0, 0.33, 1 / 20      # 위력 200 물리 노말기 하나
+    o2 = [t.clone() for t in o]; o2[1][:, :, 1] = 0; o2[1][:, :, 2] = 1.0; o2[1][:, :, 11:17] = 0.2; o2[4][:, :, 1] = 0; o2[4][:, :, 11:17] = 0.6        # 내 쪽 전원 생존/풀피/낮은 능력치, 상대 쪽 생존/높은 능력치 → 확정 KO
+    one = lambda w: model._matchup_feats4(o2[0], o2[1], o2[2], o2[3], o2[4], o2[5], {**g2, "w": g2["w"].index_fill(-1, torch.tensor([0]), w)},
+                                          torch.ones(5, 6, 6), torch.zeros(5, 6, 6))[2][:, 0, 1]                  # [B,2] (내 0번, 상대 1번)
+    hi, lo = one(0.3), one(0.1)
+    assert torch.allclose(hi[:, 0], torch.full((5,), 0.3), atol=1e-5) and hi[:, 1].min() > 0, "확정 KO 30% -> P_KO 0.3, 그럴듯한 최대 데미지는 확률 가중 없이 그대로"
+    assert torch.allclose(lo[:, 0], torch.full((5,), 0.1), atol=1e-5) and (lo[:, 1] == 0).all(), "w < 0.15면 그럴듯한 후보에서 제외"
 print("model v4 OK: 롤아웃 == 시퀀스, 인과성, 패딩/미공개 칸, 매치업 반영, 신념 격리, 기술 표, 체크포인트 왕복, 상위 8개 후보, 숨은 기술/능력치 예측 반영")

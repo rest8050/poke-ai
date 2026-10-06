@@ -1,7 +1,8 @@
 """엔티티 토큰 트랜스포머 v4 = v3 + 신념 활용 방식 변경 (model_v3.py의 나머지 구조/인터페이스는 그대로).
-1) 숨은 기술을 "슬롯당 추측 기술 하나"가 아니라 마리당 확률 상위 8개 후보의 혼합으로 취급:
-   각 후보가 내 포켓몬에게 주는 위협(배율/데미지/KO)을 후보의 세트 포함 확률 w(= 미공개 칸 수 x 확률, 최대 1)로 가중해
-   기대 위협(합)과 최악 위협(최대)을 포켓몬 쌍(내 i, 상대 o)마다 계산 → 포켓몬 토큰 요약, 교체 후보 특징, 포켓몬<->포켓몬 어텐션 편향에 반영.
+1) 숨은 기술을 "슬롯당 추측 기술 하나"가 아니라 마리당 확률 상위 12개 후보의 혼합으로 취급:
+   후보의 세트 포함 확률 w(= 미공개 칸 수 x 확률, 최대 1)로 포켓몬 쌍(내 i, 상대 o)마다 교체 판단에 필요한 두 값을 계산:
+   P_KO = 1 - Π(1 - w·KO) (숨은 기술 중 하나라도 확정 KO일 확률), 그럴듯한 최대 데미지 = w >= 0.15인 후보의 최대 데미지(확률 가중 없음)
+   → 포켓몬 토큰 요약, 교체 후보 특징, 포켓몬<->포켓몬 어텐션 편향에 반영. (확률x크기로 곱하면 "30%의 확정 1타"가 0.3짜리 위협으로 뭉개지므로 분리)
    미공개 기술 토큰은 "모름" 표시만 유지하고, 후보 기술의 수치/임베딩 요약은 상대 포켓몬 토큰에 더함
 2) 노력치/성격: 신념이 상대 능력치 배율(stat 출력, 표준 가정 252/무보정 대비)을 예측 → 매치업의 상대 능력치(데미지/KO/스피드)에 곱하고 상대 포켓몬 토큰에도 입력
    (팀 데이터 사전학습으로만 학습, 정책/가치 손실은 신념에 닿지 않음 — 출력 전부 detach)
@@ -13,9 +14,10 @@ from src.core.belief import STAT_SCALE
 from src.core.model_v3 import BASE_IN, EntityPokemonNetV3, N_TOK, _mx
 from src.core.tensor_encoder import MOVE_NUM_DIM
 
-K_GUESS = 8             # 마리당 후보 기술 수 (재현율: 상위 4 0.73 / 상위 8 0.94 / 상위 12 0.98)
-MON_EXTRA4 = 7 + 6 + 6  # v3의 7 + 숨은 기술 위협(기대 3, 최악 3) + 상대 능력치 예측 6
-CAND4 = 9 + 6           # v3의 9 + 후보 i에게 상대 활성의 숨은 기술 위협(기대 3, 최악 3)
+K_GUESS = 12            # 마리당 후보 기술 수 (숨은 기술 재현율: 상위 4 0.73 / 상위 8 0.94 / 상위 12 0.98)
+PLAUSIBLE = 0.15        # 이 이상의 세트 포함 확률이면 "그럴듯한" 후보
+MON_EXTRA4 = 7 + 2 + 6  # v3의 7 + 숨은 기술 위협(P_KO, 그럴듯한 최대 데미지) + 상대 능력치 예측 6
+CAND4 = 9 + 2           # v3의 9 + 후보 i에게 상대 활성의 숨은 기술 위협 2
 MULT_RANGE = (0.6, 1.25)
 
 
@@ -29,7 +31,7 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
         self.mon_proj = nn.Sequential(nn.Linear(BASE_IN + MON_EXTRA4 + 1, d), nn.LayerNorm(d))
         self.switch_score = nn.Sequential(nn.Linear(ld + d + CAND4, hw), nn.GELU(), nn.Linear(hw, 1))
         self.type_head = nn.Sequential(nn.Linear(ld + CAND4 + 2, 64), nn.GELU(), nn.Linear(64, 2))
-        self.bias_hid = nn.ModuleList([nn.Linear(6, self.n_heads) for _ in self.layers])     # 숨은 기술 위협 -> 포켓몬<->포켓몬 어텐션 편향
+        self.bias_hid = nn.ModuleList([nn.Linear(2, self.n_heads) for _ in self.layers])     # 숨은 기술 위협 -> 포켓몬<->포켓몬 어텐션 편향
         for lin in self.bias_hid:
             nn.init.normal_(lin.weight, std=0.5)
             nn.init.zeros_(lin.bias)
@@ -60,8 +62,9 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
             M = self.matchup(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, mult)
             D, O = M["def"], M["off"]                                              # 공개된 기술만 [B,6,24,4]
             Dp = self.matchup._pair(opp_cat, opp_num, guess["pseudo"], False, my_cat, my_num, True, att_mult=mult)   # [B,6(내),6K,4]
-            Wt = Dp[..., :3].view(B, 6, 6, K, 3) * guess["w"][:, None, :, :, None]  # 후보별 위협 x 세트 포함 확률
-            H = torch.cat([Wt.sum(3), Wt.amax(3)], -1)                             # [B,6(내 i),6(상대 o),6] 기대 위협 3 + 최악 위협 3
+            w = guess["w"][:, None]                                                # [B,1,6(상대 o),K]
+            dmg, ko = Dp[..., 1].view(B, 6, 6, K), Dp[..., 2].view(B, 6, 6, K)     # 후보별 데미지 비율/확정 KO [B,6(내 i),6(상대 o),K]
+            H = torch.stack([1 - (1 - w * ko).prod(-1), (dmg * (w >= PLAUSIBLE)).amax(-1)], -1)   # [B,6,6,2] P_KO, 그럴듯한 최대 데미지
         act_m, act_o = my_num[:, :, 0].argmax(1), opp_num[:, :, 0].argmax(1)
         DS, OS = D.view(B, 6, 6, 4, 4), O.view(B, 6, 6, 4, 4)
         def_opp_act = DS[ar, :, act_o]                                             # [B,6(i),4,4] 상대 활성의 공개 기술이 내 포켓몬 i에게
@@ -71,10 +74,10 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
         h_my, h_opp = H[ar, :, act_o], H[ar, act_m]                                # 상대 활성의 숨은 기술 -> 내 i / 상대 o의 숨은 기술 -> 내 활성 [B,6,6]
         mon_extra = torch.cat([
             torch.cat([_mx(def_opp_act), _mx(off_vs_opp_act), M["spd_my"][..., None], h_my, torch.zeros_like(stat)], -1),
-            torch.cat([_mx(thr_on_my_act), _mx(my_act_on_opp), M["spd_opp"][..., None], h_opp, stat], -1)], 1)          # [B,12,19]
+            torch.cat([_mx(thr_on_my_act), _mx(my_act_on_opp), M["spd_opp"][..., None], h_opp, stat], -1)], 1)          # [B,12,15]
         mv_extra = torch.cat([off_vs_opp_act[..., :3], thr_on_my_act[..., :3]], 1)                                      # [B,12,4,3]
         bench_thr = DS[..., :3].amax((2, 3))[..., 1:]                                                                   # 후보 i가 상대 전체의 공개 기술에 맞는 최대 데미지/KO
-        cand = torch.cat([_mx(def_opp_act), _mx(off_vs_opp_act), M["spd_my"][..., None], bench_thr, h_my], -1)         # [B,6,15]
+        cand = torch.cat([_mx(def_opp_act), _mx(off_vs_opp_act), M["spd_my"][..., None], bench_thr, h_my], -1)         # [B,6,11]
         return D, O, H, mon_extra, mv_extra, cand, ar, act_m
 
     def _bias4(self, D, O, H, layer):
