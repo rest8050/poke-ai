@@ -643,8 +643,11 @@ def build_model(cfg: dict) -> nn.Module:
         from src.core.model_v2 import EntityPokemonNet
         return EntityPokemonNet(**cfg)
     if kind == "v3":
-        from src.core.model_v3 import EntityPokemonNetV3
-        return EntityPokemonNetV3(**cfg)
+        if cfg.pop("version", 1) >= 2:                   # 확정 설정이 기본인 현재 구조 (옵션 없음)
+            from src.core.model_v3 import EntityPokemonNetV3
+            return EntityPokemonNetV3(**cfg)
+        from src.core.model_v3_legacy import EntityPokemonNetV3Legacy      # 옛 구조(v3_full, v3_pilot_*): 호환 전용, 퇴역 시 삭제
+        return EntityPokemonNetV3Legacy(**cfg)
     return DeepPokemonBattleTransformerNet(**cfg)
 
 
@@ -666,7 +669,7 @@ def model_from_ckpt(path: str, map_location="cpu") -> nn.Module:
     if not has_cfg:
         print(f"  ⚠️ {path}에 .cfg.json 없음 → 기본 구조로 생성. 이 체크포인트가 모르는 새 모듈(예: team_cross)은 "
               f"무작위로 남습니다 — 기준/비교 모델로 쓴다면 cfg.json 있는(구조가 맞는) 체크포인트를 쓰세요.")
-    if cfg.get("model") == "v3":
+    if cfg.get("model") == "v3" and "version" not in cfg:
         cfg.setdefault("unrevealed_tokens", False)       # 이 옵션들 이전에 학습한 v3 체크포인트(v3_full 등)는 미공개 기술 칸을 마스킹하던 구조
         cfg.setdefault("opp_species", False)             # 상대 종 ID 임베딩도 없던 구조
     model = build_model(cfg)

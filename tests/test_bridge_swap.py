@@ -20,7 +20,7 @@ s_old = bs.Session("p1", bs.holder.model, bs.holder.name)
 write(os.path.join(ck, "supervised_v2_fp_v3_full.pt"))
 assert bs.holder.refresh() is old_model                 # 5초 안에는 다시 확인하지 않음
 bs.holder.refresh(force=True)
-assert bs.holder.name == "supervised_v2_fp_v3_full.pt" and type(bs.holder.model).__name__ == "EntityPokemonNetV3"
+assert bs.holder.name == "supervised_v2_fp_v3_full.pt" and type(bs.holder.model).__name__ == "EntityPokemonNetV3Legacy"
 s_new = bs.Session("p1", bs.holder.model, bs.holder.name)
 assert s_old.model is old_model and s_new.model is bs.holder.model and s_old.model is not s_new.model   # 진행 중 세션은 그대로
 

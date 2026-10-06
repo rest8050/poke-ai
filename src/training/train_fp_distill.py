@@ -32,6 +32,7 @@ from src.training.replay_dataset import OBS_KEYS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 UNK = vocab_sizes()
+HIDDEN_COEF = 1.0   # 숨김정보 손실 가중치: 신념 모듈 파라미터에만 닿고(입출력 detach) 기울기 클리핑도 따로라서 정책 학습과 간섭하지 않음
 KEYS = OBS_KEYS + ["action_mask", "target", "action_taken"]
 GAMMA = 0.995  # replay_dataset.py / build_fp_dataset.py와 동일
 
@@ -51,18 +52,6 @@ def make_batches(data, offsets, idx, size, shuffle):
         b["time_index"] = torch.cat([torch.arange(n) for n in lens])
         b["n_seq"] = len(sel)
         yield b
-
-
-def shape_target(t, prune, temp):
-    """교사 분포 정리: prune 미만 확률 행동은 잡음(탐색 방문 수의 꼬리)으로 보고 0 → 재정규화, temp<1이면 분포를 날카롭게(p^(1/temp)).
-    최상위 행동은 항상 남김 → argmax 불변. 둘 다 기본값(0, 1)이면 원본 그대로."""
-    if prune > 0:
-        t = torch.where((t >= prune) | (t == t.max(-1, keepdim=True).values), t, torch.zeros_like(t))
-        t = t / t.sum(-1, keepdim=True)
-    if temp != 1.0:
-        t = t.clamp_min(0) ** (1.0 / temp)
-        t = t / t.sum(-1, keepdim=True)
-    return t
 
 
 def pg_loss(logp, b, adv):
@@ -86,25 +75,27 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
     for b in make_batches(data, offsets, idx, args.batch_battles, train):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.bf16):   # 손실 계산은 아래에서 float32로
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):   # 손실 계산은 아래에서 float32로 (큰 모델의 메모리/시간 절약)
                 out = model.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
                 with torch.no_grad():
                     ref_out = ref.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
             out = {k: v.float() for k, v in out.items()}
             ref_out = {k: v.float() for k, v in ref_out.items()}
             logp = F.log_softmax(out["policy_logits"], -1)
-            ce = -(shape_target(b["target"], args.target_prune, args.target_temp) * logp).sum(-1).mean()
+            ce = -(b["target"] * logp).sum(-1).mean()
             v = F.mse_loss(out["value"].view(-1), b["value_target"])
             kl = F.kl_div(logp, F.softmax(ref_out["policy_logits"], -1), reduction="batchmean")
             pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
             hid = ce.new_zeros(())
-            if "hid_move" in out and args.hidden_coef > 0:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
+            if "hid_move" in out:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
                 hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]}, b, UNK)
                 tot["hid_top4"] += hs.get("move_top4", 0.0) * hs["move_n"]; tot["hid_nb"] += hs["move_n"]
-            loss = ce + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg + args.hidden_coef * hid
+            loss = ce + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg + HIDDEN_COEF * hid
         if train:
             opt.zero_grad(); loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+            for grp in args._clip_groups:   # 신념 모듈은 자기 손실로만 학습하므로 기울기 클리핑도 따로 (큰 숨김정보 손실이 정책 기울기를 누르지 않게)
+                torch.nn.utils.clip_grad_norm_(grp, 1.0)
+            opt.step()
             if getattr(args, "_sched", None) is not None:
                 args._sched.step()  # 학습률 스케줄은 배치마다 갱신
         with torch.no_grad():
@@ -162,15 +153,33 @@ def load(pattern, fp16=False):
     return data, np.concatenate([[0], np.cumsum(lens)]), lens, files
 
 
+def split_ids(data, offsets, val_frac, seed=0):
+    """학습/검증 분할 (시퀀스 단위). 셀프플레이는 한 배틀이 양쪽 시점으로 두 번 기록돼 있어서(내 시점/상대 시점, 결과 반대) 시퀀스 단위로
+    무작위 분할하면 검증 시퀀스의 거울 짝이 학습에 들어가 검증 지표가 낙관적이 됨 → 같은 두 팀 조합을 가진 시퀀스는 항상 같은 쪽으로 보냄.
+    팀 조합 = 첫 턴의 내 팀/상대 팀 종 ID(정렬)를 짝으로 묶은 것 (같은 조합의 다른 배틀도 같이 묶임)"""
+    first = np.asarray(offsets[:-1])
+    mine = np.sort(np.asarray(data["my_team_cat"][first, :, 10]), axis=1)
+    opp = np.sort(np.asarray(data["opp_team_cat"][first, :, 10]), axis=1)
+    groups = {}
+    for i in range(len(first)):
+        groups.setdefault(tuple(sorted((mine[i].tobytes(), opp[i].tobytes()))), []).append(i)
+    keys = list(groups)
+    random.Random(seed).shuffle(keys)
+    n_val, val = max(1, int(len(first) * val_frac)), []
+    for k in keys:
+        if len(val) >= n_val:
+            break
+        val += groups[k]
+    in_val = set(val)
+    return val, [i for i in range(len(first)) if i not in in_val]
+
+
 def main(args):
     data, offsets, lens, files = load(args.data, args.fp16_store)
-    ids = list(range(len(lens)))
-    random.Random(0).shuffle(ids)
-    n_val = max(1, int(len(ids) * args.val_frac))
-    val, train = ids[:n_val], ids[n_val:]
-    print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판")
+    val, train = split_ids(data, offsets, args.val_frac)
+    print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
-    arch = json.loads(args.arch) if args.arch else {}
+    arch = json.loads(args.arch) if args.arch else {"model": "v3", "version": 2}
     model = build_model(arch)
     if args.init != "none":
         expanded, skipped = load_compatible(model, torch.load(args.init, map_location="cpu"))
@@ -194,6 +203,8 @@ def main(args):
         raise SystemExit("❌ --init none이면 --aux-teacher가 필요함 (KL 기준 모델)")
     ref = model_from_ckpt(ref_path)
     print(f"모델 {tot/1e6:.2f}M 구조 {arch or '기본'} | 시작 {args.init} | KL 기준 {ref_path}")
+    belief_params = [p for n, p in model.named_parameters() if n.startswith("belief.")]
+    args._clip_groups = [belief_params, [p for n, p in model.named_parameters() if not n.startswith("belief.")]] if belief_params else [list(model.parameters())]
     model.to(DEVICE)
     ref.to(DEVICE).eval()
     for p in ref.parameters():
@@ -237,7 +248,7 @@ if __name__ == "__main__":
     ap.add_argument("--data", default="data/fp_selfplay/ms100/fp_data*.npz", help="build_fp_dataset.py 출력 (glob)")
     ap.add_argument("--init", default="checkpoints/supervised_v2_fp_all8a.pt", help="시작 체크포인트. 앞으로는 BC가 아니라 직전 최신 모델에서 이어서 학습")
     ap.add_argument("--out", default="checkpoints/supervised_v2_fp_next.pt")
-    ap.add_argument("--arch", default="", help="모델 구조 JSON. 예: {\"pokemon_embed_dim\":192,\"history_dim\":384,\"latent_dim\":384,\"num_layers\":3}. 비우면 기본 구조")
+    ap.add_argument("--arch", default="", help="모델 구조 JSON (비우면 현재 기본 구조 v3). 옛 기존 구조는 {} 또는 {\"pokemon_embed_dim\":192,...}")
     ap.add_argument("--aux-teacher", default="", help="KL 기준 모델 체크포인트 (기본: --init). --init none(처음부터 학습)일 때 필수")
     ap.add_argument("--kl-final", type=float, default=1.0, help="마지막 에폭의 KL 계수 배율 (첫 에폭 1.0에서 선형 변화). 예: 0.2")
     ap.add_argument("--fp16-store", action="store_true", help="관측 배열을 float16으로 메모리에 보관 (데이터가 커서 RAM이 모자랄 때). 값 정밀도는 약 3자리")
@@ -251,9 +262,5 @@ if __name__ == "__main__":
     ap.add_argument("--kl-coef", type=float, default=0.05, help="시작 정책과의 KL (클수록 시작 정책 유지). 최적해가 (교사 + 계수*시작정책)/(1+계수) 혼합이라 크면 시작 정책 쪽으로 끌려감")
     ap.add_argument("--pg-coef", type=float, default=0.0, help="실제 승패(할인된 결과 − 가치 예측 = advantage) 기반 정책 그라디언트 보조 손실 가중치. "
                     "0=끔(기본, 기존 동작 그대로). 장기 자산(장판/트릭룸/날씨) 신용 할당을 정책에도 흘려보내려는 실험적 항 — 작게(0.03~0.1) 시작할 것")
-    ap.add_argument("--target-prune", type=float, default=0.0, help="교사 분포에서 이 확률 미만인 행동을 0으로 (예: 0.05). 0=끔. 검증 CE도 정리된 타깃 기준이라 다른 설정과 숫자 비교 불가")
-    ap.add_argument("--target-temp", type=float, default=1.0, help="교사 분포를 p^(1/temp)로 날카롭게 (예: 0.75). 1=끔")
-    ap.add_argument("--bf16", action="store_true", help="bfloat16 자동 혼합정밀도 (큰 모델에서 GPU 메모리/시간 크게 절약)")
-    ap.add_argument("--hidden-coef", type=float, default=0.0, help="상대 숨겨진 정보(기술/도구/특성) 예측 보조 손실 가중치 (모델에 hidden_head가 있어야 함). 0=끔")
     ap.add_argument("--val-frac", type=float, default=0.1)
     main(ap.parse_args())

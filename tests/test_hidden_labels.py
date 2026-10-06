@@ -39,7 +39,7 @@ assert st_good["move_top4"] > 0.99 and st_good["item_acc"] == 1.0 and st_good["a
 cat2 = cat.clone(); cat2[2, 0, 10] = 9
 l2, st2 = hidden_loss(logits(True, True, True), {"opp_team_cat": cat2, "seq_index": b["seq_index"]}, U)
 assert st2["move_n"] == 0 or st2["move_n"] < st_good["move_n"] + 1
-# 모델이 hid_* 출력을 내고, hidden_head가 없으면 안 냄
+# 모델이 hid_* 출력을 내고 손실이 신념 모듈로 역전파
 from src.core.tensor_encoder import FIELD_DIM, NUM_DIM
 g = torch.Generator().manual_seed(0)
 def rnd(n):
@@ -49,13 +49,10 @@ def rnd(n):
             torch.randint(1, 8, (n, 6, 11), generator=g), opp_num, torch.rand(n, 6, 4, 46, generator=g), torch.rand(n, FIELD_DIM, generator=g)]
 o = rnd(4)
 mask = torch.zeros(4, 22, dtype=torch.bool); mask[:, [0, 2, 8]] = True
-for hh in (True, False):
-    m = build_model({"model": "v3", "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64, "hidden_head": hh}).eval()
-    out = m.forward_sequences(o, torch.zeros(4, dtype=torch.long), torch.arange(4), 1, mask)
-    assert ("hid_move" in out) == hh
-    if hh:
-        assert out["hid_move"].shape == (4, 6, Vm) and out["hid_item"].shape == (4, 6, Vi) and out["hid_ability"].shape == (4, 6, Va)
-        loss, _ = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]},
-                              {"opp_team_cat": o[3], "seq_index": torch.zeros(4, dtype=torch.long)}, U)
-        loss.backward()
+m = build_model({"model": "v3", "version": 2, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
+out = m.forward_sequences(o, torch.zeros(4, dtype=torch.long), torch.arange(4), 1, mask)
+assert out["hid_move"].shape == (4, 6, Vm) and out["hid_item"].shape == (4, 6, Vi) and out["hid_ability"].shape == (4, 6, Va)
+loss, _ = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]},
+                      {"opp_team_cat": o[3], "seq_index": torch.zeros(4, dtype=torch.long)}, U)
+loss.backward()
 print("hidden labels OK")
