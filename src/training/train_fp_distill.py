@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.core.model import DeepPokemonBattleTransformerNet, build_model, load_compatible, model_from_ckpt, save_ckpt
+from src.core.model import build_model, load_compatible, model_from_ckpt, save_ckpt
 from src.core.tensor_encoder import MOVE_NUM_DIM
 from src.training.hidden_labels import hidden_loss, vocab_sizes
 from src.training.replay_dataset import OBS_KEYS
@@ -33,6 +33,8 @@ from src.training.replay_dataset import OBS_KEYS
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 UNK = vocab_sizes()
 BELIEF_FT_LR_MULT = 0.1   # 사전학습된 신념의 미세조정 학습률 배율 (배틀 상황 입력만 새로 배우면 됨)
+BATCH_BATTLES, VALUE_COEF, VAL_FRAC = 32, 0.25, 0.1
+WARMUP_FRAC, LR_MIN_RATIO = 0.05, 0.05   # 학습률: 웜업(0 → lr) 후 코사인 감쇠(lr → lr x LR_MIN_RATIO). 높은 학습률에서 첫 에폭에 정책이 무너지는 충격을 웜업이, 마지막 지점의 흔들림을 감쇠가 줄임
 HIDDEN_COEF = 1.0   # 숨김정보 손실 가중치: 신념 모듈 파라미터에만 닿고(입출력 detach) 기울기 클리핑도 따로라서 정책 학습과 간섭하지 않음
 KEYS = OBS_KEYS + ["action_mask", "target", "action_taken"]
 GAMMA = 0.995  # replay_dataset.py / build_fp_dataset.py와 동일
@@ -49,6 +51,8 @@ def make_batches(data, offsets, idx, size, shuffle):
         lens = [offsets[j + 1] - offsets[j] for j in sel]
         # 가치 타겟 = 할인된 최종 결과 γ^(남은 턴)·(±1) → 가치 헤드가 승패 기대값(승률)을 직접 배움 (예전 저장값 value_target은 Φ를 뺀 차이값이라 안 씀)
         b["value_target"] = torch.cat([GAMMA ** torch.arange(n - 1, -1, -1, dtype=torch.float32) * float(data["outcome"][j]) for j, n in zip(sel, lens)])
+        if "teacher_value" in data:      # 교사(탐색)가 결정마다 본 승률 0~1 → ±1 척도 (build_fp_dataset로 만든 새 데이터에만 있음)
+            b["teacher_value"] = torch.from_numpy(np.concatenate([data["teacher_value"][offsets[j]:offsets[j + 1]] for j in sel])).float() * 2 - 1
         b["seq_index"] = torch.cat([torch.full((n,), s) for s, n in enumerate(lens)])
         b["time_index"] = torch.cat([torch.arange(n) for n in lens])
         b["n_seq"] = len(sel)
@@ -73,7 +77,7 @@ def pg_loss(logp, b, adv):
 def run(model, ref, data, offsets, idx, args, train, opt=None):
     model.train(bool(train))  # 학습 중에는 드롭아웃(트랜스포머/융합층 0.1)을 켬 → 오래된 데이터를 반복해서 외우는 것을 늦춤. 검증은 항상 끔
     tot = dict(ce=0.0, v=0.0, kl=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, chg=0, chg_agree=0)
-    for b in make_batches(data, offsets, idx, args.batch_battles, train):
+    for b in make_batches(data, offsets, idx, BATCH_BATTLES, train):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):   # 손실 계산은 아래에서 float32로 (큰 모델의 메모리/시간 절약)
@@ -84,21 +88,25 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
             ref_out = {k: v.float() for k, v in ref_out.items()}
             logp = F.log_softmax(out["policy_logits"], -1)
             ce = -(b["target"] * logp).sum(-1).mean()
-            v = F.mse_loss(out["value"].view(-1), b["value_target"])
+            v = F.mse_loss(out["value"].view(-1), b["value_target"])           # 기록/비교용: 항상 할인된 결과 기준
+            if args.teacher_value_mix == 0:
+                v_loss = v
+            else:
+                tv = b["teacher_value"]
+                v_loss = F.mse_loss(out["value"].view(-1), torch.where(torch.isnan(tv), b["value_target"], args.teacher_value_mix * tv + (1 - args.teacher_value_mix) * b["value_target"]))
             kl = F.kl_div(logp, F.softmax(ref_out["policy_logits"], -1), reduction="batchmean")
             pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
             hid = ce.new_zeros(())
             if "hid_move" in out:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
                 hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]}, b, UNK)
                 tot["hid_top4"] += hs.get("move_top4", 0.0) * hs["move_n"]; tot["hid_nb"] += hs["move_n"]
-            loss = ce + args.value_coef * v + args.kl_coef * getattr(args, '_kl_mult', 1.0) * kl + args.pg_coef * pg + HIDDEN_COEF * hid
+            loss = ce + VALUE_COEF * v_loss + args.kl_coef * kl + args.pg_coef * pg + HIDDEN_COEF * hid
         if train:
             opt.zero_grad(); loss.backward()
             for grp in args._clip_groups:   # 신념 모듈은 자기 손실로만 학습하므로 기울기 클리핑도 따로 (큰 숨김정보 손실이 정책 기울기를 누르지 않게)
                 torch.nn.utils.clip_grad_norm_(grp, 1.0)
             opt.step()
-            if getattr(args, "_sched", None) is not None:
-                args._sched.step()  # 학습률 스케줄은 배치마다 갱신
+            args._sched.step()  # 학습률 스케줄은 배치마다 갱신
         with torch.no_grad():
             want, got, ref_a = b["target"].argmax(-1), logp.argmax(-1), ref_out["policy_logits"].argmax(-1)
             chg = want != ref_a  # 탐색이 원래 정책의 선택을 바꾼 결정
@@ -150,6 +158,8 @@ def load(pattern, fp16=False):
         data[k] = out
         del first
     data["outcome"] = np.concatenate([p["outcome"] for p in parts])
+    if any("teacher_value" in p.files for p in parts):      # 교사 가치가 없는 파일(옛 형식)은 NaN → 그 결정은 할인된 결과만으로 학습
+        data["teacher_value"] = np.concatenate([p["teacher_value"] if "teacher_value" in p.files else np.full(int(p["lens"].sum()), np.nan, np.float32) for p in parts])
     lens = np.concatenate([p["lens"] for p in parts])
     return data, np.concatenate([[0], np.cumsum(lens)]), lens, files
 
@@ -177,7 +187,9 @@ def split_ids(data, offsets, val_frac, seed=0):
 
 def main(args):
     data, offsets, lens, files = load(args.data, args.fp16_store)
-    val, train = split_ids(data, offsets, args.val_frac)
+    if args.teacher_value_mix > 0 and "teacher_value" not in data:
+        raise SystemExit("❌ --teacher-value-mix에는 교사 가치(teacher_value)가 든 npz가 하나는 있어야 함 (build_fp_dataset.py로 만든 새 형식)")
+    val, train = split_ids(data, offsets, VAL_FRAC)
     print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
     arch = json.loads(args.arch) if args.arch else {"model": "v3", "version": 3}
@@ -223,25 +235,21 @@ def main(args):
     other_params = [p for n, p in model.named_parameters() if not n.startswith("belief.")]
     groups = [{"params": other_params, "lr": args.lr}] + ([{"params": belief_params, "lr": args.lr * belief_lr}] if belief_params else [])
     opt = torch.optim.AdamW(groups, weight_decay=1e-4)
-    if args.sched == "cosine":
-        # 웜업(0 → lr) 후 코사인 감쇠(lr → lr × lr_min_ratio). 높은 학습률에서 첫 에폭에 정책이 무너지는 충격을 웜업이, 마지막 지점의 흔들림을 감쇠가 줄임
-        import math
-        total = max(1, args.epochs * math.ceil(len(train) / args.batch_battles))
-        warm = int(total * args.warmup_frac)
+    import math
+    total = max(1, args.epochs * math.ceil(len(train) / BATCH_BATTLES))
+    warm = int(total * WARMUP_FRAC)
 
-        def mult(step):
-            if step < warm:
-                return (step + 1) / max(1, warm)
-            t = (step - warm) / max(1, total - warm)
-            return args.lr_min_ratio + (1 - args.lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * min(1.0, t)))
+    def mult(step):
+        if step < warm:
+            return (step + 1) / max(1, warm)
+        t = (step - warm) / max(1, total - warm)
+        return LR_MIN_RATIO + (1 - LR_MIN_RATIO) * 0.5 * (1 + math.cos(math.pi * min(1.0, t)))
 
-        args._sched = torch.optim.lr_scheduler.LambdaLR(opt, mult)
+    args._sched = torch.optim.lr_scheduler.LambdaLR(opt, mult)
     print("시작 전 검증:", fmt(run(model, ref, data, offsets, val, args, train=False)))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     best_ce, best_ep, ce_hist = float("inf"), 0, []
     for ep in range(1, args.epochs + 1):
-        # KL 계수 배율: 첫 에폭 1.0 → 마지막 에폭 kl_final (선형). 처음부터 학습할 때 초반엔 보조 교사를 강하게, 후반엔 약하게
-        args._kl_mult = 1.0 + (args.kl_final - 1.0) * (ep - 1) / max(1, args.epochs - 1)
         tr = run(model, ref, data, offsets, train, args, train=True, opt=opt)
         va = run(model, ref, data, offsets, val, args, train=False)
         print(f"[에폭 {ep}/{args.epochs}] 학습 {fmt(tr)}\n            검증 {fmt(va)}", flush=True)
@@ -252,8 +260,7 @@ def main(args):
             best_ce, best_ep = smoothed, ep
             save_ckpt(model, args.out)
             print(f"  💾 최저점 갱신(완만화 CE {smoothed:.4f}) → {args.out}", flush=True)
-    save_ckpt(model, args.out + ".last.pt")
-    print(f"💾 최종 저장: {args.out}.last.pt | 최저점: {args.out} (에폭 {best_ep}, 완만화 CE {best_ce:.4f})")
+    print(f"💾 최저점: {args.out} (에폭 {best_ep}, 완만화 CE {best_ce:.4f})")
 
 
 if __name__ == "__main__":
@@ -263,18 +270,12 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="checkpoints/supervised_v2_fp_next.pt")
     ap.add_argument("--arch", default="", help="모델 구조 JSON (비우면 현재 기본 구조 v3). 옛 기존 구조는 {} 또는 {\"pokemon_embed_dim\":192,...}")
     ap.add_argument("--aux-teacher", default="", help="KL 기준 모델 체크포인트 (기본: --init). --init none(처음부터 학습)일 때 필수")
-    ap.add_argument("--kl-final", type=float, default=1.0, help="마지막 에폭의 KL 계수 배율 (첫 에폭 1.0에서 선형 변화). 예: 0.2")
     ap.add_argument("--fp16-store", action="store_true", help="관측 배열을 float16으로 메모리에 보관 (데이터가 커서 RAM이 모자랄 때). 값 정밀도는 약 3자리")
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-3, help="피크 학습률. 스윕(코사인, 학생 상태 홀드아웃 CE): 1e-3 1.5005 / 2e-3 1.4906 / 3e-3 1.4958 / 4e-3 1.5034")
-    ap.add_argument("--sched", choices=["const", "cosine"], default="cosine", help="학습률 스케줄. cosine=웜업 후 코사인 감쇠(기본), const=고정 (예전 동작; 고정 lr은 높이면 붕괴)")
-    ap.add_argument("--warmup-frac", type=float, default=0.05, help="cosine일 때 전체 스텝 중 웜업 비율")
-    ap.add_argument("--lr-min-ratio", type=float, default=0.05, help="cosine일 때 마지막 학습률 = lr × 이 값")
-    ap.add_argument("--batch-battles", type=int, default=32)
-    ap.add_argument("--value-coef", type=float, default=0.25)
     ap.add_argument("--kl-coef", type=float, default=0.05, help="시작 정책과의 KL (클수록 시작 정책 유지). 최적해가 (교사 + 계수*시작정책)/(1+계수) 혼합이라 크면 시작 정책 쪽으로 끌려감")
     ap.add_argument("--pg-coef", type=float, default=0.0, help="실제 승패(할인된 결과 − 가치 예측 = advantage) 기반 정책 그라디언트 보조 손실 가중치. "
                     "0=끔(기본, 기존 동작 그대로). 장기 자산(장판/트릭룸/날씨) 신용 할당을 정책에도 흘려보내려는 실험적 항 — 작게(0.03~0.1) 시작할 것")
+    ap.add_argument("--teacher-value-mix", type=float, default=0.0, help="가치 타깃 = 이 비율 x 교사 가치(탐색이 결정마다 본 승률) + 나머지 x 할인된 결과. 0=결과만 (교사 가치가 있는 새 데이터 필요)")
     ap.add_argument("--belief-init", default="checkpoints/belief.pt", help="사전학습한 신념 가중치(pretrain_belief.py 결과). 파일이 없으면 신념도 처음부터 함께 학습, none이면 사용 안 함")
-    ap.add_argument("--val-frac", type=float, default=0.1)
     main(ap.parse_args())

@@ -6,6 +6,7 @@
    미공개 기술 토큰은 "모름" 표시만 유지하고, 후보 기술의 수치/임베딩 요약은 상대 포켓몬 토큰에 더함
 2) 노력치/성격: 신념이 상대 능력치 배율(stat 출력, 표준 가정 252/무보정 대비)을 예측 → 매치업의 상대 능력치(데미지/KO/스피드)에 곱하고 상대 포켓몬 토큰에도 입력
    (팀 데이터 사전학습으로만 학습, 정책/가치 손실은 신념에 닿지 않음 — 출력 전부 detach)
+3) my_pos=False: 내 쪽 팀 슬롯/기술 칸 위치 임베딩을 끔 → 내 팀 순서 순열에 대해 정확히 대칭(순서가 팀 지문 통로가 되는 것을 막음). 상대 쪽은 공개된 순서라 유지
 arch: {"model": "v4"}"""
 import torch
 import torch.nn as nn
@@ -22,9 +23,11 @@ MULT_RANGE = (0.6, 1.25)
 
 
 class EntityPokemonNetV4(EntityPokemonNetV3):
-    def __init__(self, **kw):
+    def __init__(self, my_pos: bool = True, **kw):
         super().__init__(**kw)
-        self.cfg = {**{k: v for k, v in self.cfg.items() if k != "version"}, "model": "v4"}
+        self.cfg = {**{k: v for k, v in self.cfg.items() if k != "version"}, "model": "v4", "my_pos": my_pos}
+        pos = torch.ones(12) if my_pos else torch.tensor([0.0] * 6 + [1.0] * 6)       # 내 쪽 슬롯/기술 칸 순서는 임의(팀 export 순서)라서 끌 수 있음. 상대 쪽 순서는 공개된 순서라 정보가 있어 유지
+        self.register_buffer("pos_gate", pos, persistent=False)
         d, hw, ld = self.d, self.cfg["head_width"], self.cfg["latent_dim"]
         del self.guess_proj
         self.hid_proj = nn.Linear(1 + MOVE_NUM_DIM + 48, d)                 # 후보 기술 혼합(확률 합, 수치, 임베딩) -> 상대 포켓몬 토큰
@@ -109,12 +112,12 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
         side = torch.arange(12, device=dev) // 6
         slot = torch.arange(12, device=dev) % 6
         active = (num[:, 0] > 0.5).long().view(B, 12)
-        base = self.side_emb(side)[None] + self.slot_emb(slot)[None] + self.act_emb(active)
+        base = self.side_emb(side)[None] + self.slot_emb(slot)[None] * self.pos_gate[None, :, None] + self.act_emb(active)
         g = torch.cat([guess["w"].sum(-1, keepdim=True), (guess["w"][..., None] * guess["pseudo"]).sum(2),
                        (guess["w"][..., None] * E._emb("move", guess["idx"]).detach()).sum(2)], -1)      # 후보 기술 혼합 요약 [B,6,1+46+48]
         mon = self.mon_proj(mon_in).view(B, 12, d) + base + self.role_emb.weight[0]
         mon = mon + torch.cat([torch.zeros_like(mon[:, :6]), self.hid_proj(g)], 1)
-        mv = self.move_proj(mv_in).view(B, 12, 4, d) + base[:, :, None] + self.mslot_emb.weight[None, None] + self.role_emb.weight[1]
+        mv = self.move_proj(mv_in).view(B, 12, 4, d) + base[:, :, None] + self.mslot_emb.weight[None, None] * self.pos_gate[None, :, None, None] + self.role_emb.weight[1]
         fld = self.field_proj(field_vec).view(B, 3, d) + self.fld_emb.weight[None] + self.role_emb.weight[2]
         cls = self.cls.expand(B, 1, d) + self.role_emb.weight[3]
         x = torch.cat([mon, mv.reshape(B, 48, d), fld, cls], 1)

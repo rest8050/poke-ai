@@ -633,29 +633,24 @@ PokemonBattleNet = DeepPokemonBattleTransformerNet
 
 
 def build_model(cfg: dict) -> nn.Module:
-    """구조 인자로 모델 생성: {"model": "entity"}면 model_v2.EntityPokemonNet, 아니면 기존 구조"""
+    """구조 인자로 모델 생성: model 키가 v4(model_v4.py)/v3(version 3 = model_v3.py, 없으면 옛 v3_full 구조 = model_v3_legacy.py)이면 엔티티 토큰 모델, 없으면 기존 구조"""
     cfg = dict(cfg)
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
     kind = cfg.pop("model", "v1")
-    if kind == "entity":
-        from src.core.model_v2 import EntityPokemonNet
-        return EntityPokemonNet(**cfg)
-    if kind == "v4":                                     # v3 + 상위 8개 기술 혼합 위협 + 노력치/성격 예측 (src/core/model_v4.py)
+    if kind == "v4":                                     # v3 + 상위 12개 기술 혼합 위협 + 노력치/성격 예측
         from src.core.model_v4 import EntityPokemonNetV4
         return EntityPokemonNetV4(**cfg)
     if kind == "v3":
-        ver = cfg.pop("version", 1)
-        if ver >= 3:                                     # 확정 설정이 기본인 현재 구조 (자기 완결형 신념, 옵션 없음)
+        if cfg.pop("version", 1) >= 3:                   # 자기 완결형 신념이 있는 구조
             from src.core.model_v3 import EntityPokemonNetV3
             return EntityPokemonNetV3(**cfg)
-        from src.core.model_v3_legacy import EntityPokemonNetV3Legacy      # 옛 구조: 호환 전용, 퇴역 시 삭제
-        if ver == 2:                                     # 트렁크 임베딩을 공유하던 신념(v3_pilot): 옛 구조 + belief 켜기, 벤치 위협은 공개 기술만
-            m = EntityPokemonNetV3Legacy(belief=True, **cfg)
-            m.bench_from_guess = False
-            return m
-        return EntityPokemonNetV3Legacy(**cfg)
+        from src.core.model_v3_legacy import EntityPokemonNetV3Legacy      # v3_full(서버 탑재) 호환 전용, 퇴역 시 삭제
+        for k, default in (("unrevealed_tokens", False), ("opp_species", False), ("policy", "hier"), ("hidden_head", False), ("belief", False)):   # 제거된 옵션
+            if cfg.pop(k, default) != default:
+                raise ValueError(f"제거된 옵션 {k}를 쓰는 v3 체크포인트는 더 이상 로드할 수 없음")
+        return EntityPokemonNetV3Legacy(**{k: v for k, v in cfg.items() if k not in ("species_dropout", "species_dim", "belief_hidden", "belief_species_dropout")})
     return DeepPokemonBattleTransformerNet(**cfg)
 
 
@@ -677,9 +672,6 @@ def model_from_ckpt(path: str, map_location="cpu") -> nn.Module:
     if not has_cfg:
         print(f"  ⚠️ {path}에 .cfg.json 없음 → 기본 구조로 생성. 이 체크포인트가 모르는 새 모듈(예: team_cross)은 "
               f"무작위로 남습니다 — 기준/비교 모델로 쓴다면 cfg.json 있는(구조가 맞는) 체크포인트를 쓰세요.")
-    if cfg.get("model") == "v3" and "version" not in cfg:     # version 없음 = v3_full 등 옛 구조
-        cfg.setdefault("unrevealed_tokens", False)       # 이 옵션들 이전에 학습한 v3 체크포인트(v3_full 등)는 미공개 기술 칸을 마스킹하던 구조
-        cfg.setdefault("opp_species", False)             # 상대 종 ID 임베딩도 없던 구조
     model = build_model(cfg)
     load_compatible(model, torch.load(path, map_location=map_location))
     return model

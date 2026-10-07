@@ -1,4 +1,4 @@
-"""엔티티 토큰 트랜스포머 v3 (model_v2의 확장). 옵션 없이 확정된 설정이 기본 동작:
+"""엔티티 토큰 트랜스포머 v3. 옵션 없이 확정된 설정이 기본 동작:
 1) 규모: d_model 256 / 6층 / 8헤드. 한 턴 = 포켓몬 12 + 기술 48 + 필드 3 + CLS 1 = 64개 토큰, 압축 없이 전부 어텐션
 2) 매치업 특징(src/core/matchup.py): 상대 기술이 내 포켓몬에 주는 배율·데미지·KO, 내 기술이 상대 포켓몬에 주는 효과, 스피드 우열
    - 포켓몬/기술 토큰 입력에 요약치를 더하고, 어텐션 로짓에 편향 bias[h,i,j] = f_h(배율, 데미지, KO, 공격기여부)를 더함
@@ -10,7 +10,7 @@
    배틀에서는 숨김정보 손실(src/training/hidden_labels.py)로만 학습.
    확률 상위 기술을 미공개 칸에 "추측 기술"로 배정해, 그 기술의 위력/타입/분류로 매치업 위협(기대 데미지/KO)을 계산 → 어텐션 편향, 토큰 요약, 교체 헤드에 반영.
    신념 출력은 detach라서 정책/가치 손실은 신념에 닿지 않고(종 조합으로 승패를 외울 수 없음), 신념은 트렁크 입력을 안 쓰므로 숨김정보 손실도 트렁크에 닿지 않음
-인터페이스는 model_v2와 같음 (forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt). 옛 구조(v3_full 등)는 model_v3_legacy.py
+인터페이스: forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt. 옛 구조(v3_full 등)는 model_v3_legacy.py
 arch: {"model": "v3", "version": 3}"""
 import torch
 import torch.nn as nn

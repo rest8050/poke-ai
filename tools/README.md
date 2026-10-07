@@ -119,8 +119,8 @@ python src/evaluation/analyze_model.py --ckpt checkpoints/supervised_v2.pt --mod
 # 1차 (약 30초): 학생이 방문한 상태에서 교사와의 일치율/CE (높을수록/낮을수록 좋음). 기준: all5d300 0.485/1.5596, all5x 0.497/1.5500, all5h 0.500/1.5335
 python tools/eval_on_npz.py checkpoints/supervised_v2_fp_XXX.pt data/dagger/dg2_ho.npz
 
-# 최종 (약 15분, Showdown 서버 먼저 켤 것): 모델끼리 3000판. 표준오차 약 0.9pp
-bash logs/h2h_run.sh <모델A> <모델B> 125    # checkpoints/supervised_v2_fp_<이름>.pt, 결과 logs/h2h_summary.txt
+# 최종 (Showdown 서버는 없으면 알아서 띄움): 후보 대 기준 SPRT 대전. 결론이 나는 즉시 멈추고(δ 3%p, 상한 6000판), 풀별 판 수를 맞춘 데이터로 판정. 기록은 results/ledger.jsonl
+python tools/arena.py <후보> <기준> --delta 0.03 --cap 6000    # 이름 = checkpoints/supervised_v2_fp_<이름>.pt
 
 # DAgger 데이터 만들기: tools/record_games.py (학생 자가대전 기록) → foul-play/fp/replay_label.py (컨테이너에서 재생 라벨링) → build_fp_dataset.py
 ```

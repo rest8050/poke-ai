@@ -8,13 +8,13 @@ from src.training.train_fp_distill import pg_loss
 def test_all_unmatched_returns_zero():
     logp = torch.log_softmax(torch.randn(3, 22), dim=-1)
     b = {"action_taken": torch.tensor([-1, -1, -1]), "value_target": torch.tensor([0.5, -0.3, 0.1])}
-    assert pg_loss(logp, b).item() == 0.0
+    assert pg_loss(logp, b, b["value_target"]).item() == 0.0
 
 
 def test_unmatched_rows_excluded_from_normalization_and_loss():
     logp = torch.log_softmax(torch.zeros(3, 4), dim=-1)  # 균등분포, logp(모든 행동)=log(0.25)
     b = {"action_taken": torch.tensor([0, -1, 1]), "value_target": torch.tensor([1.0, 999.0, -1.0])}
-    loss = pg_loss(logp, b)
+    loss = pg_loss(logp, b, b["value_target"])
     # 유효 2개(advantage 1.0, -1.0)만 정규화: 평균0, 표준편차1 -> adv_norm = [+1,-1]. logp_a 둘 다 log(0.25)로 동일
     # loss = -mean(logp_a * adv_norm) = -log(0.25)*(1 + -1)/2 = 0
     assert abs(loss.item()) < 1e-5
@@ -26,7 +26,7 @@ def test_positive_advantage_pushes_up_negative_pushes_down():
     logits = torch.zeros(2, 3, requires_grad=True)
     logp = torch.log_softmax(logits, dim=-1)
     b = {"action_taken": torch.tensor([0, 1]), "value_target": torch.tensor([5.0, -5.0])}
-    loss = pg_loss(logp, b)
+    loss = pg_loss(logp, b, b["value_target"])
     loss.backward()
     assert logits.grad[0, 0].item() < 0
     assert logits.grad[1, 1].item() > 0

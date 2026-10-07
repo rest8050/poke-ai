@@ -149,4 +149,12 @@ with torch.no_grad():
     hi, lo = one(0.3), one(0.1)
     assert torch.allclose(hi[:, 0], torch.full((5,), 0.3), atol=1e-5) and hi[:, 1].min() > 0, "확정 KO 30% -> P_KO 0.3, 그럴듯한 최대 데미지는 확률 가중 없이 그대로"
     assert torch.allclose(lo[:, 0], torch.full((5,), 0.1), atol=1e-5) and (lo[:, 1] == 0).all(), "w < 0.15면 그럴듯한 후보에서 제외"
+    # my_pos=False: 내 팀 슬롯 순서를 바꾸면 교체 점수도 같은 순열로 바뀌고 나머지는 그대로
+    mp = build_model({"model": "v4", "my_pos": False, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
+    perm = torch.tensor([3, 0, 5, 1, 4, 2]); oo = obs[0]
+    ob2 = [oo[0][:, perm], oo[1][:, perm], oo[2][:, perm]] + oo[3:]
+    a1 = mp.forward_sequences(oo, Z(5), torch.arange(5), 1, masks[0])["policy_logits"]
+    a2 = mp.forward_sequences(ob2, Z(5), torch.arange(5), 1, masks[0][:, [0, 1, 2, 3, 4, 5, 6, 7] + [8 + int(i) for i in perm] + list(range(14, 22))])["policy_logits"]
+    assert torch.allclose(a2[:, 8:14], a1[:, 8:14][:, perm], atol=1e-4), "내 팀 순서를 바꾸면 교체 점수도 같은 순열이어야 함"
+    assert mp.cfg["my_pos"] is False and model.cfg["my_pos"] is True
 print("model v4 OK: 롤아웃 == 시퀀스, 인과성, 패딩/미공개 칸, 매치업 반영, 신념 격리, 기술 표, 체크포인트 왕복, 상위 8개 후보, 숨은 기술/능력치 예측 반영")

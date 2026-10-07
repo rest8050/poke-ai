@@ -10,7 +10,7 @@ Foul Play(탐색 봇) 대전 기록 → 증류 학습 데이터 (train_fp_distil
 처리
   프로토콜을 Foul Play 쪽 시점으로 재생하되, 내 팀 정보는 사후 추정이 아니라 Foul Play가 실제로 쓴 팀(start 레코드)으로 채움
   → 실시간 인코더와 같은 완전한 내 팀 정보. 결정 지점(턴 시작/기절 후 교체)마다 Foul Play의 탐색 분포를 22칸 행동 분포로 변환
-출력 npz: OBS_KEYS + action_mask + target(22) + value_target, lens(배틀별 길이), outcome
+출력 npz: OBS_KEYS + action_mask + target(22) + value_target, teacher_value(탐색이 본 이 쪽 승률 0~1, 결정마다), lens(배틀별 길이), outcome
 
 사용: python src/training/build_fp_dataset.py --decisions "data/fp_gen/ms050/dec_*.jsonl" --protocols "data/fp_gen/ms050/prot_*.jsonl" --out data/fp_gen/ms050/fp_data.npz
 자가대전: python src/training/build_fp_dataset.py --decisions "data/fp_selfplay/ms050/dec_*.jsonl" --out data/fp_selfplay/ms050/fp_data.npz
@@ -185,7 +185,7 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
         queues = defaultdict(list)
         for st, turn, kind in states:
             queues[(turn, kind)].append(st)
-        steps = []
+        steps, tvals = [], []
         for r in d["dec"]:
             key = (r["turn"], int(r["force_switch"]))
             if not queues[key]:
@@ -197,6 +197,7 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
                 stat["결정 제외(행동 매칭 실패)"] += 1
                 continue
             steps.append((st, target, -1 if action_idx is None else action_idx))
+            tvals.append(float(r["value"]))
             stat["결정 사용"] += 1
         if len(steps) < 2:
             continue
@@ -207,6 +208,7 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
         seq["target"] = np.stack([t for _, t, _ in steps])
         seq["action_taken"] = np.array([a for _, _, a in steps], np.int64)  # 정책 그라디언트용, -1=실제 선택 매칭 실패
         seq["value_target"] = (GAMMA ** np.arange(T - 1, -1, -1, dtype=np.float32)) * outcome - np.array([s["phi"] for s, _, _ in steps], np.float32)
+        seq["teacher_value"] = np.array(tvals, np.float32)
         seq["outcome"] = outcome
         out.append(seq)
         stat["배틀 사용"] += 1
@@ -218,7 +220,7 @@ def main(args):
     seqs, stat = build(load_jsonl(args.decisions), protocols, args.min_matched, args.keep_ratio, args.workers)
     if not seqs:
         raise SystemExit(f"❌ 만들어진 배틀이 없음: {dict(stat)}")
-    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "action_taken"]}
+    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken"]}
     data["lens"] = np.array([len(s["action_mask"]) for s in seqs])
     data["outcome"] = np.array([s["outcome"] for s in seqs], np.float32)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
