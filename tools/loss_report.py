@@ -63,6 +63,8 @@ for tag, g in games.items():
         seq.append((t, d, P))
     for i, (t, d, P) in enumerate(seq):
         c = norm_student(t["chosen"])
+        if c is None:   # 선택이 기록되지 않은 턴(드물게 있음)은 건너뜀
+            continue
         top = max(P, key=P.get)
         v = float(d["value"])
         v_next = float(seq[i + 1][1]["value"]) if i + 1 < len(seq) else (1.0 if g["won"] else 0.0)
