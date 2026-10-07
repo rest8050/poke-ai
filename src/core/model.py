@@ -633,12 +633,15 @@ PokemonBattleNet = DeepPokemonBattleTransformerNet
 
 
 def build_model(cfg: dict) -> nn.Module:
-    """구조 인자로 모델 생성: model 키가 v4(model_v4.py)/v3(version 3 = model_v3.py, 없으면 옛 v3_full 구조 = model_v3_legacy.py)이면 엔티티 토큰 모델, 없으면 기존 구조"""
+    """구조 인자로 모델 생성: model 키가 v5(model_v5.py)/v4(model_v4.py)/v3(version 3 = model_v3.py, 없으면 옛 v3_full 구조 = model_v3_legacy.py)이면 엔티티 토큰 모델, 없으면 기존 구조"""
     cfg = dict(cfg)
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
     kind = cfg.pop("model", "v1")
+    if kind == "v5":                                     # v4 + 상대 의도 예측 + 의도 가중 선택지 피처
+        from src.core.model_v5 import EntityPokemonNetV5
+        return EntityPokemonNetV5(**cfg)
     if kind == "v4":                                     # v3 + 상위 12개 기술 혼합 위협 + 노력치/성격 예측
         from src.core.model_v4 import EntityPokemonNetV4
         return EntityPokemonNetV4(**cfg)

@@ -81,7 +81,7 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
         mv_extra = torch.cat([off_vs_opp_act[..., :3], thr_on_my_act[..., :3]], 1)                                      # [B,12,4,3]
         bench_thr = DS[..., :3].amax((2, 3))[..., 1:]                                                                   # 후보 i가 상대 전체의 공개 기술에 맞는 최대 데미지/KO
         cand = torch.cat([_mx(def_opp_act), _mx(off_vs_opp_act), M["spd_my"][..., None], bench_thr, h_my], -1)         # [B,6,11]
-        return D, O, H, mon_extra, mv_extra, cand, ar, act_m
+        return D, O, H, torch.stack([dmg, ko], -1), mon_extra, mv_extra, cand, ar, act_m
 
     def _bias4(self, D, O, H, layer):
         b = self._bias(D, O, layer)
@@ -105,7 +105,7 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
         stat = belief_logits["stat"].detach().float()                              # [B,6,6] 상대 능력치 배율 예측 (STAT_SCALE 단위 로그)
         mult = torch.exp(STAT_SCALE * stat).clamp(*MULT_RANGE)
         guess = self._top_guess(belief_logits, opp_team_cat, opp_move_num, opp_team_num)
-        D, O, H, mon_extra, mv_extra, cand, ar, act_m = self._matchup_feats4(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
+        D, O, H, Dk, mon_extra, mv_extra, cand, ar, act_m = self._matchup_feats4(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
                                                                              opp_move_num, guess, mult, stat)
         mon_in = torch.cat(parts + [mon_extra.reshape(B * 12, MON_EXTRA4), n_rev], -1)
         mv_in = torch.cat([E.move_encoder(raw, mvn), raw, mvn, mv_extra.reshape(B * 12, 4, 3)], -1)
@@ -134,4 +134,7 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
         opp_act = opp_team_num[:, :, 0].argmax(1)
         return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, act_m], "opp_active_mon": out[:, 6:12][ar, opp_act],
                 "active_mv": out[:, 12:60].view(B, 12, 4, d)[:, :6][ar, act_m], "belief_logits": belief_logits, "cand": cand,
-                "field": field_vec, "act_m": act_m}
+                "field": field_vec, "act_m": act_m,
+                # v5의 상대 의도 헤드/피처가 쓰는 원재료 (v4는 쓰지 않음)
+                "act_o": opp_act, "opp_mon": out[:, 6:12], "opp_ok": (opp_team_num[..., 11] > 0) & (opp_team_num[..., 1] < 0.5) & (opp_team_num[..., 0] < 0.5),
+                "opp_cat": opp_team_cat, "D": D, "O": O, "Dk": Dk, "guess": guess}
