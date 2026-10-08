@@ -652,9 +652,8 @@ def build_model(cfg: dict) -> nn.Module:
         from src.core.model_v4 import EntityPokemonNetV4
         return EntityPokemonNetV4(**cfg)
     if kind == "v3":
-        if cfg.pop("version", 1) >= 3:                   # 자기 완결형 신념이 있는 구조
-            from src.core.model_v3 import EntityPokemonNetV3
-            return EntityPokemonNetV3(**cfg)
+        if cfg.pop("version", 1) >= 3:                   # v3 구조(version 3)는 v4 이상이 대체해 제거됨
+            raise ValueError("v3 구조(version 3)는 제거됨: v4 이상을 쓸 것")
         from src.core.model_v3_legacy import EntityPokemonNetV3Legacy      # v3_full(서버 탑재) 호환 전용, 퇴역 시 삭제
         for k, default in (("unrevealed_tokens", False), ("opp_species", False), ("policy", "hier"), ("hidden_head", False), ("belief", False)):   # 제거된 옵션
             if cfg.pop(k, default) != default:

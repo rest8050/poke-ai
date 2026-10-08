@@ -29,7 +29,6 @@ class EntityPokemonNetV4(EntityPokemonNetV3):
         pos = torch.ones(12) if my_pos else torch.tensor([0.0] * 6 + [1.0] * 6)       # 내 쪽 슬롯/기술 칸 순서는 임의(팀 export 순서)라서 끌 수 있음. 상대 쪽 순서는 공개된 순서라 정보가 있어 유지
         self.register_buffer("pos_gate", pos, persistent=False)
         d, hw, ld = self.d, self.cfg["head_width"], self.cfg["latent_dim"]
-        del self.guess_proj
         self.hid_proj = nn.Linear(1 + MOVE_NUM_DIM + 48, d)                 # 후보 기술 혼합(확률 합, 수치, 임베딩) -> 상대 포켓몬 토큰
         self.mon_proj = nn.Sequential(nn.Linear(BASE_IN + MON_EXTRA4 + 1, d), nn.LayerNorm(d))
         self.switch_score = nn.Sequential(nn.Linear(ld + d + CAND4, hw), nn.GELU(), nn.Linear(hw, 1))

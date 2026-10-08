@@ -21,7 +21,7 @@ esac
 NAME=$1; FILE=supervised_v2_fp_$NAME.pt; SRC=checkpoints/$FILE
 [ -f "$SRC" ] || { echo "체크포인트 없음: $SRC"; exit 1; }
 if [ "${2:-}" = "--code" ]; then
-  tar cf - src/__init__.py src/core/{__init__,bridge_server,events,model,model_v3,model_v3_legacy,model_v4,belief,matchup,rct_player,search,set_prior,tensor_encoder}.py data/type_chart.json | ssh_ "cd $REMOTE && tar xf -"
+  tar cf - src/__init__.py src/core/{__init__,bridge_server,events,model,model_v3,model_v3_legacy,model_v4,model_v5,model_v6,belief,matchup,rct_player,search,set_prior,tensor_encoder}.py data/type_chart.json | ssh_ "cd $REMOTE && tar xf -"
   echo "코드 올림 (bridge_server/model 등을 바꿨다면 재시작 필요)"
 fi
 # 올리는 도중 반쯤 쓰인 파일을 읽지 않도록 임시 이름으로 올린 뒤 이름 변경, 구조 설정 파일이 먼저 가도록 순서 유지

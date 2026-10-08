@@ -196,8 +196,11 @@ def main(args):
     val, train = split_ids(data, offsets, VAL_FRAC)
     print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
-    arch = json.loads(args.arch) if args.arch else {"model": "v5", "my_pos": False}
+    arch = json.loads(args.arch) if args.arch else {"model": "v6", "my_pos": False}
     model = build_model(arch)
+    need = getattr(model, "field_proj", None) and model.field_proj[0].in_features
+    if getattr(model, "uses_legal", False) and data["field_vec"].shape[1] < need:        # v6는 효과 열이 든 새 데이터가 필요 (옛 데이터는 조용히 0으로 채워져 효과 입력이 비게 됨)
+        raise SystemExit(f"❌ 데이터의 field_vec이 {data['field_vec'].shape[1]}칸인데 {arch['model']}는 {need}칸이 필요: python logs/rebuild_all.py 로 다시 만들 것")
     if args.init != "none":
         expanded, skipped = load_compatible(model, torch.load(args.init, map_location="cpu"))
         # load_compatible이 체크포인트에 깊은 헤드 키가 있으면 model.enable_deep_heads()를 자동 호출해 파라미터를 늘릴 수 있음
@@ -273,7 +276,7 @@ if __name__ == "__main__":
     ap.add_argument("--accum", type=int, default=1, help="기울기 누적 횟수: 배틀 32개를 이 수로 나눠 처리해 VRAM을 줄임 (큰 모델용, 32의 약수)")
     ap.add_argument("--init", default="checkpoints/supervised_v2_fp_all8a.pt", help="시작 체크포인트. 앞으로는 BC가 아니라 직전 최신 모델에서 이어서 학습")
     ap.add_argument("--out", default="checkpoints/supervised_v2_fp_next.pt")
-    ap.add_argument("--arch", default="", help="모델 구조 JSON (비우면 현재 기본 구조 v5 = 합법성 입력, 요청 기반 마스크로 만든 데이터 필요). 옛 기존 구조는 {} 또는 {\"pokemon_embed_dim\":192,...}")
+    ap.add_argument("--arch", default="", help="모델 구조 JSON (비우면 현재 기본 구조 v6 = 합법성 입력 + 천진/장판 매치업 + 행동 제약 효과 입력, 요청 기반 마스크와 효과 열이 든 데이터 필요). 옛 기존 구조는 {} 또는 {\"pokemon_embed_dim\":192,...}")
     ap.add_argument("--aux-teacher", default="", help="KL 기준 모델 체크포인트 (기본: --init). --init none(처음부터 학습)일 때 필수")
     ap.add_argument("--fp16-store", action="store_true", help="관측 배열을 float16으로 메모리에 보관 (데이터가 커서 RAM이 모자랄 때). 값 정밀도는 약 3자리")
     ap.add_argument("--epochs", type=int, default=4)

@@ -1,17 +1,12 @@
-"""엔티티 토큰 트랜스포머 v3. 옵션 없이 확정된 설정이 기본 동작:
+"""엔티티 토큰 트랜스포머의 공통 부분 (v3 설계). 토큰 구성과 신념 활용은 v4~v6(model_v4.py~model_v6.py)가 덮어쓰고, 여기에는 공통 모듈/히스토리/헤드/롤아웃만 남음 (단독 모델 아님, arch는 v4 이상).
 1) 규모: d_model 256 / 6층 / 8헤드. 한 턴 = 포켓몬 12 + 기술 48 + 필드 3 + CLS 1 = 64개 토큰, 압축 없이 전부 어텐션
 2) 매치업 특징(src/core/matchup.py): 상대 기술이 내 포켓몬에 주는 배율·데미지·KO, 내 기술이 상대 포켓몬에 주는 효과, 스피드 우열
-   - 포켓몬/기술 토큰 입력에 요약치를 더하고, 어텐션 로짓에 편향 bias[h,i,j] = f_h(배율, 데미지, KO, 공격기여부)를 더함
-     (내 포켓몬 i <-> 상대 기술 토큰 j, 상대 포켓몬 o <-> 내 기술 토큰 j, 층마다 따로 학습)
+   - 포켓몬/기술 토큰 입력에 요약치를 더하고, 어텐션 로짓에 편향 bias[h,i,j] = f_h(배율, 데미지, KO, 공격기여부)를 더함 (층마다 따로 학습)
    - 교체 후보 점수와 교체/기술 판단(type_head)에 후보별·활성 매치업 요약을 직접 입력
 3) 히스토리: 턴 요약 = [CLS, 내 활성 토큰, 상대 활성 토큰, 필드/직전 사건 벡터]을 인과 트랜스포머로 요약
-4) 미공개 기술 칸도 토큰으로 유지 (빈 슬롯만 마스킹) + 포켓몬 토큰에 공개된 기술 수/4. 안 드러난 칸을 통째로 빼면 "기술을 1개만 가진 포켓몬"과 구분이 안 됨
-5) 상대 세트 신념(belief, src/core/belief.py): 자기 완결형 모듈(자기 임베딩, 트렁크와 공유 없음). 종 ID는 여기에만 들어가고(트렁크에는 없음) 팀 데이터 사전학습 +
-   배틀에서는 숨김정보 손실(src/training/hidden_labels.py)로만 학습.
-   확률 상위 기술을 미공개 칸에 "추측 기술"로 배정해, 그 기술의 위력/타입/분류로 매치업 위협(기대 데미지/KO)을 계산 → 어텐션 편향, 토큰 요약, 교체 헤드에 반영.
-   신념 출력은 detach라서 정책/가치 손실은 신념에 닿지 않고(종 조합으로 승패를 외울 수 없음), 신념은 트렁크 입력을 안 쓰므로 숨김정보 손실도 트렁크에 닿지 않음
-인터페이스: forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt. 옛 구조(v3_full 등)는 model_v3_legacy.py
-arch: {"model": "v3", "version": 3}"""
+4) 미공개 기술 칸도 토큰으로 유지 (빈 슬롯만 마스킹) + 포켓몬 토큰에 공개된 기술 수/4
+5) 상대 세트 신념(belief, src/core/belief.py): 자기 완결형 모듈, 출력은 detach라서 정책/가치 손실은 신념에 닿지 않음 (숨김정보 손실로만 학습)
+인터페이스: forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt. 옛 구조(v3_full 등)는 model_v3_legacy.py"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,7 +46,6 @@ class EntityPokemonNetV3(nn.Module):
         self.matchup = Matchup(vocab_path)
         self.belief = SetBelief(vocab_path, species_dim, belief_hidden, belief_species_dropout)
         self.register_buffer("move_table", build_move_table(vocab_path), persistent=False)
-        self.guess_proj = nn.Linear(1 + MOVE_NUM_DIM + 48, d)               # 추측 기술(확률, 수치 특징, 기술 임베딩) -> 미공개 칸 토큰
         self.unk_move = nn.Parameter(torch.zeros(d))                        # 미공개 기술 칸 표시
         self.mon_proj = nn.Sequential(nn.Linear(BASE_IN + MON_EXTRA + 1, d), nn.LayerNorm(d))
         self.move_proj = nn.Sequential(nn.Linear(142 + MV_EXTRA, d), nn.LayerNorm(d))
@@ -84,53 +78,6 @@ class EntityPokemonNetV3(nn.Module):
         self.opp_action_head = nn.Sequential(nn.Linear(latent_dim, 128), nn.GELU(), nn.Linear(128, self.ACTION_DIM))
         self.value_head = nn.Sequential(nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, 1))
 
-    # ---- 매치업 요약 ----
-    def _matchup_feats(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, guess):
-        B = my_cat.size(0)
-        ar = torch.arange(B, device=my_cat.device)
-        with torch.no_grad():
-            M = self.matchup(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv)
-            D, O = M["def"], M["off"]                                          # [B,6,24,4]
-            Dp = self.matchup._pair(opp_cat, opp_num, guess["pseudo"], False, my_cat, my_num, True)
-        D_real = D
-        D = D + Dp * guess["w"].reshape(B, 1, 24, 1)                           # 미공개 칸의 추측 기술이 내 포켓몬에게 주는 위협을 확률로 가중해 더함
-        act_m, act_o = my_num[:, :, 0].argmax(1), opp_num[:, :, 0].argmax(1)
-        DS, OS = D.view(B, 6, 6, 4, 4), O.view(B, 6, 6, 4, 4)                  # D[b,i(내),o,m,ch] / O[b,o(상대),i(내 공격),m,ch]
-        def_opp_act = DS[ar, :, act_o]                                         # [B,6(i),4,4] 상대 활성 기술이 내 포켓몬 i에게 (추측 기술 포함)
-        off_vs_opp_act = OS[ar, act_o]                                         # [B,6(i),4,4] 내 포켓몬 i의 기술이 상대 활성에게
-        thr_on_my_act = DS[ar, act_m]                                          # [B,6(o),4,4] 상대 포켓몬 o의 기술이 내 활성에게
-        my_act_on_opp = OS[ar, :, act_m]                                       # [B,6(o),4,4] 내 활성 기술이 상대 포켓몬 o에게
-        mon_extra = torch.cat([
-            torch.cat([_mx(def_opp_act), _mx(off_vs_opp_act), M["spd_my"][..., None]], -1),                # 내 쪽 6
-            torch.cat([_mx(thr_on_my_act), _mx(my_act_on_opp), M["spd_opp"][..., None]], -1)], 1)          # 상대 쪽 6 → [B,12,7]
-        mv_extra = torch.cat([off_vs_opp_act[..., :3], thr_on_my_act[..., :3]], 1)                          # [B,12,4,3]
-        # 벤치 위협은 실제로 공개된 기술만 (필드에 없는 상대의 추측 기술은 섞지 않음 — 그쪽 정보는 토큰/어텐션 편향 경로로 감)
-        bench_thr = D_real.view(B, 6, 6, 4, 4)[..., :3].amax((2, 3))[..., 1:]                               # 후보 i가 상대 전체의 공개 기술에 맞는 최대 데미지/KO [B,6,2]
-        cand = torch.cat([_mx(def_opp_act), _mx(off_vs_opp_act), M["spd_my"][..., None], bench_thr], -1)   # [B,6,9]
-        return D, O, mon_extra, mv_extra, cand, ar, act_m
-
-    def _make_guess(self, logits, opp_cat, opp_mv, opp_num):
-        """신념의 기술 확률 -> 미공개 칸마다 추측 기술 배정 (확률 높은 순). 반환 idx/w [B,6,4], pseudo [B,6,4,46] (모두 기울기 없음)"""
-        with torch.no_grad():
-            lg = logits["move"].detach().float()
-            V = lg.size(-1)
-            unk = self.belief.move.out_features - 2
-            cur = opp_cat[..., 5:9].long()
-            known = torch.zeros_like(lg, dtype=torch.bool)
-            known.scatter_(2, torch.where((cur >= 1) & (cur < unk), cur, torch.zeros_like(cur)).clamp(0, V - 1), True)
-            bad = torch.zeros(V, dtype=torch.bool, device=lg.device)
-            bad[0], bad[unk:] = True, True
-            prob = torch.softmax(lg.masked_fill(known | bad, -1e4), -1)
-            present = opp_num[..., 11] > 0
-            unrev = (opp_mv.abs().sum(-1) == 0) & present[..., None]                # [B,6,4]
-            n_unrev = unrev.sum(-1, keepdim=True).float()
-            topv, topi = prob.topk(4, -1)
-            marg = (topv * n_unrev).clamp(max=1.0)                                   # 미공개 칸이 n개면 각 기술이 세트에 있을 확률 ~ n x 확률
-            rank = (unrev.long().cumsum(-1) - 1).clamp(0, 3)
-            idx, w = topi.gather(-1, rank), marg.gather(-1, rank) * unrev
-            pseudo = self.move_table[idx] * unrev[..., None]
-        return {"idx": idx, "w": w, "pseudo": pseudo}
-
     def _bias(self, D, O, layer):
         """어텐션 편향 [B,H,64,64]: 내 포켓몬<->상대 기술 토큰(36..59), 상대 포켓몬<->내 기술 토큰(12..35)"""
         B, H = D.size(0), self.n_heads
@@ -143,55 +90,10 @@ class EntityPokemonNetV3(nn.Module):
         b[:, :, 12:36, 6:12] = fo.transpose(2, 3)
         return b
 
-    # ---- 토큰 구성 + 트렁크 ----
     def _fit_field(self, fv):
         """field_vec 폭을 이 모델이 학습한 폭에 맞춤: 더 넓으면(인코더가 뒤에 열을 추가) 뒤를 버리고, 더 좁으면(옛 데이터) 0으로 채움"""
         n = self.field_proj[0].in_features
         return fv[..., :n] if fv.size(-1) >= n else F.pad(fv, (0, n - fv.size(-1)))
-
-    def _encode_turn(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec):
-        field_vec = self._fit_field(field_vec)
-        B, dev, d = my_team_cat.size(0), my_team_cat.device, self.d
-        cat = torch.cat([my_team_cat[..., :10], opp_team_cat[..., :10]], 1).reshape(B * 12, 10)
-        num = torch.cat([my_team_num, opp_team_num], 1).reshape(B * 12, -1)
-        mvn = torch.cat([my_move_num, opp_move_num], 1).reshape(B * 12, 4, -1)
-        E = self.embeddings
-        parts = [E.species_proj(num[:, 11:18]), E._emb("item", cat[:, 0]), E._emb("ability", cat[:, 1]), E.type_embed(cat[:, 2]),
-                 E.type_embed(cat[:, 3]), E.status_embed(cat[:, 4]), E.type_embed(cat[:, 9]), num[:, :11], num[:, 18:]]     # BASE_IN차원
-        raw = E._emb("move", cat[:, 5:9])
-        revealed = (mvn.abs().sum(-1) > 0)
-        n_rev = revealed.float().sum(-1, keepdim=True) / 4.0
-        # 신념: 상대 팀 텐서를 자기 입력으로 읽어(트렁크와 무관) 숨겨진 세트를 예측, 확률 높은 기술을 미공개 칸에 추측 기술로 배정
-        belief_logits = self.belief(opp_team_cat, opp_team_num)
-        guess = self._make_guess(belief_logits, opp_team_cat, opp_move_num, opp_team_num)
-        D, O, mon_extra, mv_extra, cand, ar, act_m = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, guess)
-        mon_in = torch.cat(parts + [mon_extra.reshape(B * 12, MON_EXTRA), n_rev], -1)
-        mv_in = torch.cat([E.move_encoder(raw, mvn), raw, mvn, mv_extra.reshape(B * 12, 4, MV_EXTRA)], -1)
-        side = torch.arange(12, device=dev) // 6
-        slot = torch.arange(12, device=dev) % 6
-        active = (num[:, 0] > 0.5).long().view(B, 12)
-        base = self.side_emb(side)[None] + self.slot_emb(slot)[None] + self.act_emb(active)
-        mon = self.mon_proj(mon_in).view(B, 12, d) + base + self.role_emb.weight[0]
-        mv = self.move_proj(mv_in).view(B, 12, 4, d) + base[:, :, None] + self.mslot_emb.weight[None, None] + self.role_emb.weight[1]
-        fld = self.field_proj(field_vec).view(B, 3, d) + self.fld_emb.weight[None] + self.role_emb.weight[2]
-        cls = self.cls.expand(B, 1, d) + self.role_emb.weight[3]
-        x = torch.cat([mon, mv.reshape(B, 48, d), fld, cls], 1)
-        mon_pad = (num[:, 11] == 0).view(B, 12)
-        unrevealed = ~revealed.view(B, 12, 4) & ~mon_pad[:, :, None]
-        g = torch.cat([guess["w"][..., None], guess["pseudo"], E._emb("move", guess["idx"]).detach()], -1)       # 추측 기술 특징 (상대 쪽만)
-        unk = self.unk_move.expand(B, 12, 4, d) + self.guess_proj(torch.cat([torch.zeros_like(g), g], 1))
-        x = torch.cat([x[:, :12], x[:, 12:60] + unrevealed.reshape(B, 48, 1) * unk.reshape(B, 48, d), x[:, 60:]], 1)
-        pad = torch.cat([mon_pad, mon_pad[:, :, None].expand(B, 12, 4).reshape(B, 48), mon_pad.new_zeros(B, 4)], 1)     # 빈 슬롯의 칸만 마스킹
-        pad_f = torch.zeros(B, 1, 1, N_TOK, device=dev, dtype=x.dtype).masked_fill(pad[:, None, None, :], float("-inf"))
-        for li, layer in enumerate(self.layers):
-            mask = (self._bias(D, O, li).to(x.dtype) + pad_f).reshape(B * self.n_heads, N_TOK, N_TOK)
-            x = layer(x, src_mask=mask)
-        out = self.norm(x)
-        my_mon = out[:, :6]
-        opp_act = opp_team_num[:, :, 0].argmax(1)
-        return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, act_m], "opp_active_mon": out[:, 6:12][ar, opp_act],
-                "active_mv": out[:, 12:60].view(B, 12, 4, d)[:, :6][ar, act_m], "belief_logits": belief_logits, "cand": cand,
-                "field": field_vec, "act_m": act_m}
 
     def _history(self, turn_seq):
         B, T = turn_seq.size(0), turn_seq.size(1)
