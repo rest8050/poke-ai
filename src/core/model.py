@@ -515,7 +515,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
         opp_team_summary = torch.cat([opp_team_mean, opp_team_max], dim=-1) # [B, 256]
         
         # --- E. 필드 + 턴 요약 ---
-        field_features = self.field_encoder(field_vec) # [B, 64]
+        field_features = self.field_encoder(field_vec[..., :self.field_encoder[0].in_features])      # [B, 64] (인코더가 뒤에 추가한 열은 이 모델이 안 씀)
         turn_input = torch.cat([my_active_vec, opp_active_vec, my_team_summary, opp_team_summary, field_features], dim=-1) # [B, 832]
         return {
             "turn_input": turn_input, "my_active_vec": my_active_vec, "my_team_summary": my_team_summary,
@@ -584,12 +584,14 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
     def get_action(self, my_team_cat, my_team_num, my_move_num, 
                    opp_team_cat, opp_team_num, opp_move_num, 
-                   field_vec, history_state=None, action_mask=None):
+                   field_vec, history_state=None, action_mask=None, legal_mask=None):
+        """legal_mask: 서버 요청 기반 순수 합법 마스크 (합법성을 입력 특징으로 쓰는 모델(uses_legal)만 받음, action_mask는 로짓 마스킹용)"""
         self.eval()
         with torch.no_grad():
+            kw = {"legal_mask": legal_mask} if getattr(self, "uses_legal", False) else {}
             res = self.forward(my_team_cat, my_team_num, my_move_num,
                                opp_team_cat, opp_team_num, opp_move_num, 
-                               field_vec, history_state, action_mask)
+                               field_vec, history_state, action_mask, **kw)
             
             p_logits = res["policy_logits"]
             p_probs = F.softmax(p_logits, dim=-1)
@@ -602,16 +604,17 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
     def get_action_rl(self, my_team_cat, my_team_num, my_move_num, 
                       opp_team_cat, opp_team_num, opp_move_num, 
-                      field_vec, history_state=None, action_mask=None, deterministic=False):
+                      field_vec, history_state=None, action_mask=None, deterministic=False, legal_mask=None):
         """
         PPO 강화학습을 위한 행동 샘플링 메서드.
         deterministic=True일 경우 가장 확률이 높은 행동을 무조건 선택 (완벽한 평가 모드)
         """
         self.eval()
         with torch.no_grad():
+            kw = {"legal_mask": legal_mask} if getattr(self, "uses_legal", False) else {}
             res = self.forward(my_team_cat, my_team_num, my_move_num,
                                opp_team_cat, opp_team_num, opp_move_num, 
-                               field_vec, history_state, action_mask)
+                               field_vec, history_state, action_mask, **kw)
             
             p_logits = res["policy_logits"]
             
@@ -633,13 +636,16 @@ PokemonBattleNet = DeepPokemonBattleTransformerNet
 
 
 def build_model(cfg: dict) -> nn.Module:
-    """구조 인자로 모델 생성: model 키가 v5(model_v5.py)/v4(model_v4.py)/v3(version 3 = model_v3.py, 없으면 옛 v3_full 구조 = model_v3_legacy.py)이면 엔티티 토큰 모델, 없으면 기존 구조"""
+    """구조 인자로 모델 생성: model 키가 v6(model_v6.py)/v5(model_v5.py)/v4(model_v4.py)/v3(version 3 = model_v3.py, 없으면 옛 v3_full 구조 = model_v3_legacy.py)이면 엔티티 토큰 모델, 없으면 기존 구조"""
     cfg = dict(cfg)
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
     kind = cfg.pop("model", "v1")
-    if kind == "v5":                                     # v4 + 상대 의도 예측 + 의도 가중 선택지 피처
+    if kind == "v6":                                     # v5 + 천진/장판 진입 피해 매치업 + 행동 제약 효과 입력
+        from src.core.model_v6 import EntityPokemonNetV6
+        return EntityPokemonNetV6(**cfg)
+    if kind == "v5":                                     # v4 + 합법성(서버 요청 기반 순수 합법 마스크) 입력
         from src.core.model_v5 import EntityPokemonNetV5
         return EntityPokemonNetV5(**cfg)
     if kind == "v4":                                     # v3 + 상위 12개 기술 혼합 위협 + 노력치/성격 예측

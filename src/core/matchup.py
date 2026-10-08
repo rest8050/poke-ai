@@ -22,8 +22,9 @@ IMMUNE_ABILITIES = {"levitate": "ground", "eartheater": "ground", "flashfire": "
 
 
 class Matchup(nn.Module):
-    def __init__(self, vocab_path: str = "data/vocab.json", chart_path: str = "data/type_chart.json"):
+    def __init__(self, vocab_path: str = "data/vocab.json", chart_path: str = "data/type_chart.json", entry: bool = False):
         super().__init__()
+        self.entry = entry
         vocab = json.load(open(vocab_path, encoding="utf-8"))
         tid = vocab["type"]
         chart = torch.ones(TYPE_N, TYPE_N)
@@ -42,26 +43,51 @@ class Matchup(nn.Module):
         self.balloon = vocab["item"].get("airballoon", -1)
         self.burn = vocab["status"]["brn"]
         self.ground = tid["ground"]
+        if entry:                                                                  # 규칙 기반 보정 (v6~): 천진 + 교체해 들어올 때의 장판 피해
+            ab, it = vocab["ability"], vocab["item"]
+            self.unaware, self.levitate, self.magicguard = ab["unaware"], ab["levitate"], ab["magicguard"]
+            self.boots = it["heavydutyboots"]
+            self.flying, self.rock = tid["flying"], tid["rock"]
+            self.register_buffer("spikes_frac", torch.tensor([0.0, 1 / 8, 1 / 6, 1 / 4]), persistent=False)
 
     @staticmethod
     def _stage(r):  # 랭크/6 → 배율
         s = (r * 6).round()
         return torch.where(s >= 0, (2 + s) / 2, 2 / (2 - s))
 
-    def _stats(self, num, mine: bool, mult=None):
+    def _stats(self, num, mine: bool, mult=None, staged: bool = True):
         v = num[..., 11:17] * 255.0                                                # hp, atk, def, spa, spd, spe
         if not mine:
             v = torch.cat([2 * v[..., :1] + 204, 2 * v[..., 1:] + 99], -1)
             if mult is not None:                                                   # 신념이 예측한 노력치/성격 배율 [..., 6] (hp, atk, def, spa, spd, spe)
                 v = v * mult
-        st = self._stage(num[..., 3:8])                                            # atk, def, spa, spd, spe
+        st = self._stage(num[..., 3:8]) if staged else torch.ones_like(num[..., 3:8])    # atk, def, spa, spd, spe (staged=False: 랭크 무시 = 천진 상대)
         return v[..., 0], v[..., 1] * st[..., 0], v[..., 2] * st[..., 1], v[..., 3] * st[..., 2], v[..., 4] * st[..., 3], v[..., 5] * st[..., 4]
 
-    def _pair(self, att_cat, att_num, att_mv, att_mine, def_cat, def_num, def_mine, att_mult=None, def_mult=None):
+    def entry_frac(self, cat, num, field_vec):
+        """교체해 들어올 때 내 쪽 장판에 깎이는 HP 비율 [B,6] (활성은 0). 스텔스록 1/8 x 바위 상성 + 압정 1/8,1/6,1/4(접지만), 두꺼운부츠/매직가드는 면제.
+        entry=False이면 None (옛 체크포인트는 이 보정 없이 학습됨)"""
+        if not self.entry or field_vec is None:
+            return None
+        tera = num[..., 9] > 0.5
+        t1 = torch.where(tera, cat[..., 9], cat[..., 2]).clamp(0, TYPE_N - 1)
+        t2 = torch.where(tera, torch.zeros_like(cat[..., 3]), cat[..., 3]).clamp(0, TYPE_N - 1)
+        ab, it = cat[..., 1], cat[..., 0]
+        rock = self.chart[self.rock, t1] * self.chart[self.rock, t2]
+        grounded = (t1 != self.flying) & (t2 != self.flying) & (ab != self.levitate) & (it != self.balloon)
+        spikes = self.spikes_frac[(field_vec[:, 29] * 3).round().long().clamp(0, 3)][:, None]
+        frac = 0.125 * rock * (field_vec[:, 28:29] > 0.5) + spikes * grounded
+        safe = (it == self.boots) | (ab == self.magicguard) | (num[..., 0] > 0.5)
+        return torch.where(safe, torch.zeros_like(frac), frac)
+
+    def _pair(self, att_cat, att_num, att_mv, att_mine, def_cat, def_num, def_mine, att_mult=None, def_mult=None, entry=None):
         """공격측 6마리(마리당 기술 K칸, 보통 4) x 방어측 6마리 → [B, 6(방어), 6K(공격 기술칸), 4]. mult: 상대 쪽 능력치 배율(기본 없음 = 표준 가정)"""
         B, K = att_cat.size(0), att_mv.size(2)
         a_hp, a_atk, _, a_spa, _, _ = self._stats(att_num, att_mine, att_mult)
         d_hp, _, d_def, _, d_spd, _ = self._stats(def_num, def_mine, def_mult)
+        if self.entry:                                                             # 천진: 방어측이 천진이면 공격측 공/특공 랭크를, 공격측이 천진이면 방어측 방/특방 랭크를 무시
+            _, a_atk_raw, _, a_spa_raw, _, _ = self._stats(att_num, att_mine, att_mult, staged=False)
+            _, _, d_def_raw, _, d_spd_raw, _ = self._stats(def_num, def_mine, def_mult, staged=False)
         rep = lambda x: x.repeat_interleave(K, dim=1)[:, None]                     # [B,6] → [B,1,6K]
         mv = att_mv.reshape(B, 6 * K, -1)
         bp, kind, mt = mv[..., 0] * 200.0, mv[..., 4], (mv[..., 6] * 20.0).round().long().clamp(0, TYPE_N - 1)
@@ -76,6 +102,8 @@ class Matchup(nn.Module):
         stab = ((mt_ == t1) | (mt_ == t2) | ((mt_ == tera) & tera_on)).float() * 0.5 + 1.0
         burned = rep((att_cat[..., 4] == self.burn).float()) * phys.float()
         A = torch.where(phys, rep(a_atk), rep(a_spa))                              # [B,1,24]
+        if self.entry:
+            A = torch.where((def_cat[..., 1] == self.unaware)[..., None], torch.where(phys, rep(a_atk_raw), rep(a_spa_raw)), A)   # [B,6,24]
         # 방어측: 타입(테라면 테라 타입 하나)/능력치/특성 면역
         d_t1 = torch.where(def_num[..., 9] > 0.5, def_cat[..., 9], def_cat[..., 2])[..., None]   # [B,6,1]
         d_t2 = torch.where(def_num[..., 9] > 0.5, torch.zeros_like(def_cat[..., 3]), def_cat[..., 3])[..., None]
@@ -86,11 +114,14 @@ class Matchup(nn.Module):
         if self.balloon >= 0:
             immune = immune | ((def_cat[..., 0] == self.balloon)[..., None] & (mt_ == self.ground))
         eff = torch.where(immune, torch.zeros_like(eff), eff)
-        D = torch.where(phys, d_def[..., None], d_spd[..., None]).clamp_min(1.0)  # [B,6,1]
+        D = torch.where(phys, d_def[..., None], d_spd[..., None])                  # [B,6,1] -> (천진 공격측이면) [B,6,24]
+        if self.entry:
+            D = torch.where(rep((att_cat[..., 1] == self.unaware).float()).bool(), torch.where(phys, d_def_raw[..., None], d_spd_raw[..., None]), D)
+        D = D.clamp_min(1.0)
         base = (42.0 * bp[:, None] * A / D) / 50.0 + 2.0
         dmg = base * stab * eff * (1.0 - 0.5 * burned)                             # 최댓값(랜덤 1.0) 기준
         hp = d_hp[..., None].clamp_min(1.0)
-        cur = hp * def_num[..., 2:3]
+        cur = hp * (def_num[..., 2:3] if entry is None else (def_num[..., 2:3] - entry[..., None]).clamp_min(0.0))      # 장판에 깎인 뒤 HP
         dm = damaging[:, None]
         frac = torch.where(dm, dmg * 0.925 / hp, torch.zeros_like(dmg))
         ko = (dm & (dmg >= cur)).float()
@@ -98,8 +129,8 @@ class Matchup(nn.Module):
         out = torch.stack([torch.where(dm, eff / 4.0, torch.zeros_like(eff)), frac.clamp(max=1.5) / 1.5, ko, dm.expand_as(eff).float()], -1)
         return out * d_ok[..., None].float()
 
-    def forward(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, opp_mult=None):
-        D = self._pair(opp_cat, opp_num, opp_mv, False, my_cat, my_num, True, att_mult=opp_mult)      # 내 포켓몬이 맞음
+    def forward(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, opp_mult=None, entry=None):
+        D = self._pair(opp_cat, opp_num, opp_mv, False, my_cat, my_num, True, att_mult=opp_mult, entry=entry)      # 내 포켓몬이 맞음
         O = self._pair(my_cat, my_num, my_mv, True, opp_cat, opp_num, False, def_mult=opp_mult)       # 상대 포켓몬이 맞음
         ar = torch.arange(my_num.size(0), device=my_num.device)
         spe_my = self._stats(my_num, True)[5]

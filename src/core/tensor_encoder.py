@@ -536,7 +536,29 @@ def _move_obj(move_id: str):
 #   18 아직 팀프리뷰로만 보임(상대 전용) — 뒤 SLOT_DIM칸은 상대 슬롯별 증거 (events.py)
 BASE_NUM = 19
 NUM_DIM, CAT_DIM = BASE_NUM + SLOT_DIM, 11  # 카테고리 [0..9]=도구/특성/타입/상태/기술/테라, [10]=종 ID (상대만 모델이 씀)
-FIELD_DIM = 48 + TURN_DIM
+# 양쪽 활성 포켓몬의 행동 제약 효과 (field_vec 뒤쪽 열, 내 쪽 다음 상대 쪽): 기술을 막는 효과 3 + 교체를 막는 효과 1 + 남은 턴 비율 3
+# (트집·기술 고정·교감은 poke-env가 효과로 안 남기거나 데이터에 거의 없어서 뺌: 난동 같은 고정은 합법 마스크가 "기술 1개만 가능"으로 알려 줌)
+# 남은 턴 = (지속 턴 - poke-env 카운터) / 지속 턴. 카운터는 시작 때 0, 턴이 끝날 때마다 +1. 지속 턴은 프로토콜 실측(앵콜/도발은 시작 2턴 뒤 종료 = 결정 2번 제약)과 게임 규칙
+EFFECT_FLAGS = ("TAUNT", "ENCORE", "DISABLE")
+TRAP_EFFECTS = ("TRAPPED", "OCTOLOCK", "NO_RETREAT", "PARTIALLY_TRAPPED")
+EFFECT_TURNS = {"TAUNT": 3, "ENCORE": 3, "DISABLE": 4}
+EFFECT_SIDE = len(EFFECT_FLAGS) + 1 + len(EFFECT_TURNS)
+EFFECT_DIM = 2 * EFFECT_SIDE
+EFFECT_START = 48 + TURN_DIM
+FIELD_DIM = EFFECT_START + EFFECT_DIM
+
+
+def active_effect_vec(mon: Any) -> List[float]:
+    """활성 포켓몬의 행동 제약 효과 -> [플래그 3, 교체 봉쇄 1, 남은 턴 비율 3]"""
+    v = [0.0] * EFFECT_SIDE
+    eff = {e.name: c for e, c in (getattr(mon, "effects", None) or {}).items()} if mon is not None else {}
+    for i, n in enumerate(EFFECT_FLAGS):
+        v[i] = float(n in eff)
+    v[len(EFFECT_FLAGS)] = float(any(n in eff for n in TRAP_EFFECTS))
+    for j, (n, dur) in enumerate(EFFECT_TURNS.items()):
+        if n in eff:
+            v[len(EFFECT_FLAGS) + 1 + j] = max(0.0, (dur - eff[n]) / dur)
+    return v
 
 
 class BattleTensorEncoder:
@@ -564,9 +586,10 @@ class BattleTensorEncoder:
         
         field_vec = np.zeros((1, FIELD_DIM), dtype=np.float32)
         action_mask = np.zeros((1, 22), dtype=bool)
+        legal_mask = np.zeros((1, 22), dtype=bool)     # 서버 요청이 알려 준 순수 합법성 (모델 입력 특징용). action_mask = 여기에 휴리스틱 가지치기를 더한 것 (로짓 마스킹 전용)
 
         if not hasattr(battle, "team") or not battle.team:
-            return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask)
+            return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask)
 
         # --- A. 내 팀 6마리 인코딩 ---
         my_team_list = list(battle.team.values())
@@ -811,7 +834,7 @@ class BattleTensorEncoder:
 
         # --- C. 필드, 날씨, 룸 & 내/상대 사이드 조건(벽, 장판, 순풍) 48D 정밀 인코딩 ---
         if ev:  # 직전 턴 사건 10칸 (인덱스 48~57)
-            field_vec[0, 48:] = ev.last
+            field_vec[0, 48:EFFECT_START] = ev.last
         # C.1 현재 턴 수 정규화 (50턴 기준 - 인덱스 47)
         turn_num = getattr(battle, "turn", 1) or 1
         field_vec[0, 47] = min(1.0, turn_num / 50.0)
@@ -884,6 +907,9 @@ class BattleTensorEncoder:
         _encode_side(getattr(battle, "side_conditions", None), base_idx=20)
         _encode_side(getattr(battle, "opponent_side_conditions", None), base_idx=32)
 
+        field_vec[0, EFFECT_START:EFFECT_START + EFFECT_SIDE] = active_effect_vec(active_pkmn)
+        field_vec[0, EFFECT_START + EFFECT_SIDE:] = active_effect_vec(opp_active_mon)
+
         # --- D. 행동 마스킹 ---
         if active_pkmn and hasattr(battle, "available_moves"):
             active_moves = list(getattr(active_pkmn, "moves", {}).values())
@@ -900,7 +926,10 @@ class BattleTensorEncoder:
                 curr_pp = getattr(mv, "current_pp", 1)
 
                 if mv_id in avail_move_ids and curr_pp > 0:
-                    # 💡 [휴리스틱 마스킹] 무의미한 턴 낭비 방지 룰
+                    legal_mask[0, m_idx] = True
+                    if mv_id in z_ids or can_tera:
+                        legal_mask[0, 4 + m_idx] = True
+                    # 💡 [휴리스틱 마스킹] 무의미한 턴 낭비 방지 룰 (action_mask에만 적용, legal_mask에는 안 닿음)
                     is_valid = True
                     
                     # 1. 상대가 이미 상태이상인데, 또 상태이상을 거는 변화기(도깨비불, 맹독 등) 사용 금지
@@ -944,13 +973,16 @@ class BattleTensorEncoder:
                 is_fainted = getattr(pkmn, "fainted", False)
                 if pkmn in avail_switches and not is_fainted and pkmn != active_pkmn:
                     action_mask[0, 8 + s_idx] = True
+                    legal_mask[0, 8 + s_idx] = True
 
         if not action_mask.any():
             action_mask[0, 0] = True
+        if not legal_mask.any():
+            legal_mask[0, 0] = True
 
-        return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask)
+        return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask)
 
-    def _to_tensors(self, my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask):
+    def _to_tensors(self, my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask):
         return (
             torch.tensor(my_cat, dtype=torch.long, device=self.device),
             torch.tensor(my_num, dtype=torch.float32, device=self.device),
@@ -959,7 +991,8 @@ class BattleTensorEncoder:
             torch.tensor(opp_num, dtype=torch.float32, device=self.device),
             torch.tensor(opp_m_num, dtype=torch.float32, device=self.device),
             torch.tensor(field_vec, dtype=torch.float32, device=self.device),
-            torch.tensor(action_mask, dtype=torch.bool, device=self.device)
+            torch.tensor(action_mask, dtype=torch.bool, device=self.device),
+            torch.tensor(legal_mask, dtype=torch.bool, device=self.device)
         )
 
 
@@ -1040,7 +1073,7 @@ def main():
     mock_battle = DummyBattle()
     
     tensors = encoder.encode_battle(mock_battle)
-    my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask = tensors
+    my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask = tensors
     
     print("\n✅ 턴 카운터 및 장기 전략 필드 텐서 검증:")
     print(f"  1. 쾌청 활성화 (field_vec[0, 0]): {field_vec[0, 0].item() == 1.0}")

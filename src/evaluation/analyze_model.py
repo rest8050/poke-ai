@@ -107,7 +107,7 @@ class LoggingPlayer(SmartPokemonPlayer):
         tensors = self.encoder.encode_battle(battle)
         mask = tensors[7][0]
         opp_num = tensors[4][0]
-        policy_idx, probs, _, value, self.history[tag] = self.model.get_action(*tensors[:7], self.history.get(tag), tensors[7])
+        policy_idx, probs, _, value, self.history[tag] = self.model.get_action(*tensors[:7], self.history.get(tag), tensors[7], tensors[8])
         probs = probs[0]
         if self.mode == "sample":
             policy_idx = int(torch.multinomial(probs, 1).item())

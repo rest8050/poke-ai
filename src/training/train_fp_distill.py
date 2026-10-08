@@ -24,7 +24,6 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.stats import rankdata
 
 from src.core.model import build_model, load_compatible, model_from_ckpt, save_ckpt
 from src.core.tensor_encoder import MOVE_NUM_DIM
@@ -36,11 +35,9 @@ UNK = vocab_sizes()
 BELIEF_FT_LR_MULT = 0.1   # 사전학습된 신념의 미세조정 학습률 배율 (배틀 상황 입력만 새로 배우면 됨)
 BATCH_BATTLES, VALUE_COEF, VAL_FRAC = 32, 0.25, 0.1
 WARMUP_FRAC, LR_MIN_RATIO = 0.05, 0.05   # 학습률: 웜업(0 → lr) 후 코사인 감쇠(lr → lr x LR_MIN_RATIO). 높은 학습률에서 첫 에폭에 정책이 무너지는 충격을 웜업이, 마지막 지점의 흔들림을 감쇠가 줄임
-OPP_COEF = 0.5     # 상대 의도 보조 손실 가중치 (v5, 반대편 기록이 있는 결정만)
 HIDDEN_COEF = 1.0   # 숨김정보 손실 가중치: 신념 모듈 파라미터에만 닿고(입출력 detach) 기울기 클리핑도 따로라서 정책 학습과 간섭하지 않음
 KEYS = OBS_KEYS + ["action_mask", "target", "action_taken"]
 GAMMA = 0.995  # replay_dataset.py / build_fp_dataset.py와 동일
-OPP_KEYS = ["opp_sw", "opp_tera", "opp_mv_id", "opp_mv_p", "opp_tgt"]
 
 
 def make_batches(data, offsets, idx, size, shuffle):
@@ -56,9 +53,6 @@ def make_batches(data, offsets, idx, size, shuffle):
         b["value_target"] = torch.cat([GAMMA ** torch.arange(n - 1, -1, -1, dtype=torch.float32) * float(data["outcome"][j]) for j, n in zip(sel, lens)])
         if "teacher_value" in data:      # 교사(탐색)가 결정마다 본 승률 0~1 → ±1 척도 (build_fp_dataset로 만든 새 데이터에만 있음)
             b["teacher_value"] = torch.from_numpy(np.concatenate([data["teacher_value"][offsets[j]:offsets[j + 1]] for j in sel])).float() * 2 - 1
-        for k in OPP_KEYS:               # 상대 의도 라벨 (자가대전 --opp-labels 데이터에만 있음, 없는 결정은 opp_sw=NaN)
-            if k in data:
-                b[k] = torch.from_numpy(np.concatenate([data[k][offsets[j]:offsets[j + 1]] for j in sel]))
         b["seq_index"] = torch.cat([torch.full((n,), s) for s, n in enumerate(lens)])
         b["time_index"] = torch.cat([torch.arange(n) for n in lens])
         b["n_seq"] = len(sel)
@@ -80,33 +74,9 @@ def pg_loss(logp, b, adv):
     return -(logp_a * adv.detach() * valid.float()).sum() / valid.float().sum().clamp_min(1)
 
 
-def intent_loss(it, b):
-    """상대 의도 보조 손실 (라벨 있는 결정만): 교체 BCE + 테라 BCE(공격할 때, 공격 질량 가중) + 기술 칸 CE(공격 질량 가중) + 교체 대상 CE(매칭된 교체 질량 가중).
-    기술 라벨: 상위 기술 ID 질량을 모델의 칸(공개 4 + 후보 12)에 정렬, 칸에 없는 질량은 '기타'. 반환: (손실, 통계 dict, 교체 확률 [n], 교체 라벨 [n])"""
-    has = ~torch.isnan(b["opp_sw"])
-    if not has.any():
-        return b["opp_sw"].new_zeros(()), {}, None, None
-    sw, tera = b["opp_sw"][has], b["opp_tera"][has]
-    kind, mlp, tlp = it["kind"][has].float(), it["move_lp"][has].float(), it["tgt_lp"][has].float()
-    att = (1 - sw).clamp_min(0)
-    l_sw = F.binary_cross_entropy_with_logits(kind[:, 0], sw)
-    l_tera = (F.binary_cross_entropy_with_logits(kind[:, 1], (tera / att.clamp_min(1e-6)).clamp(0, 1), reduction="none") * att).sum() / att.sum().clamp_min(1e-6)
-    lid, lp = b["opp_mv_id"][has].long(), b["opp_mv_p"][has]
-    hit = (it["slot_ids"][has][:, :, None] == lid[:, None, :]) & (lid[:, None, :] > 0) & it["slot_ok"][has][:, :, None]
-    ms = (hit.float() * lp[:, None, :]).sum(-1)                                                          # [n,N_SLOT]
-    q = torch.cat([ms, (att - ms.sum(-1)).clamp_min(0)[:, None]], 1) / att.clamp_min(1e-6)[:, None]     # 칸 + 기타
-    l_mv = (-(q * mlp).sum(-1) * att).sum() / att.sum().clamp_min(1e-6)
-    tg = b["opp_tgt"][has] * it["tgt_ok"][has].float()
-    tw = tg.sum(-1)
-    l_tg = (-(tg / tw.clamp_min(1e-6)[:, None] * tlp).sum(-1) * tw).sum() / tw.sum().clamp_min(1e-6)
-    top1 = ((mlp.argmax(-1) == q.argmax(-1)).float() * att).sum() / att.sum().clamp_min(1e-6)
-    return l_sw + 0.5 * l_tera + l_mv + l_tg, dict(sw=l_sw.item(), mv=l_mv.item(), tg=l_tg.item(), top1=top1.item(), n=int(has.sum())), torch.sigmoid(kind[:, 0]).detach(), (sw > 0.5)
-
-
 def run(model, ref, data, offsets, idx, args, train, opt=None):
     model.train(bool(train))  # 학습 중에는 드롭아웃(트랜스포머/융합층 0.1)을 켬 → 오래된 데이터를 반복해서 외우는 것을 늦춤. 검증은 항상 끔
-    tot = dict(ce=0.0, v=0.0, kl=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, chg=0, chg_agree=0, opp_sw=0.0, opp_mv=0.0, opp_tg=0.0, opp_top1=0.0, opp_n=0)
-    opp_p, opp_y = [], []
+    tot = dict(ce=0.0, v=0.0, kl=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, chg=0, chg_agree=0)
     for bi, b in enumerate(make_batches(data, offsets, idx, BATCH_BATTLES // args.accum, train)):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
@@ -114,7 +84,6 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
                 out = model.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
                 with torch.no_grad():
                     ref_out = ref.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
-            it = out.pop("intent", None)
             out = {k: v.float() for k, v in out.items()}
             ref_out = {k: v.float() for k, v in ref_out.items()}
             logp = F.log_softmax(out["policy_logits"], -1)
@@ -131,15 +100,7 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
             if "hid_move" in out:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
                 hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]}, b, UNK)
                 tot["hid_top4"] += hs.get("move_top4", 0.0) * hs["move_n"]; tot["hid_nb"] += hs["move_n"]
-            opp = ce.new_zeros(())
-            if it is not None and "opp_sw" in b:
-                opp, os_, p_sw, y_sw = intent_loss(it, b)
-                if os_:
-                    k = os_["n"]
-                    tot["opp_sw"] += os_["sw"] * k; tot["opp_mv"] += os_["mv"] * k; tot["opp_tg"] += os_["tg"] * k; tot["opp_top1"] += os_["top1"] * k; tot["opp_n"] += k
-                    if not train:
-                        opp_p.append(p_sw.cpu().numpy()); opp_y.append(y_sw.cpu().numpy())
-            loss = ce + VALUE_COEF * v_loss + args.kl_coef * kl + args.pg_coef * pg + HIDDEN_COEF * hid + OPP_COEF * opp
+            loss = ce + VALUE_COEF * v_loss + args.kl_coef * kl + args.pg_coef * pg + HIDDEN_COEF * hid
         if train:
             # ponytail: --accum k면 배틀 32개를 k개로 나눠 기울기를 누적(VRAM 절약). 미세 배치를 같은 가중으로 평균(결정 수 차이는 무시), 에폭 끝의 덜 찬 묶음은 버림
             if bi % args.accum == 0:
@@ -157,20 +118,13 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
         tot["ce"] += ce.item() * n; tot["v"] += v.item() * n; tot["kl"] += kl.item() * n; tot["pg"] += pg.item() * n; tot["hid"] += hid.item() * n; tot["n"] += n
         tot["agree"] += (got == want).sum().item(); tot["chg"] += chg.sum().item(); tot["chg_agree"] += ((got == want) & chg).sum().item()
     n = max(1, tot["n"])
-    on = max(1, tot["opp_n"])
-    auc = None
-    if opp_p:
-        pp, yy = np.concatenate(opp_p), np.concatenate(opp_y)
-        if yy.any() and not yy.all():
-            auc = float((rankdata(pp)[yy].sum() - yy.sum() * (yy.sum() + 1) / 2) / (yy.sum() * (~yy).sum()))
-    return {"opp_n": tot["opp_n"], "opp_sw": tot["opp_sw"] / on, "opp_mv": tot["opp_mv"] / on, "opp_tg": tot["opp_tg"] / on, "opp_top1": tot["opp_top1"] / on, "opp_auc": auc, "ce": tot["ce"] / n, "v": tot["v"] / n, "kl": tot["kl"] / n, "pg": tot["pg"] / n, "hid": tot["hid"] / n, "hid_top4": tot["hid_top4"] / max(1, tot["hid_nb"]), "agree": tot["agree"] / n,
+    return {"ce": tot["ce"] / n, "v": tot["v"] / n, "kl": tot["kl"] / n, "pg": tot["pg"] / n, "hid": tot["hid"] / n, "hid_top4": tot["hid_top4"] / max(1, tot["hid_nb"]), "agree": tot["agree"] / n,
             "chg_agree": tot["chg_agree"] / max(1, tot["chg"]), "chg_rate": tot["chg"] / n, "n": tot["n"]}
 
 
 def fmt(r):
     return (f"소프트CE {r['ce']:.4f} | 탐색 선택과 일치 {r['agree']:.3f} | 탐색이 바꾼 결정({r['chg_rate']:.3f})을 따라 함 {r['chg_agree']:.3f} "
-            f"| V {r['v']:.3f} | KL {r['kl']:.4f} | PG {r['pg']:.4f}" + (f" | 숨김정보 {r['hid']:.3f}(기술 상위4 적중 {r['hid_top4']:.2f})" if r["hid"] else "")
-            + (f" | 상대의도 교체CE {r['opp_sw']:.3f}" + (f" AUC {r['opp_auc']:.3f}" if r["opp_auc"] is not None else "") + f" 기술CE {r['opp_mv']:.3f}(top1 {r['opp_top1']:.2f}) 대상CE {r['opp_tg']:.3f}" if r["opp_n"] else ""))
+            f"| V {r['v']:.3f} | KL {r['kl']:.4f} | PG {r['pg']:.4f}" + (f" | 숨김정보 {r['hid']:.3f}(기술 상위4 적중 {r['hid_top4']:.2f})" if r["hid"] else ""))
 
 
 def load(pattern, fp16=False):
@@ -210,12 +164,6 @@ def load(pattern, fp16=False):
     data["outcome"] = np.concatenate([p["outcome"] for p in parts])
     if any("teacher_value" in p.files for p in parts):      # 교사 가치가 없는 파일(옛 형식)은 NaN → 그 결정은 할인된 결과만으로 학습
         data["teacher_value"] = np.concatenate([p["teacher_value"] if "teacher_value" in p.files else np.full(int(p["lens"].sum()), np.nan, np.float32) for p in parts])
-    if any("opp_sw" in p.files for p in parts):             # 상대 의도 라벨이 없는 파일(DAgger 등)은 opp_sw=NaN → 그 결정은 의도 손실에서 제외
-        tails = {"opp_sw": (), "opp_tera": (), "opp_mv_id": (5,), "opp_mv_p": (5,), "opp_tgt": (6,)}
-        ref = next(p for p in parts if "opp_sw" in p.files)
-        for k, tail in tails.items():
-            data[k] = np.concatenate([p[k] if "opp_sw" in p.files else
-                                      np.full((int(p["lens"].sum()),) + tail, np.nan if k == "opp_sw" else 0, dtype=ref[k].dtype) for p in parts])
     lens = np.concatenate([p["lens"] for p in parts])
     return data, np.concatenate([[0], np.cumsum(lens)]), lens, files
 
@@ -241,28 +189,14 @@ def split_ids(data, offsets, val_frac, seed=0):
     return val, [i for i in range(len(first)) if i not in in_val]
 
 
-def upsample_train(train, files, spec):
-    """학습 시퀀스 중 지정한 파일 소속을 배수만큼 반복 (검증은 그대로). spec: {npz 경로: 배수}. DAgger처럼 작지만 중요한 데이터의 비중을 올릴 때 씀"""
-    start = np.concatenate([[0], np.cumsum([len(np.load(f)["lens"]) for f in files])])
-    norm = [os.path.normpath(f) for f in files]
-    out = list(train)
-    for path, k in spec.items():
-        i = norm.index(os.path.normpath(path))
-        out += [s for s in train if start[i] <= s < start[i + 1]] * (k - 1)
-    return out
-
-
 def main(args):
     data, offsets, lens, files = load(args.data, args.fp16_store)
     if args.teacher_value_mix > 0 and "teacher_value" not in data:
         raise SystemExit("❌ --teacher-value-mix에는 교사 가치(teacher_value)가 든 npz가 하나는 있어야 함 (build_fp_dataset.py로 만든 새 형식)")
     val, train = split_ids(data, offsets, VAL_FRAC)
-    n_train = len(train)
-    if args.upsample:
-        train = upsample_train(train, files, {k: int(v) for k, v in (a.rsplit("=", 1) for a in args.upsample)})
-    print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {n_train}판{f' (반복 포함 {len(train)}판)' if len(train) != n_train else ''}, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
+    print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
-    arch = json.loads(args.arch) if args.arch else {"model": "v3", "version": 3}
+    arch = json.loads(args.arch) if args.arch else {"model": "v5", "my_pos": False}
     model = build_model(arch)
     if args.init != "none":
         expanded, skipped = load_compatible(model, torch.load(args.init, map_location="cpu"))
@@ -337,10 +271,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/fp_selfplay/ms100/fp_data*.npz", help="build_fp_dataset.py 출력 (glob)")
     ap.add_argument("--accum", type=int, default=1, help="기울기 누적 횟수: 배틀 32개를 이 수로 나눠 처리해 VRAM을 줄임 (큰 모델용, 32의 약수)")
-    ap.add_argument("--upsample", action="append", default=[], help="경로=배수: 그 npz 파일의 학습 배틀을 배수만큼 반복 (예: data/dagger/dg6.npz=5). 여러 번 지정 가능")
     ap.add_argument("--init", default="checkpoints/supervised_v2_fp_all8a.pt", help="시작 체크포인트. 앞으로는 BC가 아니라 직전 최신 모델에서 이어서 학습")
     ap.add_argument("--out", default="checkpoints/supervised_v2_fp_next.pt")
-    ap.add_argument("--arch", default="", help="모델 구조 JSON (비우면 현재 기본 구조 v3). 옛 기존 구조는 {} 또는 {\"pokemon_embed_dim\":192,...}")
+    ap.add_argument("--arch", default="", help="모델 구조 JSON (비우면 현재 기본 구조 v5 = 합법성 입력, 요청 기반 마스크로 만든 데이터 필요). 옛 기존 구조는 {} 또는 {\"pokemon_embed_dim\":192,...}")
     ap.add_argument("--aux-teacher", default="", help="KL 기준 모델 체크포인트 (기본: --init). --init none(처음부터 학습)일 때 필수")
     ap.add_argument("--fp16-store", action="store_true", help="관측 배열을 float16으로 메모리에 보관 (데이터가 커서 RAM이 모자랄 때). 값 정밀도는 약 3자리")
     ap.add_argument("--epochs", type=int, default=4)

@@ -100,6 +100,34 @@ def _preview_mon(details, info):
     return mon
 
 
+def legal_from_request(req, moves, team_species, kind):
+    """Showdown 요청(서버가 알려 준 실제 합법성; 배포 때 poke-env가 available_moves/switches를 만드는 원본) -> 22칸 순수 합법 마스크.
+    moves: 활성 포켓몬 기술 id들(슬롯 순서, 정규화), team_species: 내 팀 종(슬롯 순서). 휴리스틱 가지치기는 없음.
+    기술: 요청의 기술 목록에 있고 disabled 아니며 PP가 남은 것(고정 때는 한 개만 남거나 나머지가 disabled), 테라: canTerastallize, 교체: 생존·비활성 포켓몬이고 trapped가 아닐 때"""
+    mask = np.zeros(22, dtype=bool)
+    trapped = False
+    if kind == "turn":
+        act = (req.get("active") or [None])[0]
+        if act is None:
+            return None
+        avail = {_norm(m.get("id") or m.get("move")) for m in act.get("moves", []) if not m.get("disabled") and m.get("pp", 1) != 0}
+        for i, mid in enumerate(moves[:4]):
+            if mid in avail:
+                mask[i] = True
+                mask[4 + i] = bool(act.get("canTerastallize"))
+        trapped = bool(act.get("trapped"))
+    alive = {}
+    for p in req.get("side", {}).get("pokemon", []):
+        alive[_norm(p["details"].split(",")[0])] = not p["condition"].endswith("fnt") and not p.get("active")
+    for k, sp in enumerate(team_species[:6]):
+        sp = _norm(sp)
+        ok = alive.get(sp)
+        if ok is None:                      # 폼 이름이 달라진 경우(예: 오거폰 테라 폼)는 접두사로 매칭
+            ok = next((v for n, v in alive.items() if n.startswith(sp) or sp.startswith(n)), False)
+        mask[8 + k] = bool(ok) and not trapped
+    return mask
+
+
 def _capture(battle, kind):
     """현재 상태를 인코딩하고, 요청 데이터 대신 규칙으로 합법 행동 마스크를 만듦"""
     global _ENCODER
@@ -120,6 +148,9 @@ def _capture(battle, kind):
     return {
         "obs": [t[0].numpy() for t in tensors[:7]], "mask": mask, "phi": potential(battle),
         "moves": moves, "team_species": [mon.species for mon in team], "tera": False,
+        # 마스크 점검용 (제약 없는 상태 판정): 등장 직후 첫 턴 여부, 도구, 걸려 있는 효과
+        "active_info": {"first_turn": bool(active and active.first_turn), "item": _norm(active.item) if active and active.item else "",
+                        "effects": sorted(e.name for e in active.effects) if active else [], "n_moves": len(moves)},
     }
 
 
