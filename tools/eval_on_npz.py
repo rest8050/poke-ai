@@ -1,5 +1,6 @@
 """체크포인트가 npz(교사 라벨) 위에서 교사와 얼마나 일치하는지 측정. DAgger 진단용: 학생 방문 상태 vs 교사 방문 상태 비교.
-사용: eval_on_npz.py <ckpt> <npz> [<npz> ...]   (npz의 배틀을 시퀀스 단위로 통째로 넣음 — 히스토리 포함)"""
+사용: eval_on_npz.py <ckpt> <npz> [<npz> ...]   (npz의 배틀을 시퀀스 단위로 통째로 넣음 — 히스토리 포함)
+홀드아웃 통합 파일(data/holdout/holdout_all.npz, src 그룹이 든 파일)은 그룹별로 한 줄씩 출력"""
 import sys
 
 import numpy as np
@@ -23,7 +24,9 @@ for path in sys.argv[2:]:
             z[k] = np.concatenate([z[k], pad], axis=-1)
     lens = z["lens"]
     off = np.concatenate([[0], np.cumsum(lens)])
-    agree = n = ce = ent = top = 0
+    src = z0["src"] if "src" in z0.files else np.zeros(len(lens), dtype=int)       # 그룹이 없는 파일은 통째로 한 그룹
+    gname = [str(g) for g in z0["src_names"]] if "src_names" in z0.files else [path]
+    acc = {g: [0, 0, 0.0, 0.0, 0.0] for g in range(len(gname))}                       # 그룹별 [일치, 결정 수, CE, 엔트로피, 최상위 확률 합]
     with torch.no_grad():
         for b in range(len(lens)):
             s, e = off[b], off[b + 1]
@@ -32,9 +35,12 @@ for path in sys.argv[2:]:
                                           torch.arange(T), 1, torch.tensor(z["action_mask"][s:e]))
             lp = torch.log_softmax(out["policy_logits"], -1)
             t = torch.tensor(z["target"][s:e])
-            agree += (lp.argmax(-1) == t.argmax(-1)).sum().item()
-            ce += -(t * lp.clamp(min=-30)).sum().item()
-            ent += -(t * torch.log(t.clamp(min=1e-9))).sum().item()
-            top += t.max(-1).values.sum().item()
-            n += T
-    print(f"{path}: 배틀 {len(lens)} 결정 {n} | 교사와 일치 {agree / n:.3f} | 소프트CE {ce / n:.4f} | 교사 엔트로피 {ent / n:.3f} 최상위확률 {top / n:.3f}")
+            a = acc[int(src[b])]
+            a[0] += (lp.argmax(-1) == t.argmax(-1)).sum().item()
+            a[2] += -(t * lp.clamp(min=-30)).sum().item()
+            a[3] += -(t * torch.log(t.clamp(min=1e-9))).sum().item()
+            a[4] += t.max(-1).values.sum().item()
+            a[1] += T
+    for g, (agree, n, ce, ent, top) in acc.items():
+        if n:
+            print(f"{path if len(gname) == 1 else path + '#' + gname[g]}: 배틀 {int((src == g).sum())} 결정 {n} | 교사와 일치 {agree / n:.3f} | 소프트CE {ce / n:.4f} | 교사 엔트로피 {ent / n:.3f} 최상위확률 {top / n:.3f}")

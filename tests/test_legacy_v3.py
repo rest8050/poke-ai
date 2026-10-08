@@ -13,11 +13,9 @@ if not os.path.exists(CK):
 else:
     m = model_from_ckpt(CK).eval()
     assert type(m).__name__ == "EntityPokemonNetV3Legacy"
-    z = np.load("data/dagger/dg3_ho.npz"); n = int(z["lens"][0])
-    keys = ["my_team_cat", "my_team_num", "my_move_num", "opp_team_cat", "opp_team_num", "opp_move_num", "field_vec"]
-    obs = [torch.tensor(z[k][:n]) for k in keys]
-    for i in (2, 5):                                         # 옛 npz는 기술 수치 칸이 44개 -> 뒤를 0으로 채움
-        obs[i] = torch.cat([obs[i], obs[i].new_zeros(*obs[i].shape[:-1], 46 - obs[i].size(-1))], -1)
-    out = m.forward_sequences(obs, torch.zeros(n, dtype=torch.long), torch.arange(n), 1, torch.tensor(z["action_mask"][:n]))
-    assert torch.isfinite(out["policy_logits"][torch.tensor(z["action_mask"][:n])]).all()
+    from src.evaluation.holdout import OBS, load_holdout
+    _, o, mask, _ = load_holdout(("dg3",))[0]; n = len(mask)           # 통합 홀드아웃의 dg3 첫 배틀 (기술 수치 칸은 46으로 채워져 있음)
+    obs = [torch.tensor(o[k]) for k in OBS]
+    out = m.forward_sequences(obs, torch.zeros(n, dtype=torch.long), torch.arange(n), 1, torch.tensor(mask))
+    assert torch.isfinite(out["policy_logits"][torch.tensor(mask)]).all()
     print("legacy v3 OK")

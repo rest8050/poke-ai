@@ -107,7 +107,7 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
     model.train(bool(train))  # 학습 중에는 드롭아웃(트랜스포머/융합층 0.1)을 켬 → 오래된 데이터를 반복해서 외우는 것을 늦춤. 검증은 항상 끔
     tot = dict(ce=0.0, v=0.0, kl=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, chg=0, chg_agree=0, opp_sw=0.0, opp_mv=0.0, opp_tg=0.0, opp_top1=0.0, opp_n=0)
     opp_p, opp_y = [], []
-    for b in make_batches(data, offsets, idx, BATCH_BATTLES, train):
+    for bi, b in enumerate(make_batches(data, offsets, idx, BATCH_BATTLES // args.accum, train)):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):   # 손실 계산은 아래에서 float32로 (큰 모델의 메모리/시간 절약)
@@ -141,11 +141,15 @@ def run(model, ref, data, offsets, idx, args, train, opt=None):
                         opp_p.append(p_sw.cpu().numpy()); opp_y.append(y_sw.cpu().numpy())
             loss = ce + VALUE_COEF * v_loss + args.kl_coef * kl + args.pg_coef * pg + HIDDEN_COEF * hid + OPP_COEF * opp
         if train:
-            opt.zero_grad(); loss.backward()
-            for grp in args._clip_groups:   # 신념 모듈은 자기 손실로만 학습하므로 기울기 클리핑도 따로 (큰 숨김정보 손실이 정책 기울기를 누르지 않게)
-                torch.nn.utils.clip_grad_norm_(grp, 1.0)
-            opt.step()
-            args._sched.step()  # 학습률 스케줄은 배치마다 갱신
+            # ponytail: --accum k면 배틀 32개를 k개로 나눠 기울기를 누적(VRAM 절약). 미세 배치를 같은 가중으로 평균(결정 수 차이는 무시), 에폭 끝의 덜 찬 묶음은 버림
+            if bi % args.accum == 0:
+                opt.zero_grad()
+            (loss / args.accum).backward()
+            if (bi + 1) % args.accum == 0:
+                for grp in args._clip_groups:   # 신념 모듈은 자기 손실로만 학습하므로 기울기 클리핑도 따로 (큰 숨김정보 손실이 정책 기울기를 누르지 않게)
+                    torch.nn.utils.clip_grad_norm_(grp, 1.0)
+                opt.step()
+                args._sched.step()  # 학습률 스케줄은 최적화 스텝마다 갱신
         with torch.no_grad():
             want, got, ref_a = b["target"].argmax(-1), logp.argmax(-1), ref_out["policy_logits"].argmax(-1)
             chg = want != ref_a  # 탐색이 원래 정책의 선택을 바꾼 결정
@@ -237,12 +241,26 @@ def split_ids(data, offsets, val_frac, seed=0):
     return val, [i for i in range(len(first)) if i not in in_val]
 
 
+def upsample_train(train, files, spec):
+    """학습 시퀀스 중 지정한 파일 소속을 배수만큼 반복 (검증은 그대로). spec: {npz 경로: 배수}. DAgger처럼 작지만 중요한 데이터의 비중을 올릴 때 씀"""
+    start = np.concatenate([[0], np.cumsum([len(np.load(f)["lens"]) for f in files])])
+    norm = [os.path.normpath(f) for f in files]
+    out = list(train)
+    for path, k in spec.items():
+        i = norm.index(os.path.normpath(path))
+        out += [s for s in train if start[i] <= s < start[i + 1]] * (k - 1)
+    return out
+
+
 def main(args):
     data, offsets, lens, files = load(args.data, args.fp16_store)
     if args.teacher_value_mix > 0 and "teacher_value" not in data:
         raise SystemExit("❌ --teacher-value-mix에는 교사 가치(teacher_value)가 든 npz가 하나는 있어야 함 (build_fp_dataset.py로 만든 새 형식)")
     val, train = split_ids(data, offsets, VAL_FRAC)
-    print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
+    n_train = len(train)
+    if args.upsample:
+        train = upsample_train(train, files, {k: int(v) for k, v in (a.rsplit("=", 1) for a in args.upsample)})
+    print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {n_train}판{f' (반복 포함 {len(train)}판)' if len(train) != n_train else ''}, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
     arch = json.loads(args.arch) if args.arch else {"model": "v3", "version": 3}
     model = build_model(arch)
@@ -318,6 +336,8 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/fp_selfplay/ms100/fp_data*.npz", help="build_fp_dataset.py 출력 (glob)")
+    ap.add_argument("--accum", type=int, default=1, help="기울기 누적 횟수: 배틀 32개를 이 수로 나눠 처리해 VRAM을 줄임 (큰 모델용, 32의 약수)")
+    ap.add_argument("--upsample", action="append", default=[], help="경로=배수: 그 npz 파일의 학습 배틀을 배수만큼 반복 (예: data/dagger/dg6.npz=5). 여러 번 지정 가능")
     ap.add_argument("--init", default="checkpoints/supervised_v2_fp_all8a.pt", help="시작 체크포인트. 앞으로는 BC가 아니라 직전 최신 모델에서 이어서 학습")
     ap.add_argument("--out", default="checkpoints/supervised_v2_fp_next.pt")
     ap.add_argument("--arch", default="", help="모델 구조 JSON (비우면 현재 기본 구조 v3). 옛 기존 구조는 {} 또는 {\"pokemon_embed_dim\":192,...}")

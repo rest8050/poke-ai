@@ -52,9 +52,11 @@ assert abs(m(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, mult)["def"][0][2,
 print("손계산 OK")
 
 # 실제 데이터에서 인코더와 대조
-path = "data/dagger/dg2_ho.npz"
+path = "data/holdout/holdout_all.npz"
 if os.path.exists(path):
-    z = np.load(path); n = 3000
+    from src.evaluation.holdout import load_holdout
+    seqs = load_holdout(("dg2",)); n = 3000                                    # 통합 홀드아웃의 dg2 그룹 앞쪽 결정 3000개
+    z = {k: np.concatenate([q[1][k] for q in seqs]) for k in seqs[0][1]}
     g = lambda k: torch.tensor(z[k][:n]).float() if ("num" in k) else torch.tensor(z[k][:n]).long()
     mc, mn, mm, oc, on, om = [g(k) for k in ["my_team_cat", "my_team_num", "my_move_num", "opp_team_cat", "opp_team_num", "opp_move_num"]]
     out = m(mc, mn, mm, oc, on, om)
