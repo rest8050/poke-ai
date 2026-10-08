@@ -112,6 +112,16 @@ python src/evaluation/analyze_model.py --ckpt checkpoints/supervised_v2.pt --mod
 
 평가는 항상 holdout(A)/rare(B)/randomset(C) 풀에만. 학습 풀(train_a*, rare_train*, randomset_train3)로 평가하지 말 것.
 
+## 5-1. 행동 사건 추출 + 손계산 오차 진단 (결과 예측기 1단계)
+
+자가대전 기록에서 기술/등장 사건(직전 상태 → 결과)을 뽑고, 모델의 손계산(Matchup과 같은 근사)이 실제 피해와 어디서 어긋나는지 특성/도구/기술/날씨/벽/랭크별로 집계한다.
+메커니즘 표에 무엇부터 넣을지, 학습된 보정이 얼마나 필요한지를 여기서 정한다. 사건 추출은 표준 라이브러리만 써서 빠르고, 진단만 poke-env가 필요함.
+```bash
+python tools/extract_events.py --decisions "data/fp_selfplay/ms300/dec_sp12[abc]_*.jsonl" --out data/events/sp12.jsonl.gz   # --max-battles 500 으로 빠르게 맛보기
+python tools/damage_residual_report.py data/events/sp12.jsonl.gz --min-n 30 --tsv logs/damage_residual_sp12.tsv              # --stats standard: 노력치 표준 가정과 비교
+```
+읽는 법: 그룹의 "실제/손계산"이 1에서 멀고 n이 클수록 손계산이 놓친 메커니즘 (개별 |r| 0.1 안팎은 난수/HP 반올림 잡음). KO는 따로("최대 난수 손계산이 KO를 예측한 비율"), 장판 피해와 위협 발동 결과도 함께 찍힘.
+
 ## 6. 검증 표준 (학생 상태 홀드아웃 + 직접 대전)
 
 교사 상태 검증(학습 스크립트가 찍는 값)은 강도를 따라가지 못함 → 1차 검증은 **학생 상태 홀드아웃**, 최종 판정은 **직접 대전**.
