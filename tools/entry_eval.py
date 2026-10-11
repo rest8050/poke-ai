@@ -3,7 +3,7 @@
       C4 내 쪽 스텔스록 & 약점(2배+) 후보 / C5 스텔스록 & 저항(0.5배-) 후보 — 모두 자발 결정(기술·교체 둘 다 가능)만
 지표: 결정마다 오차 = 학생의 특징 질량 - 교사의 특징 질량. 편향 = 오차 평균(0이면 교사와 같음), 평균 |오차|. 구간은 판(배틀) 단위 부트스트랩 95%
 기준 모델 대비 평균 |오차|의 차이도 냄 (음수가 개선).
-사용: python tools/entry_eval.py --models v5_leg,v6_ent --base v5_leg --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz  (모델 = checkpoints/supervised_v2_fp_<이름>.pt)"""
+사용: python tools/entry_eval.py --models v4_full_tv,v6_full --base v4_full_tv --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz  (모델 = checkpoints/supervised_v2_fp_<이름>.pt)"""
 import argparse
 import json
 import sys
