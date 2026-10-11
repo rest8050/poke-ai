@@ -301,7 +301,7 @@ def pick(sess: Session):
         return {"kind": "default", "why": "선택 가능한 행동 없음"}
     tensors = encoder.encode_battle(battle)
     mask = tensors[7]
-    idx, probs, _, value, sess.history = sess.model.get_action(*tensors[:7], sess.history, mask)
+    idx, probs, _, value, sess.history = sess.model.get_action(*tensors[:7], sess.history, mask, tensors[8])
     decoded = decode_action(battle, idx)
     decode_fn = lambda i: decode_action(battle, i)  # noqa: E731
     idx, decoded = avoid_redundant_trickroom(idx, probs, mask, decoded, decode_fn, _fields_have_trickroom(battle))

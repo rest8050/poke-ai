@@ -69,12 +69,12 @@ if POKE_ENV_AVAILABLE:
         def choose_move(self, battle: AbstractBattle):
             # 1. 분리된 전용 인코더 모듈로 텐서 및 마스크 변환
             tensors = self.encoder.encode_battle(battle)
-            my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask = tensors
+            my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask = tensors
 
             # 2. 신경망 추론 (+ 선택적 1턴 탐색)
             tag = battle.battle_tag
             action_idx, p_probs, opp_p_probs, val, self.history[tag] = self.model.get_action(
-                my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, self.history.get(tag), action_mask
+                my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, self.history.get(tag), action_mask, legal_mask
             )
             if self.search_lambda is not None:
                 action_idx = search_pick(battle, p_probs[0], self.search_lambda) or action_idx

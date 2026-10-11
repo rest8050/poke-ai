@@ -144,7 +144,13 @@ class EntityPokemonNetV3(nn.Module):
         return b
 
     # ---- 토큰 구성 + 트렁크 ----
+    def _fit_field(self, fv):
+        """field_vec 폭을 이 모델이 학습한 폭에 맞춤: 더 넓으면(인코더가 뒤에 열을 추가) 뒤를 버리고, 더 좁으면(옛 데이터) 0으로 채움"""
+        n = self.field_proj[0].in_features
+        return fv[..., :n] if fv.size(-1) >= n else F.pad(fv, (0, n - fv.size(-1)))
+
     def _encode_turn(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec):
+        field_vec = self._fit_field(field_vec)
         B, dev, d = my_team_cat.size(0), my_team_cat.device, self.d
         cat = torch.cat([my_team_cat[..., :10], opp_team_cat[..., :10]], 1).reshape(B * 12, 10)
         num = torch.cat([my_team_num, opp_team_num], 1).reshape(B * 12, -1)
@@ -198,26 +204,20 @@ class EntityPokemonNetV3(nn.Module):
     def _turn_vec(enc):
         return torch.cat([enc["cls"], enc["active_mon"], enc["opp_active_mon"], enc["field"]], -1)
 
-    def _option_inputs(self, enc, latent, ok):
-        """기술/교체 점수 헤드와 종류 헤드의 입력 (ok: 교체 가능 후보 [B,6]). v5가 상대 의도 피처를 더하려고 이 부분만 바꿈"""
-        B = latent.size(0)
+    def _heads(self, enc, history, action_mask=None, opp_action_mask=None):
+        B = history.size(0)
+        latent = self.fusion(torch.cat([enc["cls"], history], -1))
         cand = enc["cand"]                                                       # [B,6,9]
+        ok = action_mask[:, 8:14] if action_mask is not None else torch.ones(B, 6, dtype=torch.bool, device=latent.device)
         act_feat = cand[torch.arange(B, device=latent.device), enc["act_m"]]    # 내 활성의 같은 요약
         best_off = torch.where(ok, cand[..., 4], torch.full_like(cand[..., 4], -1.0)).amax(1, keepdim=True).clamp_min(0)      # 교체 가능 후보가 줄 수 있는 최대 데미지
         min_thr = torch.where(ok, cand[..., 7], torch.full_like(cand[..., 7], 9.0)).amin(1, keepdim=True)
         min_thr = torch.where(ok.any(1, keepdim=True), min_thr, torch.zeros_like(min_thr))
         mv_in = torch.cat([latent[:, None].expand(-1, 4, -1), enc["active_mv"], enc["active_mon"][:, None].expand(-1, 4, -1)], -1)
         sw_in = torch.cat([latent[:, None].expand(-1, 6, -1), enc["my_mon"], cand], -1)
-        return mv_in, sw_in, torch.cat([latent, act_feat, best_off, min_thr], -1)
-
-    def _heads(self, enc, history, action_mask=None, opp_action_mask=None):
-        B = history.size(0)
-        latent = self.fusion(torch.cat([enc["cls"], history], -1))
-        ok = action_mask[:, 8:14] if action_mask is not None else torch.ones(B, 6, dtype=torch.bool, device=latent.device)
-        mv_in, sw_in, type_in = self._option_inputs(enc, latent, ok)
         mv, sw = self.move_score(mv_in), self.switch_score(sw_in).squeeze(-1)
         detail = torch.cat([mv[..., 0], mv[..., 1], sw, latent.new_full((B, 8), -1e9)], 1)
-        type_logits = self.type_head(type_in)
+        type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr], -1))
         if action_mask is not None:
             detail = detail.masked_fill(~action_mask, -1e9)
             no_move = ~(action_mask & ~self.is_switch).any(dim=1)

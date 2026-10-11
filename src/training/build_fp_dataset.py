@@ -11,7 +11,6 @@ Foul Play(탐색 봇) 대전 기록 → 증류 학습 데이터 (train_fp_distil
   프로토콜을 Foul Play 쪽 시점으로 재생하되, 내 팀 정보는 사후 추정이 아니라 Foul Play가 실제로 쓴 팀(start 레코드)으로 채움
   → 실시간 인코더와 같은 완전한 내 팀 정보. 결정 지점(턴 시작/기절 후 교체)마다 Foul Play의 탐색 분포를 22칸 행동 분포로 변환
 출력 npz: OBS_KEYS + action_mask + target(22) + value_target, teacher_value(탐색이 본 이 쪽 승률 0~1, 결정마다), lens(배틀별 길이), outcome
-  (--opp-labels: 상대 의도 라벨 opp_sw/opp_tera [N], opp_mv_id/opp_mv_p [N,5], opp_tgt [N,6] — 상대 쪽 탐색 분포에서, 없으면 opp_sw=NaN)
 
 사용: python src/training/build_fp_dataset.py --decisions "data/fp_gen/ms050/dec_*.jsonl" --protocols "data/fp_gen/ms050/prot_*.jsonl" --out data/fp_gen/ms050/fp_data.npz
 자가대전: python src/training/build_fp_dataset.py --decisions "data/fp_selfplay/ms050/dec_*.jsonl" --out data/fp_selfplay/ms050/fp_data.npz
@@ -34,7 +33,7 @@ from collections import Counter, defaultdict
 import numpy as np
 from poke_env.battle import Battle
 
-from src.training.replay_dataset import OBS_KEYS, _LOGGER, _capture, _norm, _preview_mon
+from src.training.replay_dataset import OBS_KEYS, _LOGGER, _capture, _norm, _preview_mon, legal_from_request
 
 GAMMA = 0.995
 
@@ -77,10 +76,34 @@ def _choice_index(choice, moves, team):
     """'기술' | '기술-tera' | 'switch 종' → 22칸 행동 인덱스 (매칭 안 되면 None)"""
     if choice.startswith("switch "):
         sp = _norm(choice[len("switch "):])
-        return next((8 + k for k, s in enumerate(team) if s == sp), None)
+        k = next((k for k, s in enumerate(team) if s == sp), None)
+        if k is None:       # 폼이 바뀐 이름(예: 오거폰 테라 폼 'ogerpontealtera')은 접두사로 매칭 (한 팀에 같은 종은 하나)
+            k = next((k for k, s in enumerate(team) if s and (s.startswith(sp) or sp.startswith(s))), None)
+        return None if k is None else 8 + k
     tera = choice.endswith("-tera")
     mid = _norm(choice.removesuffix("-tera").removesuffix("-mega"))
     return next((i + (4 if tera else 0) for i, m in enumerate(moves) if m == mid), None)
+
+
+CONSTRAINT_ITEMS = {"choicescarf", "choiceband", "choicespecs", "assaultvest"}       # 기술 선택을 제한하는 도구
+CONSTRAINT_EFFECTS = {"TAUNT", "ENCORE", "DISABLE", "TORMENT", "IMPRISON", "HEAL_BLOCK", "THROAT_CHOP", "LOCKED_MOVE"}
+
+
+def legal_from_options(r, state):
+    """결정 기록의 옵션 목록(Foul Play가 서버 요청에서 얻은 실제 합법 행동, 모든 세계의 합집합) -> (22칸 합법 마스크, 매칭 실패한 옵션 이름들).
+    옵션이 없으면 (None, [])"""
+    names = {o[0] for w in (r.get("worlds") or []) for o in w.get("o", [])}
+    if not names:
+        return None, []
+    moves, team = [_norm(m) for m in state["moves"]], [_norm(x) for x in state["team_species"]]
+    legal, bad = np.zeros(22, bool), []
+    for n in sorted(names):
+        i = _choice_index(n, moves, team)
+        if i is None:
+            bad.append(n)
+        else:
+            legal[i] = True
+    return legal, bad
 
 
 def to_target(state, policy, keep_ratio, choice=None):
@@ -104,39 +127,15 @@ def to_target(state, policy, keep_ratio, choice=None):
     return (t / s if s > 0 else None), s / total, action_idx
 
 
-OPP_TOP = 5   # 상대 기술 분포로 남기는 상위 기술 수 (나머지 질량은 '기타')
-_VOCAB = json.load(open("data/vocab.json", encoding="utf-8"))
-_SPECIES_NAME = {i: n for n, i in _VOCAB["species"].items()}
-
-
-def opp_labels(policy, keep_ratio, opp_team_cat):
-    """상대 쪽 탐색 분포 → 상대 의도 라벨 (모두 전체 질량 대비 비율, 매칭 안 된 질량은 버림 — 손실이 다시 정규화).
-    policy: 상대 컨테이너가 남긴 [(선택, 가중치)], opp_team_cat: 내 관측의 상대 6칸 [6, CAT] (종 ID는 10번 열, 프리뷰로 6마리 모두 채워짐)
-    반환: (교체 질량, 테라 질량, 기술 ID [OPP_TOP], 기술 질량 [OPP_TOP], 교체 대상 슬롯 질량 [6])"""
-    best = max(w for _, w in policy)
-    policy = [(c, w) for c, w in policy if w >= keep_ratio * best]
-    total = sum(w for _, w in policy) or 1.0
-    slots = [_SPECIES_NAME.get(int(i), "") for i in opp_team_cat[:, 10]]
-    sw, tera, tgt, mv = 0.0, 0.0, np.zeros(6, np.float32), defaultdict(float)
-    for c, w in policy:
-        w /= total
-        if c.startswith("switch "):
-            sw += w
-            sp = _norm(c[len("switch "):])
-            k = next((k for k, s in enumerate(slots) if s and s == sp), None)
-            if k is None:   # 폼 차이(프리뷰 'sinistcha' vs 실제 'sinistchamasterpiece')는 접두사로 매칭 (tensor_encoder와 같은 규칙)
-                k = next((k for k, s in enumerate(slots) if s and (s.startswith(sp) or sp.startswith(s))), None)
-            if k is not None:
-                tgt[k] += w
-        else:
-            tera += w if c.endswith("-tera") else 0.0
-            mid = _VOCAB["move"].get(_norm(c.removesuffix("-tera").removesuffix("-mega")))
-            if mid:
-                mv[mid] += w
-    top = sorted(mv.items(), key=lambda kv: -kv[1])[:OPP_TOP]
-    ids = np.array([i for i, _ in top] + [0] * (OPP_TOP - len(top)), np.int32)
-    ps = np.array([p for _, p in top] + [0.0] * (OPP_TOP - len(top)), np.float32)
-    return np.float32(sw), np.float32(tera), ids, ps, tgt
+def _apply_request(st, req, kind):
+    """상태의 행동 마스크를 서버 요청 기반 순수 합법 마스크로 교체 (못 만들면 규칙 마스크 유지)"""
+    ids = [_norm(x) for x in st["moves"]]
+    m = legal_from_request(req, ids, st["team_species"], kind)
+    if m is not None and m.any():
+        st["mask"], st["mask_src"] = m, "request"
+        if kind == "turn":      # PP가 바닥난 기술 슬롯 (마스크 점검에서 "제약 없는 상태"의 정당한 예외)
+            empty = {_norm(x.get("id") or x.get("move")) for x in req["active"][0].get("moves", []) if x.get("pp", 1) == 0}
+            st["pp_empty"] = np.array([i in empty for i in ids] + [False] * (4 - len(ids)))
 
 
 def replay_states(protocol, side, name, team):
@@ -146,11 +145,24 @@ def replay_states(protocol, side, name, team):
     info = team_info(team)
     battle = Battle(f"fp-{side}", name, _LOGGER, gen=9)
     states, forced = [], False
+    last_req, waiting = None, None      # 서버 요청: 턴 결정의 요청은 |turn| 줄 바로 뒤에 오고, 강제 교체의 요청은 교체 직전에 이미 와 있음
     for s in lines:
         ev = s[1]
+        if ev == "request":
+            try:
+                req = json.loads("|".join(s[2:]))
+            except ValueError:
+                continue
+            if waiting is not None and req.get("active"):
+                _apply_request(states[waiting][0], req, "turn")
+                waiting = None
+            last_req = req
+            continue
         own = len(s) > 2 and s[2].startswith(side) and len(s[2]) > 2 and s[2][2] in "abc"
         if own and ev == "switch" and forced:
             st = _capture(battle, "forced")
+            if last_req and last_req.get("forceSwitch"):
+                _apply_request(st, last_req, "forced")
             states.append((st, battle.turn, 1))
             forced = False
         elif own and ev == "faint":
@@ -171,6 +183,7 @@ def replay_states(protocol, side, name, team):
             return None
         if ev == "turn":
             states.append((_capture(battle, "turn"), battle.turn, 0))
+            waiting = len(states) - 1
     return states
 
 
@@ -178,7 +191,7 @@ def _states(task):
     return replay_states(*task)
 
 
-def build(decisions, protocols, min_matched, keep_ratio, workers=1, opp=False):
+def build(decisions, protocols, min_matched, keep_ratio, workers=1):
     decisions = list(decisions)  # 아래서 두 번(결정 집계 + 자기기록 프로토콜 추출) 훑음
     # (파일, 태그)로 묶음: 자가대전은 두 컨테이너가 같은 배틀 태그를 쓰므로 태그만으로 묶으면 서로 덮어씀
     by_tag = defaultdict(lambda: {"dec": []})
@@ -196,13 +209,12 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1, opp=False):
         if r["type"] == "protocol":
             prot_by_tag.setdefault(r["tag"], r["lines"])
 
-    peers = defaultdict(list)   # 배틀 태그 -> 그 배틀의 기록 파일들 (자가대전은 양쪽 2개)
-    for src, tag in by_tag:
-        peers[tag].append(src)
     stat = Counter()
+    unmatched = defaultdict(lambda: [0, None])       # 22칸에 못 넣은 옵션 이름 -> [횟수, 첫 사례 (태그, 턴)]
     out, jobs = [], []
     for (_src, tag), d in by_tag.items():
-        protocol = prot_by_tag.get(tag)
+        # 자기 컨테이너의 프로토콜을 우선 (자기 쪽 서버 요청 |request|가 들어 있어 순수 합법 마스크를 만들 수 있음), 없으면 상대편 수집분
+        protocol = d["protocol"]["lines"] if "protocol" in d else prot_by_tag.get(tag)
         if not protocol or "start" not in d or "end" not in d or d["end"]["winner"] is None:
             stat["배틀 제외(결정/종료/프로토콜 기록 없음)"] += 1
             continue
@@ -224,28 +236,37 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1, opp=False):
         queues = defaultdict(list)
         for st, turn, kind in states:
             queues[(turn, kind)].append(st)
-        steps, tvals, olabs = [], [], []
-        opp_dec = {}   # 반대편의 같은 턴 결정 (자가대전 한정): (턴, 강제교체) -> 기록
-        if opp:
-            others = [s for s in peers[d["start"]["tag"]] if s != d["start"]["_src"]]
-            if len(others) == 1:
-                for o in by_tag[(others[0], d["start"]["tag"])]["dec"]:
-                    opp_dec.setdefault((o["turn"], int(o["force_switch"])), o)
+        steps, tvals = [], []
         for r in d["dec"]:
             key = (r["turn"], int(r["force_switch"]))
             if not queues[key]:
                 stat["결정 제외(상태 못 찾음)"] += 1
                 continue
             st = queues[key].pop(0)
+            from_req = st.get("mask_src") == "request"      # replay_states가 서버 요청에서 만든 순수 합법 마스크 (없으면 규칙 마스크)
+            stat["마스크: 서버 요청 기반" if from_req else "마스크: 규칙 대체(요청 못 찾음)"] += 1
+            opt, bad = legal_from_options(r, st)             # Foul Play가 고려한 옵션: 진단용 (마스크는 요청 기반)
+            if opt is not None:
+                for n in bad:
+                    unmatched[n][0] += 1
+                    unmatched[n][1] = unmatched[n][1] or (r["tag"], r["turn"])
+                stat["옵션 중 22칸 매칭 실패가 있는 결정"] += bool(bad)
+                if from_req:
+                    stat["FP 옵션이 요청 합법 밖 행동을 포함한 결정"] += bool((opt & ~st["mask"]).any())
+                    stat["요청상 합법인데 FP 옵션에 없는 행동이 있는 결정(FP 자체 가지치기)"] += bool((st["mask"] & ~opt).any())
+            info = st["active_info"]
+            if from_req and key[1] == 0 and info["first_turn"] and info["item"] not in CONSTRAINT_ITEMS and not (set(info["effects"]) & CONSTRAINT_EFFECTS) and info["n_moves"]:
+                stat["제약 없는 상태(등장 직후 첫 턴, 비고정 도구, 도발·앵콜 등 없음)"] += 1
+                pe = st.get("pp_empty", np.zeros(4, bool))
+                if not (st["mask"][:4][:info["n_moves"]] | pe[:info["n_moves"]]).all():         # PP가 바닥난 기술은 정당하게 빠짐
+                    stat["　그중 공개된 기술이 마스크에서 빠진 결정"] += 1
+                    unmatched["[제약 없는 상태에서 기술 누락] " + ",".join(str(m) for m in st["moves"]) + " | 마스크 " + "".join("1" if x else "0" for x in st["mask"][:8])][0] += 1
             target, matched, action_idx = to_target(st, r["policy"], keep_ratio, r.get("choice"))
             if target is None or matched < min_matched:
                 stat["결정 제외(행동 매칭 실패)"] += 1
                 continue
             steps.append((st, target, -1 if action_idx is None else action_idx))
             tvals.append(float(r["value"]))
-            o = opp_dec.get(key) if key[1] == 0 else None      # 내가 강제 교체일 때는 상대 결정이 없음
-            olabs.append(opp_labels(o["policy"], keep_ratio, st["obs"][3]) if o else (np.float32("nan"), np.float32(0), np.zeros(OPP_TOP, np.int32), np.zeros(OPP_TOP, np.float32), np.zeros(6, np.float32)))
-            stat["상대 라벨 있음" if o else "상대 라벨 없음"] += 1
             stat["결정 사용"] += 1
         if len(steps) < 2:
             continue
@@ -257,22 +278,18 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1, opp=False):
         seq["action_taken"] = np.array([a for _, _, a in steps], np.int64)  # 정책 그라디언트용, -1=실제 선택 매칭 실패
         seq["value_target"] = (GAMMA ** np.arange(T - 1, -1, -1, dtype=np.float32)) * outcome - np.array([s["phi"] for s, _, _ in steps], np.float32)
         seq["teacher_value"] = np.array(tvals, np.float32)
-        if opp:
-            seq["opp_sw"], seq["opp_tera"] = (np.array([l[i] for l in olabs], np.float32) for i in (0, 1))
-            seq["opp_mv_id"], seq["opp_mv_p"], seq["opp_tgt"] = (np.stack([l[i] for l in olabs]) for i in (2, 3, 4))
         seq["outcome"] = outcome
         out.append(seq)
         stat["배틀 사용"] += 1
-    return out, stat
+    return out, stat, unmatched
 
 
 def main(args):
     protocols = load_jsonl(args.protocols) if args.protocols else []
-    seqs, stat = build(load_jsonl(args.decisions), protocols, args.min_matched, args.keep_ratio, args.workers, args.opp_labels)
+    seqs, stat, unmatched = build(load_jsonl(args.decisions), protocols, args.min_matched, args.keep_ratio, args.workers)
     if not seqs:
         raise SystemExit(f"❌ 만들어진 배틀이 없음: {dict(stat)}")
-    opp_keys = ["opp_sw", "opp_tera", "opp_mv_id", "opp_mv_p", "opp_tgt"] if args.opp_labels else []
-    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken"] + opp_keys}
+    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken"]}
     data["lens"] = np.array([len(s["action_mask"]) for s in seqs])
     data["outcome"] = np.array([s["outcome"] for s in seqs], np.float32)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -281,6 +298,18 @@ def main(args):
     print(f"✅ {len(seqs)}판 / 결정 {int(data['lens'].sum())}개 → {args.out}")
     print(f"   Foul Play 승률(이 데이터) {np.mean(data['outcome'] > 0):.3f} | 교사 분포 평균 엔트로피 {ent.mean():.3f} | 최상위 행동 평균 확률 {data['target'].max(-1).mean():.3f}")
     print("   ", dict(stat))
+    n_mask = (stat["마스크: 서버 요청 기반"] + stat["마스크: 규칙 대체(요청 못 찾음)"]) or 1
+    n_free = stat["제약 없는 상태(등장 직후 첫 턴, 비고정 도구, 도발·앵콜 등 없음)"]
+    n_prune = stat["요청상 합법인데 FP 옵션에 없는 행동이 있는 결정(FP 자체 가지치기)"]
+    print(f"   마스크 점검: 서버 요청 기반 {stat['마스크: 서버 요청 기반']}개 ({stat['마스크: 서버 요청 기반'] / n_mask:.1%}), 규칙 대체 {stat['마스크: 규칙 대체(요청 못 찾음)']}개")
+    print(f"   옵션(Foul Play) 대비: 22칸 매칭 실패가 있는 결정 {stat['옵션 중 22칸 매칭 실패가 있는 결정']}개 ({stat['옵션 중 22칸 매칭 실패가 있는 결정'] / n_mask:.2%}), "
+          f"요청 합법 밖 옵션 {stat['FP 옵션이 요청 합법 밖 행동을 포함한 결정']}개, FP 자체 가지치기 {n_prune}개 ({n_prune / n_mask:.1%})")
+    print(f"   제약 없는 상태 {n_free}개 중 공개된 기술이 마스크에서 빠진 결정 {stat['　그중 공개된 기술이 마스크에서 빠진 결정']}개 ({stat['　그중 공개된 기술이 마스크에서 빠진 결정'] / max(n_free, 1):.2%})")
+    log = os.path.splitext(args.out)[0] + "_unmatched.txt"          # 22칸에 못 넣은 옵션과 제약 없는 상태의 기술 누락 사례 (횟수 내림차순)
+    with open(log, "w", encoding="utf-8") as f:
+        for n, (c, ex) in sorted(unmatched.items(), key=lambda kv: -kv[1][0]):
+            f.write(f"{c}"+chr(9)+f"{n}"+chr(9)+f"{ex}"+chr(10))
+    print(f"   매칭 실패 옵션 {len(unmatched)}종 -> {log}")
 
 
 if __name__ == "__main__":
@@ -290,8 +319,6 @@ if __name__ == "__main__":
                     help="상대편(poke-env)이 남긴 프로토콜 JSONL glob. 자가대전(FoulPlay vs FoulPlay)처럼 상대편 기록이 없으면 생략 — "
                          "FoulPlay 자신이 남긴 protocol 레코드를 씀")
     ap.add_argument("--out", default="data/fp/fp_data.npz")
-    ap.add_argument("--opp-labels", action="store_true",
-                    help="자가대전 전용: 같은 배틀 반대편 기록의 탐색 분포로 상대 의도 라벨(opp_sw/opp_tera/opp_mv_*/opp_tgt)을 함께 저장 (DAgger는 쓰지 말 것 — 반대편 policy가 실제 행동 분포가 아님)")
     ap.add_argument("--workers", type=int, default=8, help="재생 병렬 프로세스 수")
     ap.add_argument("--keep-ratio", type=float, default=0.2, help="탐색 분포에서 최고 확률의 이 비율 이상만 목표로. 낮을수록 원본 분포에 가까움(0=전체, Foul Play 자체 선택 규칙은 0.75지만 그대로 쓰면 알고리즘 절차를 모방하게 됨)")
     ap.add_argument("--min-matched", type=float, default=0.6, help="탐색 분포 중 우리 행동 칸에 매칭돼야 하는 최소 질량 비율")

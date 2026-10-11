@@ -101,6 +101,7 @@ class EntityPokemonNetV3Legacy(nn.Module):
 
     # ---- 토큰 구성 + 트렁크 ----
     def _encode_turn(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec):
+        field_vec = field_vec[..., :self.field_proj[0].in_features]                  # 인코더가 뒤에 추가한 열은 이 모델이 안 씀
         B, dev, d = my_team_cat.size(0), my_team_cat.device, self.d
         cat = torch.cat([my_team_cat[..., :10], opp_team_cat[..., :10]], 1).reshape(B * 12, 10)
         num = torch.cat([my_team_num, opp_team_num], 1).reshape(B * 12, -1)

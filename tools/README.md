@@ -112,7 +112,17 @@ python src/evaluation/analyze_model.py --ckpt checkpoints/supervised_v2.pt --mod
 
 평가는 항상 holdout(A)/rare(B)/randomset(C) 풀에만. 학습 풀(train_a*, rare_train*, randomset_train3)로 평가하지 말 것.
 
-## 5-1. 행동 사건 추출 + 손계산 오차 진단 (결과 예측기 1단계)
+### 5-1. 범주별 평가 (v5 합법성 입력, v6 진입 후 매치업·효과 입력)
+
+데이터는 build_fp_dataset이 서버 요청(`|request|`)으로 만든 합법 마스크를 쓰고, 행동 제약 효과 열(field_vec 뒤쪽 14열)도 같이 만든다. 옛 npz(마스크가 규칙 기반, 효과 열 없음)로는 v5/v6의 입력이 비어 있으니 다시 빌드할 것.
+```bash
+# 합법성 범주(기술 4개/2~3개/1개만/교체 봉쇄) + 제약 효과 범주(도발·앵콜 등)별 교사/학생 교체 확률, 종류 KL, 총 KL, AUC와 기준 모델 대비 차이의 판 단위 부트스트랩 95% 구간
+python tools/legal_eval.py --models v5_leg,v6_ent --base v5_leg --sets sp4=data/v6/fp_data_sp4.npz,dg5=data/v6/dg5.npz
+# 진입 후 매치업 범주(상대 +2 이상 & 천진 후보, 스텔스록 & 약점/저항 후보): 특징 포켓몬으로의 교체 질량이 교사와 얼마나 같은가 (편향·평균 |오차|)
+python tools/entry_eval.py --models v5_leg,v6_ent --base v5_leg --sets sp4=data/v6/fp_data_sp4.npz,dg5=data/v6/dg5.npz
+```
+
+### 5-2. 행동 사건 추출 + 손계산 오차 진단 (결과 예측기 1단계)
 
 자가대전 기록에서 기술/등장 사건(직전 상태 → 결과)을 뽑고, 모델의 손계산(Matchup과 같은 근사)이 실제 피해와 어디서 어긋나는지 특성/도구/기술/날씨/벽/랭크별로 집계한다.
 메커니즘 표에 무엇부터 넣을지, 학습된 보정이 얼마나 필요한지를 여기서 정한다. 사건 추출은 표준 라이브러리만 써서 빠르고, 진단만 poke-env가 필요함.
