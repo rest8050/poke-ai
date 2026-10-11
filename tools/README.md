@@ -117,9 +117,9 @@ python src/evaluation/analyze_model.py --ckpt checkpoints/supervised_v2.pt --mod
 데이터는 build_fp_dataset이 서버 요청(`|request|`)으로 만든 합법 마스크를 쓰고, 행동 제약 효과 열(field_vec 뒤쪽 14열)도 같이 만든다. 옛 npz(마스크가 규칙 기반, 효과 열 없음)로는 v5/v6의 입력이 비어 있으니 다시 빌드할 것.
 ```bash
 # 합법성 범주(기술 4개/2~3개/1개만/교체 봉쇄) + 제약 효과 범주(도발·앵콜 등)별 교사/학생 교체 확률, 종류 KL, 총 KL, AUC와 기준 모델 대비 차이의 판 단위 부트스트랩 95% 구간
-python tools/legal_eval.py --models v5_leg,v6_ent --base v5_leg --sets sp4=data/v6/fp_data_sp4.npz,dg5=data/v6/dg5.npz
+python tools/legal_eval.py --models v5_leg,v6_ent --base v5_leg --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
 # 진입 후 매치업 범주(상대 +2 이상 & 천진 후보, 스텔스록 & 약점/저항 후보): 특징 포켓몬으로의 교체 질량이 교사와 얼마나 같은가 (편향·평균 |오차|)
-python tools/entry_eval.py --models v5_leg,v6_ent --base v5_leg --sets sp4=data/v6/fp_data_sp4.npz,dg5=data/v6/dg5.npz
+python tools/entry_eval.py --models v5_leg,v6_ent --base v5_leg --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
 ```
 
 ## 6. 검증 표준 (학생 상태 홀드아웃 + 직접 대전)
