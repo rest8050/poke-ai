@@ -98,6 +98,9 @@ python src/training/build_fp_dataset.py --decisions "data/fp_selfplay/ms300/dec_
 python src/training/train_fp_distill.py --data "data/fp_selfplay/ms300/fp_data*.npz,data/fp_selfplay/ms100/fp_data*.npz" \
   --init checkpoints/supervised_v2_fp_all9.pt --out checkpoints/supervised_v2_fp_all11.pt   # 기본값: 피크 lr 2e-3 + 웜업 5% + 코사인 감쇠, 4에폭. 데이터가 ~150만 결정을 넘으면 --fp16-store
 ```
+수집이 끝난 원본 결정기록(`dec_*.jsonl`)은 `python tools/compress_raw.py <폴더>`로 압축해 보관한다(해시 검증 후 원본 삭제, 약 12배 작아짐). 빌더는 같은 패턴(`dec_sp12[abc]_*.jsonl`)으로 `.gz`도 읽는다.
+npz 데이터셋은 `savez_compressed`로 저장한다(빌더·holdout 기본). 예전 무압축 npz는 `python tools/compress_npz.py <파일들>`로 무손실 변환(배열 동일 확인 후 교체, 약 60배 작아짐, 로드 1~2초).
+
 증류는 BC에서 다시 시작하지 말고 직전 최신 모델에서 누적 전체 데이터로 이어서 학습한다 (KL 기본 0.05). KL 계수는 최적해가 (교사 + 계수 × 시작정책)/(1 + 계수) 혼합이라 크면 시작 정책 쪽으로 끌려간다 (0.3이면 교사 77% + 시작 정책 23%). `--init`과 `--out`이 같으면 덮어쓰니 다른 이름을 쓸 것.
 
 ## 5. 평가

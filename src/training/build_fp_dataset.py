@@ -26,6 +26,7 @@ while _current_dir != os.path.dirname(_current_dir):
     _current_dir = os.path.dirname(_current_dir)
 import argparse
 import glob
+import gzip
 import json
 import multiprocessing as mp
 from collections import Counter, defaultdict
@@ -40,9 +41,9 @@ GAMMA = 0.995
 
 def load_jsonl(pattern):
     """pattern: 콤마로 여러 glob 패턴 지정 가능 (train_fp_distill.py --data와 동일한 규칙)"""
-    paths = sorted({p for pat in pattern.split(",") for p in glob.glob(pat.strip())})
+    paths = sorted({p for pat in pattern.split(",") for p in glob.glob(pat.strip()) + glob.glob(pat.strip() + ".gz")})   # 압축한 원본(.jsonl.gz)도 같은 패턴으로 읽음
     for path in paths:
-        with open(path, encoding="utf-8") as f:
+        with (gzip.open(path, "rt", encoding="utf-8") if path.endswith(".gz") else open(path, encoding="utf-8")) as f:
             for line in f:
                 if line.strip():
                     r = json.loads(line)
@@ -293,7 +294,7 @@ def main(args):
     data["lens"] = np.array([len(s["action_mask"]) for s in seqs])
     data["outcome"] = np.array([s["outcome"] for s in seqs], np.float32)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    np.savez(args.out, **data)
+    np.savez_compressed(args.out, **data)
     ent = -(data["target"] * np.log(np.clip(data["target"], 1e-9, 1))).sum(-1)
     print(f"✅ {len(seqs)}판 / 결정 {int(data['lens'].sum())}개 → {args.out}")
     print(f"   Foul Play 승률(이 데이터) {np.mean(data['outcome'] > 0):.3f} | 교사 분포 평균 엔트로피 {ent.mean():.3f} | 최상위 행동 평균 확률 {data['target'].max(-1).mean():.3f}")
