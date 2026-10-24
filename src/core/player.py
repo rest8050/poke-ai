@@ -12,7 +12,7 @@ except ImportError:
 
 
 if POKE_ENV_AVAILABLE:
-    from src.core.rct_player import _id, eff_move, types
+    from src.core.effectiveness import _id, eff_move, types
     from src.core.actions import decode_action
 
     def lead_score(battle, me, opps):

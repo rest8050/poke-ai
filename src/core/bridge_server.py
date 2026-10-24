@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from poke_env.battle import Battle
 
 from src.core.model import model_from_ckpt
-from src.core.rct_player import eff_move
+from src.core.effectiveness import eff_move
 from src.core.actions import decode_action
 from src.core.tensor_encoder import BattleTensorEncoder
 

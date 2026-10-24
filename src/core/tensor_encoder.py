@@ -337,7 +337,7 @@ def move_effect_features(move_id: str) -> Tuple[float, ...]:
 
 def defender_ability(mon: Any) -> Optional[str]:
     """상성 판단용 방어측 특성: 공개됐거나 후보가 1개일 때만. 미공개면 ""(타입 상성만) — 이름 기반 세트 추정은 쓰지 않음"""
-    from src.core.rct_player import ability as known_ability
+    from src.core.effectiveness import ability as known_ability
     return known_ability(mon) or ""
 
 
@@ -414,7 +414,7 @@ def move_effectiveness(battle: Any, move: Any, defender: Any, def_ability: Optio
     """
     if defender is None or not (getattr(move, "base_power", 0) or 0):
         return 0.25
-    from src.core.rct_player import eff_move
+    from src.core.effectiveness import eff_move
     move_type = effective_move_type(battle, move)
     return min(4.0, eff_move(battle, move_type, defender, def_ability)) / 4.0
 
@@ -570,7 +570,6 @@ class BattleTensorEncoder:
     def __init__(self, vocab_path: str = "data/vocab.json", device: str = "cpu"):
         self.vocab_mgr = VocabManager.get_instance(vocab_path)
         self.device = device
-        self.blind_preview = False  # True면 팀 프리뷰로 알게 된 상대 팀을 안 씀 (마인크래프트처럼 프리뷰가 없는 환경 재현: 상대는 등장해야 보임)
 
     def encode_battle(self, battle: Any) -> Tuple[torch.Tensor, ...]:
         """
@@ -716,7 +715,7 @@ class BattleTensorEncoder:
         opp_team_list = list(battle.opponent_team.values()) if hasattr(battle, "opponent_team") else []
         n_seen = len(opp_team_list)
         seen_species = [re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", ""))) for p in opp_team_list]
-        for p in ([] if self.blind_preview else (getattr(battle, "teampreview_opponent_team", None) or [])):
+        for p in (getattr(battle, "teampreview_opponent_team", None) or []):
             sp = re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", "")))
             # ponytail: 폼 차이(프리뷰 'urshifu' vs 실제 'urshifurapidstrike')는 접두사로만 매칭
             if sp and not any(s.startswith(sp) or sp.startswith(s) for s in seen_species):

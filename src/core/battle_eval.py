@@ -12,7 +12,7 @@ potential(battle) = SHAPING_SCALE × evaluate / 100
 - 두꺼운부츠 장판 면역, 치유소원 등 slot condition 미반영
 - 상대의 공개 안 된 포켓몬은 만피·생존·도구 보유로 계산
 """
-from src.core.rct_player import _id, ability
+from src.core.effectiveness import _id, ability
 
 SHAPING_SCALE = 0.2
 

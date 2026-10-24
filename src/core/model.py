@@ -31,20 +31,6 @@ def load_vocab_sizes(vocab_path: str = "data/vocab.json"):
     return defaults
 
 
-def zero_unseen_id_rows(model: nn.Module, path: str = "data/entity_features.npz") -> int:
-    """학습 팀 풀에 한 번도 안 나온 도구/특성/기술의 ID 임베딩 행(무작위 초기값)을 0으로 → 미등장 개체는 특징으로만 표현"""
-    z, n = np.load(path), 0
-    emb = model.embeddings
-    with torch.no_grad():
-        for kind in ("item", "ability", "move"):
-            w = getattr(emb, f"{kind}_embed").weight
-            unseen = torch.from_numpy(z[f"{kind}_seen"] == 0).to(w.device)
-            unseen[0] = False
-            w[unseen] = 0.0
-            n += int(unseen.sum())
-    return n
-
-
 def load_compatible(model: nn.Module, state: dict):
     """
     체크포인트 부분 로드.
