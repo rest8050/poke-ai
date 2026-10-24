@@ -79,7 +79,7 @@ async def worker(a):
         chunk += 1
 
         def make(model, suffix):
-            p = Player(mode="argmax", model=model, search_lambda=None, battle_format="gen9ou", server_configuration=server,
+            p = Player(mode="argmax", model=model, battle_format="gen9ou", server_configuration=server,
                        account_configuration=AccountConfiguration(f"w{a.run}{a.idx}{chunk % 100}{suffix}", None),
                        max_concurrent_battles=a.concurrent)
             p._team = RandomPoolTeambuilder(exports)

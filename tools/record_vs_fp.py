@@ -39,7 +39,7 @@ async def main(fp_user, n, ckpt, out, pool_path):
     exports = [t["export"] for t in json.load(open(pool_path, encoding="utf-8-sig"))["teams"]]
     model = model_from_ckpt(ckpt)
     model.eval()
-    me = VsFpPlayer(exports=exports, mode="argmax", model=model, search_lambda=None,
+    me = VsFpPlayer(exports=exports, mode="argmax", model=model,
                     account_configuration=AccountConfiguration(f"bc{fp_user[2:]}", None), battle_format="gen9ou",
                     server_configuration=LocalhostServerConfiguration, max_concurrent_battles=1)
     me._team = RandomPoolTeambuilder(exports)

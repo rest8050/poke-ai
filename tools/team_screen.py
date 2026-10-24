@@ -75,7 +75,7 @@ async def worker(a):
             continue
 
         def make(suffix, exports):
-            p = Player(mode="argmax", model=model, search_lambda=None, battle_format="gen9ou", server_configuration=server,
+            p = Player(mode="argmax", model=model, battle_format="gen9ou", server_configuration=server,
                        account_configuration=AccountConfiguration(f"s{a.stage}{a.idx}x{n % 1000}{suffix}", None), max_concurrent_battles=a.concurrent)
             p._team = RandomPoolTeambuilder(exports)
             return p

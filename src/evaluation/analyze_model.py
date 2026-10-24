@@ -2,16 +2,16 @@
 모델 전체 로그 수집 + 패배 분석.
 
 체크포인트로 N판을 돌리며 매 턴 결정(합법 행동별 확률, 가치, 상성, 테라)과
-배틀 전체 프로토콜 로그, 상대의 실제 팀(세트 추론 정확도 검증용)을 저장하고 요약한다.
+배틀 전체 프로토콜 로그, 상대의 실제 팀을 저장하고 요약한다.
 
 사용 예:
   python src/evaluation/analyze_model.py --battles 200 --opponent rct
-  python src/evaluation/analyze_model.py --mode argmax --search 0.5 --replays
+  python src/evaluation/analyze_model.py --mode argmax --replays
   python src/evaluation/analyze_model.py --pool data/team_pool_rare.json   # 기본은 Metamon 평가 전용 500팀(holdout), 낯선 파티는 rare/randomset
 
 출력: logs/analysis_<시각>/
   turns.jsonl    턴별 결정 로그
-  battles.jsonl  배틀별 결과/팀/선두/세트 추론 정확도/원본 프로토콜 로그
+  battles.jsonl  배틀별 결과/팀/선두/원본 프로토콜 로그
   summary.json   집계 (콘솔에도 출력)
   replays/       --replays 시 Showdown HTML 리플레이
 """
@@ -43,8 +43,7 @@ from src.core.battle_eval import potential
 from src.core.model import DeepPokemonBattleTransformerNet, load_compatible, zero_unseen_id_rows
 from src.core.player import SmartPokemonPlayer
 from src.core.rct_player import RCTBattleAIPlayer, _id, eff_move
-from src.core.search import decode_action, search_pick
-from src.core.set_prior import predict as predict_set
+from src.core.actions import decode_action
 from src.core.team_pool import RandomPoolTeambuilder, load_team_pool
 
 warnings.filterwarnings("ignore")
@@ -111,9 +110,6 @@ class LoggingPlayer(SmartPokemonPlayer):
         probs = probs[0]
         if self.mode == "sample":
             policy_idx = int(torch.multinomial(probs, 1).item())
-        chosen = policy_idx
-        if self.search_lambda is not None:
-            chosen = search_pick(battle, probs, self.search_lambda) or policy_idx
 
         me, opp = battle.active_pokemon, battle.opponent_active_pokemon
         legal = []
@@ -126,41 +122,19 @@ class LoggingPlayer(SmartPokemonPlayer):
         by_idx = {e["idx"]: e for e in legal}
         damaging = [e for e in legal if "eff" in e]
         best_eff = max((e["eff"] for e in damaging), default=None)
-        d = decode_action(battle, chosen)
+        d = decode_action(battle, policy_idx)
         entropy = -(probs[probs > 0] * probs[probs > 0].log()).sum().item()
 
         self.turn_logs[tag].append({
             "battle": tag, "turn": battle.turn, "me": mon_state(me, True), "opp": mon_state(opp, False),
             "forced_switch": not bool(mask[:8].any()),
             "legal": sorted(legal, key=lambda e: -e["p"]),
-            "chosen": {"idx": chosen, "name": action_name(d), "p": by_idx.get(chosen, {}).get("p"),
-                       "eff": by_idx.get(chosen, {}).get("eff")},
-            "policy_choice": policy_idx, "search_changed": chosen != policy_idx,
+            "chosen": {"idx": policy_idx, "name": action_name(d), "p": by_idx.get(policy_idx, {}).get("p"),
+                       "eff": by_idx.get(policy_idx, {}).get("eff")},
             "value": round(value, 4), "phi": round(potential(battle), 4), "entropy": round(entropy, 4), "best_eff": best_eff,
             "opp_item_guessed": bool(opp_num[:, 19].any()), "fallback": d is None,
         })
-        return self.order_for(battle, chosen) or self.choose_random_move(battle)
-
-
-def prior_accuracy(opp_true_team, tera_by_species):
-    """팀 프리뷰 시점(공개 정보 없음) 추론 vs 상대 실제 세트"""
-    item_hit = item_n = move_hit = move_n = tera_hit = tera_n = 0
-    for mon in opp_true_team:
-        p = predict_set(mon.species)
-        if not p:
-            continue
-        if p["item"] and mon.item:
-            item_n += 1
-            item_hit += p["item"] == _id(mon.item)
-        true_moves = {_id(m) for m in mon.moves}
-        if true_moves:
-            move_n += len(true_moves)
-            move_hit += len(true_moves & set(p["moves"][:4]))
-        true_tera = tera_by_species.get(norm(mon.species))
-        if p["tera"] and true_tera:
-            tera_n += 1
-            tera_hit += p["tera"] == norm(true_tera)
-    return {"item": [item_hit, item_n], "moves": [move_hit, move_n], "tera": [tera_hit, tera_n]}
+        return self.order_for(battle, policy_idx) or self.choose_random_move(battle)
 
 
 def auc(pairs):
@@ -203,8 +177,6 @@ def summarize(battles, turns):
         key = f'{b["my_team"]} vs {b["opp_team"]}'
         by_matchup[key][0] += b["won"]; by_matchup[key][1] += 1
 
-    acc = {k: [sum(b["prior_accuracy"][k][0] for b in battles), sum(b["prior_accuracy"][k][1] for b in battles)]
-           for k in ("item", "moves", "tera")}
     first_values = {b["battle"]: b["first_value"] for b in battles if b["first_value"] is not None}
     won_v = [v for b in battles if b["won"] for v in [first_values.get(b["battle"])] if v is not None]
     lost_v = [v for b in battles if not b["won"] for v in [first_values.get(b["battle"])] if v is not None]
@@ -227,7 +199,6 @@ def summarize(battles, turns):
         "chose_immune_move": rate([t for t in attacks if t["chosen"]["eff"] == 0], attacks),
         "chose_resisted_when_neutral_available": rate(
             [t for t in attacks if t["chosen"]["eff"] < 1 and t["best_eff"] >= 1], attacks),
-        "search_changed_rate": rate([t for t in decisions if t["search_changed"]], decisions),
         "fallback_rate": rate([t for t in turns if t["fallback"]], turns),
         "avg_entropy": round(sum(t["entropy"] for t in decisions) / max(1, len(decisions)), 3),
         "tera_used_battles": rate([b for b in battles if b["tera_turn"] is not None], battles),
@@ -236,7 +207,6 @@ def summarize(battles, turns):
             [b for b in battles if b["tera_turn"] is not None], [b for b in battles if b["tera_turn"] is None])],
         "value_turn1_mean_won_lost": [round(sum(won_v) / max(1, len(won_v)), 3), round(sum(lost_v) / max(1, len(lost_v)), 3)],
         "value_auc_by_phase": value_auc(battles, turns),
-        "prior_accuracy": {k: round(h / max(1, t), 3) for k, (h, t) in acc.items()},
         "team_win_rate": {k: [w, t] for k, (w, t) in sorted(team_wr.items(), key=lambda kv: kv[1][0] / kv[1][1])},
         "worst_leads": sorted(([k, w, t] for k, (w, t) in by_lead.items() if t >= 3), key=lambda x: x[1] / x[2])[:5],
     }
@@ -266,7 +236,7 @@ async def play(args, n_battles, wid, out_dir):
     tag = f"{wid}x{int(time.time()) % 100000}"  # 워커마다 다른 계정 (Showdown 이름 18자 제한)
     common = dict(battle_format=args.format, server_configuration=LocalhostServerConfiguration,
                   max_concurrent_battles=args.concurrent)
-    me = LoggingPlayer(model=model, mode=args.mode, search_lambda=args.search,
+    me = LoggingPlayer(model=model, mode=args.mode,
                        save_replays=os.path.join(out_dir, "replays") if args.replays else False,
                        account_configuration=AccountConfiguration(f"ana{tag}", None), **common)
     me.encoder.blind_preview = bool(args.blind)
@@ -299,7 +269,6 @@ async def play(args, n_battles, wid, out_dir):
             "my_left": sum(not m.fainted for m in b.team.values()),
             "opp_left": 6 - sum(m.fainted for m in b.opponent_team.values()),
             "first_value": logs[0]["value"] if logs else None,
-            "prior_accuracy": prior_accuracy(opp_true, opp_tera),
             "opp_true_team": [{"species": m.species, "item": m.item, "ability": m.ability,
                                "tera": opp_tera.get(norm(m.species)), "moves": list(m.moves)} for m in opp_true],
             "protocol": ["|".join(msg) for msg in b._replay_data],
@@ -343,7 +312,7 @@ def main(args):
             ft.write(json.dumps(t, ensure_ascii=False) + "\n")
 
     summary = summarize(battles, turns)
-    summary.update(opponent=args.opponent, mode=args.mode, search=args.search, ckpt=args.ckpt, pool=args.pool)
+    summary.update(opponent=args.opponent, mode=args.mode, ckpt=args.ckpt, pool=args.pool)
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -366,7 +335,6 @@ if __name__ == "__main__":
     ap.add_argument("--opponent", default="rct", choices=list(OPPONENTS))
     ap.add_argument("--battles", type=int, default=200)
     ap.add_argument("--mode", default="sample", choices=["sample", "argmax"], help="sample=학습과 같은 확률 샘플링")
-    ap.add_argument("--search", type=float, default=None, help="1턴 탐색 혼합 λ (생략하면 정책만)")
     ap.add_argument("--concurrent", type=int, default=8, help="워커 하나당 동시 배틀 수")
     ap.add_argument("--workers", type=int, default=4, help="배틀을 나눠 돌릴 프로세스 수")
     ap.add_argument("--replays", action="store_true", help="Showdown HTML 리플레이도 저장")

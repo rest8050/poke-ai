@@ -65,7 +65,7 @@ class RecordingPlayer(LoggingPlayer):
 def make(ckpt, name, exports, mode):
     model = model_from_ckpt(ckpt)
     model.eval()
-    p = RecordingPlayer(exports=exports, mode=mode, model=model, search_lambda=None,
+    p = RecordingPlayer(exports=exports, mode=mode, model=model,
                         account_configuration=AccountConfiguration(name, None), battle_format="gen9ou",
                         server_configuration=LocalhostServerConfiguration, max_concurrent_battles=8)
     p._team = RandomPoolTeambuilder(exports)
