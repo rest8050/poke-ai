@@ -119,6 +119,8 @@ npz 데이터셋은 `savez_compressed`로 저장한다(빌더·holdout 기본). 
 python tools/legal_eval.py --models v4_full_tv,v6_full --base v4_full_tv --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
 # 진입 후 매치업 범주(상대 +2 이상 & 천진 후보, 스텔스록 & 약점/저항 후보): 특징 포켓몬으로의 교체 질량이 교사와 얼마나 같은가 (편향·평균 |오차|)
 python tools/entry_eval.py --models v4_full_tv,v6_full --base v4_full_tv --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
+# 필드/도구/상태 범주(트릭룸, 순풍, 벽, 날씨, 지형, 구애·증폭 도구, 마비)별 KL과 일치율을 나머지와 비교 (학습에 안 쓴 학생 상태 세트만 쓸 것)
+python tools/field_eval.py --models v6_full --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
 ```
 
 ## 6. 검증 표준 (학생 상태 홀드아웃 + 직접 대전)
