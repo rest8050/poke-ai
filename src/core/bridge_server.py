@@ -2,7 +2,7 @@
 
 모드(mod/pokeai)가 BattleAI.choose()가 불릴 때마다 Cobblemon이 쌓은 Showdown 원본 메시지 덩어리(update / sideupdate)를 보내면,
 1) 우리 쪽 정보만 남기고(상대의 sideupdate·비밀 줄 제거) 표준 Showdown 형식으로 정규화하고 (Cobblemon은 포켓몬 이름 자리에 UUID를 씀)
-2) poke-env Battle에 반영 → 학습 때와 같은 인코더 → 신경망(all8a) → 행동 하나를 돌려준다.
+2) poke-env Battle에 반영 → 학습 때와 같은 인코더 → 신경망 → 행동 하나를 돌려준다.
 행동은 {"kind": "move", "id", "tera"} / {"kind": "switch", "uuid"} / {"kind": "default"}.
 
 실행: python -m src.core.bridge_server            (기본 127.0.0.1:8765)
@@ -33,7 +33,7 @@ from src.core.rct_player import eff_move
 from src.core.search import decode_action
 from src.core.tensor_encoder import BattleTensorEncoder
 
-CKPT = os.environ.get("POKEAI_CKPT", "checkpoints/supervised_v2_fp_all8a.pt")      # 포인터 파일이 없을 때 쓰는 기본값
+CKPT = os.environ.get("POKEAI_CKPT", "checkpoints/supervised_v2_fp_v6_full.pt")      # 포인터 파일이 없을 때 쓰는 기본값
 POINTER = os.environ.get("POKEAI_POINTER", "checkpoints/CURRENT")                   # 한 줄: 체크포인트 파일 이름(포인터와 같은 폴더) 또는 경로
 RECHECK_SEC = 5.0
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"

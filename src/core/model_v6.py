@@ -17,7 +17,7 @@
 6) 히스토리: 턴 요약 = [CLS, 내 활성 토큰, 상대 활성 토큰, 필드/직전 사건 벡터]을 인과 트랜스포머로 요약
 7) 미공개 기술 칸도 토큰으로 유지 (빈 슬롯만 마스킹) + 포켓몬 토큰에 공개된 기술 수/4
 8) my_pos=False: 내 쪽 팀 슬롯/기술 칸 위치 임베딩을 끔 → 내 팀 순서 순열에 대해 정확히 대칭 (순서가 팀 지문 통로가 되는 것을 막음). 상대 쪽은 공개된 순서라 유지
-인터페이스: forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt. 옛 구조는 model_v3_legacy.py / model_v4_legacy.py (퇴역 시 삭제)
+인터페이스: forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt. 옛 구조는 model_v4_legacy.py (퇴역 시 삭제)
 arch: {"model": "v6", "my_pos": false}"""
 import torch
 import torch.nn as nn

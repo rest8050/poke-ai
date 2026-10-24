@@ -592,8 +592,8 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
 
 def build_model(cfg: dict) -> nn.Module:
-    """구조 인자로 모델 생성: model 키가 v6(model_v6.py, 현행)/v4(model_v4_legacy.py)/v3(model_v3_legacy.py)이면 엔티티 토큰 모델, 없으면 v1 구조(DeepPokemonBattleTransformerNet).
-    v4/v3 구조는 서버 탑재 체크포인트(v4_full_tv, v3_full) 호환 전용이라 퇴역 시 삭제."""
+    """구조 인자로 모델 생성: model 키가 v6(model_v6.py, 현행)/v4(model_v4_legacy.py)이면 엔티티 토큰 모델, 없으면 v1 구조(DeepPokemonBattleTransformerNet).
+    v4 구조는 롤백용 체크포인트(v4_full_tv) 호환 전용이라 퇴역 시 삭제."""
     cfg = dict(cfg)
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
@@ -602,17 +602,11 @@ def build_model(cfg: dict) -> nn.Module:
     if kind == "v6":                                     # 현행 구조
         from src.core.model_v6 import EntityPokemonNetV6
         return EntityPokemonNetV6(**cfg)
-    if kind == "v4":                                     # v4_full_tv(서버 탑재) 호환 전용, 퇴역 시 삭제
+    if kind == "v4":                                     # v4_full_tv(서버 롤백용) 호환 전용, 퇴역 시 삭제
         from src.core.model_v4_legacy import EntityPokemonNetV4Legacy
         return EntityPokemonNetV4Legacy(**cfg)
-    if kind == "v3":
-        if cfg.pop("version", 1) >= 3:                   # v3 구조(version 3)는 v4 이상이 대체해 제거됨
-            raise ValueError("v3 구조(version 3)는 제거됨: v4 이상을 쓸 것")
-        from src.core.model_v3_legacy import EntityPokemonNetV3Legacy      # v3_full(서버 탑재) 호환 전용, 퇴역 시 삭제
-        for k, default in (("unrevealed_tokens", False), ("opp_species", False), ("policy", "hier"), ("hidden_head", False), ("belief", False)):   # 제거된 옵션
-            if cfg.pop(k, default) != default:
-                raise ValueError(f"제거된 옵션 {k}를 쓰는 v3 체크포인트는 더 이상 로드할 수 없음")
-        return EntityPokemonNetV3Legacy(**{k: v for k, v in cfg.items() if k not in ("species_dropout", "species_dim", "belief_hidden", "belief_species_dropout")})
+    if kind != "v1":
+        raise ValueError(f"지원하지 않는 구조: {kind}")
     return DeepPokemonBattleTransformerNet(**cfg)
 
 
