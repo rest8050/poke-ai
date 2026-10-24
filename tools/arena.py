@@ -52,7 +52,7 @@ async def worker(a):
     from poke_env.concurrency import POKE_LOOP
     import json
     from src.core.model import model_from_ckpt
-    from src.evaluation.analyze_model import LoggingPlayer
+    from src.evaluation.logging_player import LoggingPlayer
     from src.core.team_pool import RandomPoolTeambuilder
 
     pool_name, pool_path = a.pool.split("=", 1)
