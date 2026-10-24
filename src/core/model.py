@@ -578,14 +578,17 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
 
 def build_model(cfg: dict) -> nn.Module:
-    """구조 인자로 모델 생성: model 키가 v6(model_v6.py, 현행)/v4(model_v4_legacy.py)이면 엔티티 토큰 모델, 없으면 v1 구조(DeepPokemonBattleTransformerNet).
+    """구조 인자로 모델 생성: model 키가 v7(model_v7.py)/v6(model_v6.py, 서버 탑재)/v4(model_v4_legacy.py)이면 엔티티 토큰 모델, 없으면 v1 구조(DeepPokemonBattleTransformerNet).
     v4 구조는 롤백용 체크포인트(v4_full_tv) 호환 전용이라 퇴역 시 삭제."""
     cfg = dict(cfg)
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
     kind = cfg.pop("model", "v1")
-    if kind == "v6":                                     # 현행 구조
+    if kind == "v7":                                     # v6 + 특성 EXEC 규칙(matchup_v7) + 합법 요약 슬롯 순서 통로 제거
+        from src.core.model_v7 import EntityPokemonNetV7
+        return EntityPokemonNetV7(**cfg)
+    if kind == "v6":                                     # 서버 탑재 구조
         from src.core.model_v6 import EntityPokemonNetV6
         return EntityPokemonNetV6(**cfg)
     if kind == "v4":                                     # v4_full_tv(서버 롤백용) 호환 전용, 퇴역 시 삭제
