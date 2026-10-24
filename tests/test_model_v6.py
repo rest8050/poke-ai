@@ -54,13 +54,13 @@ with torch.no_grad():
             hs = out["history_state"]; step.append(out["policy_logits"][0])
     base = fs(model)
     assert torch.allclose(base, torch.stack(step), atol=1e-4)
-    # 2) 폭 호환: v6에 옛 폭(58) 데이터 == 효과 열이 0인 새 폭 데이터 / v5는 새 열을 버려 값이 같음
+    # 2) 폭 호환: v6에 옛 폭(58) 데이터 == 효과 열이 0인 새 폭 데이터 / v4(옛 구조)는 새 열을 버려 값이 같음
     old_w = EFFECT_START
     zero_eff = flat[:6] + [torch.cat([flat[6][:, :old_w], torch.zeros(len(mask), FIELD_DIM - old_w)], 1)]
     short = flat[:6] + [flat[6][:, :old_w]]
     assert torch.allclose(fs(model, short), fs(model, zero_eff), atol=1e-5)
-    v5 = build_model({"model": "v5", **small}).eval()
-    assert torch.allclose(fs(v5, short), fs(v5, flat), atol=1e-5), "v5가 field_vec 뒤쪽 새 열의 영향을 받음"
+    v4 = build_model({"model": "v4", **small}).eval()
+    assert torch.allclose(fs(v4, short), fs(v4, flat), atol=1e-5), "v4가 field_vec 뒤쪽 새 열의 영향을 받음"
     # 3) 효과 열은 v6 출력에 영향
     no_eff = flat[:6] + [torch.cat([flat[6][:, :old_w], torch.zeros(len(mask), FIELD_DIM - old_w)], 1)]
     assert not torch.allclose(fs(model), fs(model, no_eff)), "효과 열이 v6 출력에 안 닿음"

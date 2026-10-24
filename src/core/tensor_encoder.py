@@ -224,7 +224,7 @@ _DISRUPT = {"taunt", "encore", "disable", "torment", "healblock", "imprison", "t
 # (thunderclap: 상대가 공격기가 아니면 우선도 0으로 처리됨 / suckerpunch, upperhand: 조건 불충족 시 기술 자체가 실패).
 # 명목 priority 피처(4번)는 그대로 두고, "이 값은 상대 선택에 달려 있어 불확실하다"는 플래그만 따로 추가함
 # (날씨볼처럼 관측 가능한 상태에서 정답을 계산해 넣는 것과 달리, 상대의 동시 선택은 관측 불가능해 정답을 못 만듦 —
-#  대신 모델이 이미 갖고 있는 상대 행동 예측(opp_action_head)과 엮어 스스로 위험도를 배우게 유도하는 용도).
+#  대신 불확실 플래그만 넣어 모델이 스스로 위험도를 배우게 유도하는 용도).
 _CONDITIONAL_PRIORITY = {"thunderclap", "suckerpunch", "upperhand"}
 _RESIDUAL = {"leechseed", "saltcure", "partiallytrapped", "nightmare"}
 _HAZARDS = {"stealthrock", "spikes", "toxicspikes", "stickyweb"}

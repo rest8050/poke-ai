@@ -1,4 +1,4 @@
-"""모델 v5(합법성 입력) self-check (v4 항목은 test_model_v4.py): PYTHONPATH=. python tests/test_model_v5.py
+"""모델 v6의 합법성 입력 self-check (공통 구조는 test_model_v6_core.py): PYTHONPATH=. python tests/test_model_v6_legal.py
 1) 롤아웃 == 학습(forward_sequences), 2) legal_mask를 안 주면 action_mask를 씀, 3) 합법 비트가 출력에 영향 (기술 하나만 가능 / 교체 봉쇄),
 4) 합법성 요약(기술 수·한 개만 가능·고정 의심·잃은 화력) 값, 5) 가지치기 마스크와 순수 합법 마스크를 따로 줄 수 있음, 6) 체크포인트 왕복"""
 import os
@@ -24,9 +24,9 @@ def random_obs(n, gen):
 
 torch.manual_seed(0)
 gen = torch.Generator().manual_seed(0)
-cfg = {"model": "v5", "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64, "my_pos": False}
+cfg = {"model": "v6", "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64, "my_pos": False}
 model = build_model(cfg).eval()
-assert type(model).__name__ == "EntityPokemonNetV5" and model.uses_legal
+assert type(model).__name__ == "EntityPokemonNetV6" and model.uses_legal
 lengths = [5, 3]
 obs = [random_obs(L, gen) for L in lengths]
 masks = []
@@ -76,7 +76,7 @@ with tempfile.TemporaryDirectory() as td:
     path = os.path.join(td, "m.pt")
     save_ckpt(model, path)
     m2 = model_from_ckpt(path).eval()
-    assert type(m2).__name__ == "EntityPokemonNetV5" and m2.cfg == model.cfg
+    assert type(m2).__name__ == "EntityPokemonNetV6" and m2.cfg == model.cfg
     with torch.no_grad():
         assert torch.allclose(m2.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask)["policy_logits"], base, atol=1e-5)
-print("model v5 OK")
+print("model v6 legal OK")

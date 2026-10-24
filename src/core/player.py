@@ -73,7 +73,7 @@ if POKE_ENV_AVAILABLE:
 
             # 2. 신경망 추론 (+ 선택적 1턴 탐색)
             tag = battle.battle_tag
-            action_idx, p_probs, opp_p_probs, val, self.history[tag] = self.model.get_action(
+            action_idx, p_probs, val, self.history[tag] = self.model.get_action(
                 my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, self.history.get(tag), action_mask, legal_mask
             )
             if self.search_lambda is not None:

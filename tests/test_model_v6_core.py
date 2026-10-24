@@ -1,4 +1,4 @@
-"""엔티티 토큰 모델 v4 self-check (v3 설계에서 이어진 1~7 + v4 전용 8): PYTHONPATH=. python tests/test_model_v4.py
+"""엔티티 토큰 모델 v6의 공통 구조 self-check (1~7 공통 + 8 숨은 기술 후보/능력치 예측): PYTHONPATH=. python tests/test_model_v6_core.py
 1) 롤아웃(한 턴씩) == 학습(forward_sequences), 2) 인과성, 3) 빈 슬롯 입력은 출력에 영향 없음 / 공개된 기술 수와 미공개 칸 내용은 영향,
 4) 기술/후보 정보와 상대 기술 위력이 교체 점수에 반영, 5) 신념: 상대 종 ID는 신념에만 쓰이고 내 쪽 종 ID는 무시, 정책/가치 손실은 신념에 안 닿고 숨김정보 손실은 신념 밖에 안 닿음,
 6) 기술 속성 표, 7) 체크포인트 왕복, 8) 상위 8개 후보 구조(가중치 범위/공개 후 0), 숨은 기술 예측과 노력치 예측이 정책에 반영"""
@@ -27,7 +27,7 @@ def random_obs(n, gen):
 
 torch.manual_seed(0)
 gen = torch.Generator().manual_seed(0)
-model = build_model({"model": "v4", "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
+model = build_model({"model": "v6", "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
 print(f"파라미터 {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M (테스트용 소형)")
 
 lengths = [5, 9, 1, 3]
@@ -118,12 +118,12 @@ assert abs(float(t[i, 0]) - 0.5) < 1e-6 and abs(float(t[i, 4]) - 0.33) < 1e-6 an
 path = os.path.join(tempfile.mkdtemp(), "m.pt")
 save_ckpt(model, path)
 m2 = model_from_ckpt(path).eval()
-assert type(m2).__name__ == "EntityPokemonNetV4" and m2.cfg == model.cfg
+assert type(m2).__name__ == "EntityPokemonNetV6" and m2.cfg == model.cfg
 with torch.no_grad():
     assert torch.allclose(m2.forward_sequences(obs[0], Z(5), torch.arange(5), 1, masks[0])["policy_logits"], base_o, atol=1e-6)
 
 # 8) v4 전용: 후보 구조, 숨은 기술/노력치 예측이 정책에 반영
-from src.core.model_v4 import K_GUESS
+from src.core.model_v6 import K_GUESS
 with torch.no_grad():
     o = obs[0]
     bl = model.belief(o[3], o[4])
@@ -144,17 +144,18 @@ with torch.no_grad():
     g2 = {"idx": gs["idx"], "w": torch.zeros_like(gs["w"]), "pseudo": torch.zeros_like(gs["pseudo"])}
     g2["pseudo"][:, :, 0, 0], g2["pseudo"][:, :, 0, 4], g2["pseudo"][:, :, 0, 6] = 1.0, 0.33, 1 / 20      # 위력 200 물리 노말기 하나
     o2 = [t.clone() for t in o]; o2[1][:, :, 1] = 0; o2[1][:, :, 2] = 1.0; o2[1][:, :, 11:17] = 0.2; o2[4][:, :, 1] = 0; o2[4][:, :, 11:17] = 0.6        # 내 쪽 전원 생존/풀피/낮은 능력치, 상대 쪽 생존/높은 능력치 → 확정 KO
-    one = lambda w: model._matchup_feats4(o2[0], o2[1], o2[2], o2[3], o2[4], o2[5], {**g2, "w": g2["w"].index_fill(-1, torch.tensor([0]), w)},
-                                          torch.ones(5, 6, 6), torch.zeros(5, 6, 6))[2][:, 0, 1]                  # [B,2] (내 0번, 상대 1번)
+    one = lambda w: model._matchup_feats(o2[0], o2[1], o2[2], o2[3], o2[4], o2[5], {**g2, "w": g2["w"].index_fill(-1, torch.tensor([0]), w)},
+                                          torch.ones(5, 6, 6), torch.zeros(5, 6, 6), torch.zeros(5, FIELD_DIM))[2][:, 0, 1]                  # [B,2] (내 0번, 상대 1번)
     hi, lo = one(0.3), one(0.1)
     assert torch.allclose(hi[:, 0], torch.full((5,), 0.3), atol=1e-5) and hi[:, 1].min() > 0, "확정 KO 30% -> P_KO 0.3, 그럴듯한 최대 데미지는 확률 가중 없이 그대로"
     assert torch.allclose(lo[:, 0], torch.full((5,), 0.1), atol=1e-5) and (lo[:, 1] == 0).all(), "w < 0.15면 그럴듯한 후보에서 제외"
     # my_pos=False: 내 팀 슬롯 순서를 바꾸면 교체 점수도 같은 순열로 바뀌고 나머지는 그대로
-    mp = build_model({"model": "v4", "my_pos": False, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
+    mp = build_model({"model": "v6", "my_pos": False, "d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64}).eval()
     perm = torch.tensor([3, 0, 5, 1, 4, 2]); oo = obs[0]
     ob2 = [oo[0][:, perm], oo[1][:, perm], oo[2][:, perm]] + oo[3:]
-    a1 = mp.forward_sequences(oo, Z(5), torch.arange(5), 1, masks[0])["policy_logits"]
-    a2 = mp.forward_sequences(ob2, Z(5), torch.arange(5), 1, masks[0][:, [0, 1, 2, 3, 4, 5, 6, 7] + [8 + int(i) for i in perm] + list(range(14, 22))])["policy_logits"]
+    msym = masks[0].clone(); msym[:, 8:14] = True       # 교체 비트가 전부 켜진 마스크로만 정확히 대칭 (합법성 요약의 합법 비트 14개에 교체 6칸이 슬롯 순서대로 들어 있어, 일부만 꺼지면 순서 통로가 됨)
+    a1 = mp.forward_sequences(oo, Z(5), torch.arange(5), 1, msym)["policy_logits"]
+    a2 = mp.forward_sequences(ob2, Z(5), torch.arange(5), 1, msym)["policy_logits"]
     assert torch.allclose(a2[:, 8:14], a1[:, 8:14][:, perm], atol=1e-4), "내 팀 순서를 바꾸면 교체 점수도 같은 순열이어야 함"
     assert mp.cfg["my_pos"] is False and model.cfg["my_pos"] is True
-print("model v4 OK: 롤아웃 == 시퀀스, 인과성, 패딩/미공개 칸, 매치업 반영, 신념 격리, 기술 표, 체크포인트 왕복, 상위 8개 후보, 숨은 기술/능력치 예측 반영")
+print("model v6 core OK: 롤아웃 == 시퀀스, 인과성, 패딩/미공개 칸, 매치업 반영, 신념 격리, 기술 표, 체크포인트 왕복, 상위 8개 후보, 숨은 기술/능력치 예측 반영")

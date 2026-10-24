@@ -63,7 +63,6 @@ class EntityPokemonNetV3Legacy(nn.Module):
         is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
         is_switch[8:14] = True
         self.register_buffer("is_switch", is_switch, persistent=False)
-        self.opp_action_head = nn.Sequential(nn.Linear(latent_dim, 128), nn.GELU(), nn.Linear(128, self.ACTION_DIM))
         self.value_head = nn.Sequential(nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, 1))
 
     # ---- 매치업 요약 ----
@@ -146,7 +145,7 @@ class EntityPokemonNetV3Legacy(nn.Module):
     def _turn_vec(enc):
         return torch.cat([enc["cls"], enc["active_mon"], enc["opp_active_mon"], enc["field"]], -1)
 
-    def _heads(self, enc, history, action_mask=None, opp_action_mask=None):
+    def _heads(self, enc, history, action_mask=None):
         B = history.size(0)
         latent = self.fusion(torch.cat([enc["cls"], history], -1))
         cand = enc["cand"]                                                       # [B,6,9]
@@ -170,17 +169,14 @@ class EntityPokemonNetV3Legacy(nn.Module):
         lp_move = F.log_softmax(detail.masked_fill(self.is_switch, -1e9), -1)
         lp_switch = F.log_softmax(detail.masked_fill(~self.is_switch, -1e9), -1)
         policy_logits = torch.where(self.is_switch, lp_type[:, 1:2] + lp_switch, lp_type[:, 0:1] + lp_move)
-        opp = self.opp_action_head(latent)
-        if opp_action_mask is not None:
-            opp = opp.masked_fill(~opp_action_mask, -1e9)
-        return {"policy_logits": policy_logits, "opp_action_logits": opp, "value": self.value_head(latent)}
+        return {"policy_logits": policy_logits, "value": self.value_head(latent)}
 
     def forward(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec,
-                history_state=None, action_mask=None, opp_action_mask=None):
+                history_state=None, action_mask=None):
         enc = self._encode_turn(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec)
         cur = self._turn_vec(enc).unsqueeze(1)
         seq = cur if history_state is None else torch.cat([history_state.to(cur.dtype), cur], dim=1)
-        out = self._heads(enc, self._history(seq)[:, -1], action_mask, opp_action_mask)
+        out = self._heads(enc, self._history(seq)[:, -1], action_mask)
         out["history_state"] = seq
         return out
 
@@ -190,7 +186,6 @@ class EntityPokemonNetV3Legacy(nn.Module):
         T = int(time_index.max().item()) + 1
         turn_seq = tv.new_zeros(n_seq, T, tv.size(-1))
         turn_seq[seq_index, time_index] = tv
-        return self._heads(enc, self._history(turn_seq)[seq_index, time_index], action_mask, None)
+        return self._heads(enc, self._history(turn_seq)[seq_index, time_index], action_mask)
 
     get_action = DeepPokemonBattleTransformerNet.get_action
-    get_action_rl = DeepPokemonBattleTransformerNet.get_action_rl
