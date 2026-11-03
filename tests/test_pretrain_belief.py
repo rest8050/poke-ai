@@ -1,4 +1,4 @@
-"""신념 사전학습 self-check: PYTHONPATH=. python tests/test_pretrain_belief.py
+"""세트 추정 사전학습 self-check: PYTHONPATH=. python tests/test_pretrain_belief.py
 1) 부분 관측: 공개된 기술만 입력에 보이고 나머지는 숨김 ID, 정답은 안 드러난 기술(완전한 세트 - 공개분) 2) 손실/통계 형태
 3) 팀 파싱(별명, 성별, 종 이름), 노력치/성격 라벨"""
 import torch

@@ -3,6 +3,7 @@
 
 battle.parse_message를 한 번 감싸서 리플레이 재생 / 실전 / Foul Play 데이터 변환이 모두 같은 경로로 채움.
 - 턴 사건 (TURN_DIM=10, field_vec 뒤에 붙음): 직전 턴에 누가 움직였고 누가 먼저였는지, 서로 준 피해(% HP), 급소/상성
+- 도구/특성 공개와 추론, 마지막 사용 기술, 등장 후 쓴 기술, 소원/미래예지, 합성 휘발성 효과: reveals.py (Foul Play의 추적 규칙을 옮긴 것)
 - 상대 슬롯별 증거 (SLOT_DIM=8, 상대 팀 수치 뒤에 붙음):
     공격 잔차 / 방어 잔차 = log(관측 피해 / 표준 세트 예상 피해)의 평균 → 구애/생명의구슬/노력치/내구 도구 단서
     속도 구간 [하한, 상한] = 행동 순서에서 얻은 "표준 대비 속도 배율" 범위 → 스카프/속도 노력치 단서
@@ -12,11 +13,15 @@ ponytail: 날씨/벽/특성/아이템 보정과 다단히트/고정 피해기는
 """
 import math
 import re
+from collections import Counter
 
 from poke_env.battle import Field, Move, MoveCategory, SideCondition, Status
 from poke_env.battle.abstract_battle import AbstractBattle
 
+from src.core.reveals import RevealTracker
+
 TURN_DIM, SLOT_DIM = 10, 8
+REV_ERRORS = Counter()    # reveals.py 추적 중 난 예외 (예외 문구별 횟수): 배틀은 계속 진행하되, 데이터 빌드(build_fp_dataset.py)가 예외가 난 배틀을 빼고 집계
 _FLUSH = {"move", "turn", "switch", "drag", "replace", "upkeep", "faint", "cant", "-terastallize"}
 # 위력/스탯이 특수하게 정해지는 기술은 예상 피해를 못 구함
 _SKIP = {"foulplay", "bodypress", "seismictoss", "nightshade", "superfang", "naturesmadness", "ruination", "gyroball",
@@ -68,6 +73,7 @@ class EventTracker:
     def __init__(self):
         self.last = [0.0] * TURN_DIM
         self.slot = {}  # 상대 종 → {atk:[n,sum], defn:[n,sum], lo, hi}
+        self.rev = RevealTracker()   # 도구/특성 공개와 추론, 마지막 사용 기술 등 (reveals.py)
         self._reset_turn()
 
     def _reset_turn(self):
@@ -182,6 +188,10 @@ def _hook(orig):
                 ev.roll_turn()
         except Exception:
             pass
+        try:
+            ev.rev.on_message(self, split_message)
+        except Exception as e:   # 추적 실패가 배틀 진행을 막지 않게 하되 횟수는 남김 (이후 추적 상태가 어긋나므로 데이터 빌드는 그 배틀을 버림)
+            REV_ERRORS[repr(e)[:200]] += 1
     return parse_message
 
 

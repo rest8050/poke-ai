@@ -10,9 +10,10 @@ Showdown 리플레이 원문 → (실전과 같은 인코더 입력, 사람 행�
 
 ponytail 근사: 유턴/볼트체인지 뒤 교체 대상, 조로아크 환영, 끝까지 안 드러난 내 도구/테라 타입은 미반영.
 """
+import json
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 from poke_env.battle import Battle, Move, Pokemon, PokemonType
@@ -27,6 +28,7 @@ _LOGGER = logging.getLogger("replay_dataset")
 _LOGGER.setLevel(logging.CRITICAL)
 logging.getLogger("poke-env").setLevel(logging.ERROR)  # 리플레이의 모르는 효과(Gooey 등) 경고 숨김
 _ENCODER = None
+MOVE_ID = json.load(open("data/vocab.json"))["move"]
 
 
 def _norm(x):
@@ -48,6 +50,11 @@ def _hindsight(lines, side):
     for s in lines:
         if len(s) < 4:
             continue
+        if s[1] in ("-item", "-enditem") and not (s[1] == "-item" and any(x.startswith("[from] move") for x in s[4:])):   # 도구 주인은 s[2] ([of]는 쓸어내기/훔치기의 공격자이거나 Frisk 같은 특성의 주인). 트릭/바꿔치기/도둑질로 생긴 -item은 원래 도구가 아님
+            io = _key(s[2])
+            spi = nick2sp.get(io)
+            if spi is not None and io.startswith(side) and info[spi]["item"] is None:
+                info[spi]["item"] = _norm(s[3])
         owner = next((_key(x[5:]) for x in s[3:] if x.startswith("[of] ")), _key(s[2]))
         sp = nick2sp.get(owner)
         if sp is None or not owner.startswith(side):
@@ -57,8 +64,6 @@ def _hindsight(lines, side):
             mid = _norm(s[3])
             if mid not in d["moves"] and len(d["moves"]) < 4:
                 d["moves"].append(mid)
-        elif s[1] in ("-item", "-enditem") and d["item"] is None:
-            d["item"] = _norm(s[3])
         elif s[1] == "-ability" and d["ability"] is None:
             d["ability"] = _norm(s[3])
         elif s[1] == "-terastallize":
@@ -147,11 +152,32 @@ def _capture(battle, kind):
             mask[8 + k] = True
     return {
         "obs": [t[0].numpy() for t in tensors[:7]], "mask": mask, "phi": potential(battle),
-        "moves": moves, "team_species": [mon.species for mon in team], "tera": False,
+        "moves": moves, "team_species": [mon.species for mon in team], "tera": False, "turn": int(battle.turn), "opp_action": -1, "opp_move": 0, "own_move": 0,
         # 마스크 점검용 (제약 없는 상태 판정): 등장 직후 첫 턴 여부, 도구, 걸려 있는 효과
         "active_info": {"first_turn": bool(active and active.first_turn), "item": _norm(active.item) if active and active.item else "",
                         "effects": sorted(e.name for e in active.effects) if active else [], "n_moves": len(moves)},
     }
+
+
+def _opp_actions(lines, opp):
+    """턴 번호 → (그 턴 상대의 선택, 쓴 기술 id): 0 기술, 1 교체, 2 테라+기술. 그 턴 상대의 첫 행동 줄 기준이고, 행동 전에 기절/행동 불가면 -1.
+    (이젝트 버튼처럼 맞아서 나가는 교체는 자발 교체와 구분 안 됨)"""
+    out, turn, tera, done = {}, 0, False, True
+    for s in lines:
+        ev = s[1]
+        if ev == "turn":
+            turn, tera, done = int(s[2]), False, False
+        elif done or len(s) < 3 or not s[2].startswith(opp):
+            continue
+        elif ev == "-terastallize":
+            tera = True
+        elif ev == "move" and not any(x.startswith("[from]") for x in s[4:]):
+            out[turn], done = ((2 if tera else 0), _norm(s[3])), True
+        elif ev == "switch":
+            out[turn], done = (1, ""), True
+        elif ev in ("cant", "faint"):
+            out[turn], done = (-1, ""), True
+    return out
 
 
 def _label_switch(state, details):
@@ -175,13 +201,23 @@ def replay_to_sequence(log_text, side, gamma=0.995):
         return None
     outcome = 1.0 if winner == name else -1.0
     info = _hindsight(lines, side)
+    opp_map = _opp_actions(lines, "p2" if side == "p1" else "p1")
 
     battle = Battle(f"replay-{side}", name, _LOGGER, gen=9)
     steps, pending, forced = [], None, False
+    drop = Counter()                     # 결정 지점별 결과: captured = 라벨 있음(steps) + 이유별 버림
+
+    def skip(state, why):                # 선택이 로그에 안 보인 결정 지점: 상태는 남기고 action=-1
+        drop[why] += 1
+        steps.append((state, -1))
 
     def resolve(state, action):
         if action is not None and state["mask"][action]:
+            if action < 8:
+                state["own_move"] = MOVE_ID.get(state["moves"][action % 4], 0)
             steps.append((state, action))
+        else:
+            skip(state, "label_outside_mask")
 
     for s in lines:
         ev = s[1]
@@ -191,10 +227,13 @@ def replay_to_sequence(log_text, side, gamma=0.995):
         if own and ev == "-terastallize" and pending:
             pending["tera"] = True
         elif own and ev == "move" and pending:
-            if not any(x.startswith("[from]") for x in s[4:]):
-                mid = _norm(s[3])
-                if mid in pending["moves"]:
-                    resolve(pending, pending["moves"].index(mid) + (4 if pending["tera"] else 0))
+            mid = _norm(s[3])
+            if any(x.startswith("[from]") for x in s[4:]):
+                skip(pending, "from_move")
+            elif mid in pending["moves"]:
+                resolve(pending, pending["moves"].index(mid) + (4 if pending["tera"] else 0))
+            else:
+                skip(pending, "move_not_in_list")
             pending = None
         elif own and ev == "switch":
             if forced:
@@ -205,8 +244,12 @@ def replay_to_sequence(log_text, side, gamma=0.995):
                 resolve(pending, _label_switch(pending, s[3]))
                 pending = None
         elif own and ev == "cant":
+            if pending:
+                skip(pending, "cant")
             pending = None
         elif own and ev == "faint":
+            if pending:
+                skip(pending, "faint_before_move")
             pending, forced = None, True
 
         # 2) 배틀 상태 갱신
@@ -228,9 +271,15 @@ def replay_to_sequence(log_text, side, gamma=0.995):
 
         # 3) 턴 시작 = 새 결정 지점
         if ev == "turn":
+            if pending:
+                skip(pending, "no_action_seen")
             pending, forced = _capture(battle, "turn"), False
+            cls, mid = opp_map.get(int(s[2]), (-1, ""))
+            pending["opp_action"], pending["opp_move"] = cls, MOVE_ID.get(mid, 0)
 
-    if not steps:
+    if pending:
+        skip(pending, "game_ended")
+    if not any(a >= 0 for _, a in steps):
         return None
     T = len(steps)
     phi = np.array([st["phi"] for st, _ in steps], dtype=np.float32)
@@ -238,7 +287,12 @@ def replay_to_sequence(log_text, side, gamma=0.995):
     out["action_mask"] = np.stack([st["mask"] for st, _ in steps])
     out["action"] = np.array([a for _, a in steps], dtype=np.int64)
     out["value_target"] = (gamma ** np.arange(T - 1, -1, -1, dtype=np.float32)) * outcome - phi
+    out["turn"] = np.array([st["turn"] for st, _ in steps], dtype=np.int16)
+    out["opp_action"] = np.array([st["opp_action"] for st, _ in steps], dtype=np.int8)
+    out["opp_move"] = np.array([st["opp_move"] for st, _ in steps], dtype=np.int16)    # 기술 어휘 번호(data/vocab.json), 기술이 아니면 0
+    out["own_move"] = np.array([st["own_move"] for st, _ in steps], dtype=np.int16)
     out["outcome"] = outcome
+    out["drop"] = dict(drop)
     return out
 
 
@@ -252,8 +306,8 @@ if __name__ == "__main__":
 
     os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 40
-    rows = pq.read_table("data/metamon/raw/train-00000-of-00046.parquet", columns=["log"]).slice(0, n).to_pylist()
-    t0, seqs, failed, kinds, turns = time.time(), 0, 0, Counter(), 0
+    rows = pq.read_table("data/metamon_raw/train-00000-of-00046.parquet", columns=["log"]).slice(0, n).to_pylist()
+    t0, seqs, failed, kinds, turns, drops = time.time(), 0, 0, Counter(), 0, Counter()
     for r in rows:
         n_turns = r["log"].count("\n|turn|")
         for side in ("p1", "p2"):
@@ -264,13 +318,18 @@ if __name__ == "__main__":
             seqs += 1
             turns += n_turns
             T = len(out["action"])
+            drops.update(out["drop"])
             assert all(out[k].shape[0] == T for k in OBS_KEYS + ["action_mask", "value_target"])
-            assert out["action_mask"][np.arange(T), out["action"]].all(), "라벨이 마스크 밖"
-            assert out["my_move_num"].shape[1:] == (6, 4, 46) and out["my_team_cat"].shape[1:] == (6, 10)
+            lab = out["action"] >= 0
+            assert out["action_mask"][np.arange(T)[lab], out["action"][lab]].all(), "라벨이 마스크 밖"
+            assert out["my_move_num"].shape[1:] == (6, 4, 46) and out["my_team_cat"].shape[1:] == (6, 11)
             assert abs(out["value_target"][-1] - (out["outcome"] - 0)) < 2.0
-            for a in out["action"]:
+            drops["captured"] += T
+            for a in out["action"][lab]:
                 kinds["tera" if 4 <= a < 8 else "move" if a < 4 else "switch"] += 1
     dt = time.time() - t0
     total = sum(kinds.values())
     print(f"리플레이 {n}판 × 2시점: 성공 {seqs}, 실패 {failed} | 결정 {total}개 (로그 턴 대비 {total / max(1, turns):.0%})"
           f" | 기술 {kinds['move']}, 교체 {kinds['switch']}, 테라 {kinds['tera']} | {dt / max(1, seqs):.2f}초/시점")
+    lost = {k: v for k, v in drops.items() if k != "captured"}
+    print(f"결정 지점 {drops['captured']}개 중 라벨 {total}개, 버림 {sum(lost.values())}개 ({sum(lost.values()) / max(1, drops['captured']):.1%}): {lost}")

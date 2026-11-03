@@ -34,8 +34,14 @@ def team(mons, mine):
         num[0, i, 11:17] = torch.tensor([x / 255.0 for x in s])
         for k, v in (m.get("stage") or {}).items():                                              # 랭크 칸: 3 공, 4 방, 5 특공, 6 특방, 7 스피드 (랭크/6)
             num[0, i, k] = v / 6.0
-        for j, (bp, pri, kind, mtype) in enumerate(m.get("moves", ())):
+        if m.get("species"):
+            cat[0, i, 10] = V["species"][m["species"]]
+        if m.get("tera"):
+            num[0, i, 9], cat[0, i, 9] = 1.0, TY[m["tera"]]
+        for j, (bp, pri, kind, mtype, *name) in enumerate(m.get("moves", ())):                  # 5번째 원소(선택): 기술 이름 -> 기술 id 칸 (기술별 규칙)
             mv[0, i, j, 0], mv[0, i, j, 3], mv[0, i, j, 4], mv[0, i, j, 6] = bp / 200.0, pri / 7.0, CATEGORY[kind], TY[mtype] / 20.0
+            if name:
+                cat[0, i, 5 + j] = V["move"][name[0]]
     return cat, num, mv
 
 
@@ -62,7 +68,7 @@ def damage(out, o=0, j=0, ch=1):
 old = Matchup(entry=True)
 neutral = MatchupV7()
 neutral.is_tech.zero_(); neutral.is_sturdy.zero_(); neutral.is_prank.zero_(); neutral.is_intim.zero_(); neutral.is_regen.zero_()
-neutral.weather_speed.zero_()
+neutral.weather_speed.zero_(); neutral.mflag.zero_(); neutral.abf.zero_()                 # 데미지 보정 표(기술 태그/지명 특성)도 중립
 fd = torch.ones(A, neutral.f_def.size(1))
 from src.core.matchup import IMMUNE_ABILITIES
 for name, t in IMMUNE_ABILITIES.items():
@@ -75,8 +81,10 @@ mc[..., 0] = oc[..., 0] = 0
 mc[..., 4] = oc[..., 4] = 0                                    # 상태이상/도구 없음 (마비, 스카프 규칙이 안 켜지게)
 mn, on = torch.rand(n, 6, NUM_DIM, generator=g), torch.rand(n, 6, NUM_DIM, generator=g)
 mn[:, :, 0] = on[:, :, 0] = 0; mn[:, 0, 0] = 1; on[:, 1, 0] = 1; mn[:, :, 1] = on[:, :, 1] = 0
+mn[..., 9] = on[..., 9] = 0                                    # 테라 없음 (테라 자속 2배/위력 60 하한은 11)에서 따로 검사)
 mm, om = torch.rand(n, 6, 4, 46, generator=g), torch.rand(n, 6, 4, 46, generator=g)
 om[:, 4:] = 0
+mm[..., 10] = om[..., 10] = 0                                  # v6 Matchup에는 다단히트 계수가 없으므로 그 칸(효과 특징[2])은 0으로 맞춤 (10번 항목에서 따로 검사)
 fv = torch.zeros(n, FIELD_DIM)
 fv[:, 28] = 1.0; fv[:, 29] = 1 / 3                              # 내 쪽 스텔스록 + 압정 1겹 (진입 피해 같이 확인)
 mult = torch.rand(n, 6, 6, generator=g) * 0.4 + 0.8
@@ -187,4 +195,40 @@ opp_fm = lambda pri, spe=20, extra=None: float(run([active(stats=(100, 100, 100,
                                                     [active(stats=(100, 100, 100, 100, 100, spe), moves=[(50, pri, "phys", "normal")], **(extra or {}))])["fm_opp"][0, 0, 0])
 assert opp_fm(0) == -1.0 and opp_fm(1) == 1.0                                                                # 우선도 1이면 느려도 먼저 (내 활성 최고 우선도 0)
 assert float(run([active(stats=(100, 100, 100, 100, 100, 200))], [active(stats=(100, 100, 100, 100, 100, 100), moves=[(50, 0, "phys", "normal")])])["fm_opp"][0, 0, 1]) == 0.0   # 안 드러난 칸은 0
+# 10) 다단히트: 효과 특징[2] = (기대 타수 - 1)/4 이면 데미지 비율이 기대 타수배 (3.1타 = 0.525), 정밀기술 경계는 한 방 위력 기준 그대로
+def multi(frac, bp=50):
+    mc, mn, mm = team([active()], True)
+    oc, on, om = team([active()], False)
+    mm[0, 0, 0, 0], mm[0, 0, 0, 3], mm[0, 0, 0, 4], mm[0, 0, 0, 6], mm[0, 0, 0, 10] = bp / 200.0, 0, CATEGORY["phys"], TY["normal"] / 20.0, frac
+    with torch.no_grad():
+        out = M(mc, mn, mm, oc, on, om, torch.zeros(1, FIELD_DIM), F.one_hot(oc[..., 1], A).float(), torch.zeros(1, 6))
+    return float(out["off"][0, 0, 0, 1])
+single, triple = multi(0.0), multi(0.5)
+assert abs(triple / single - 3.0) < 1e-3, (single, triple)
+
+# 11) 데미지 보정 (소스: Showdown, tools/matchup_check.py로 실측 대조). 내 활성(공격 60, 방어 60)이 상대 활성(HP 404, 방어/특방 259)을 때림. 기본 기술 자속 x1.5
+ME = (300, 60, 60, 60, 60, 100)
+def dm(att=None, dfn=None, move=(80, 0, "phys", "normal"), field=None, stats=ME):
+    out = run([active(stats=stats, moves=[move], **(att or {}))], [active(types=("normal",), stats=(100, 80, 80, 80, 80, 80), **(dfn or {}))], field)
+    return float(out["off"][0, 0, 0, 1])
+def want(bp=80, a=60, d=259, mult=1.5):
+    return min(((42 * bp * a / d) / 50 + 2) * mult * 0.925 / 404, 1.5) / 1.5
+close = lambda x, y: abs(x - y) < 1e-5
+assert close(dm(), want())
+assert close(dm({"item": "lifeorb"}), want(mult=1.5 * 5324 / 4096))
+assert close(dm({"item": "choiceband"}), want(a=90)) and close(dm({"item": "choiceband"}, move=(80, 0, "spec", "normal")), want())
+assert close(dm({"item": "choicespecs"}, move=(80, 0, "spec", "normal")), want(a=90)) and close(dm({"item": "choicespecs"}), want())
+assert close(dm(dfn={"item": "assaultvest"}, move=(80, 0, "spec", "normal")), want(d=259 * 1.5)) and close(dm(dfn={"item": "assaultvest"}), want())
+assert close(dm(dfn={"ab": "multiscale"}), want(mult=0.75)) and close(dm(dfn={"ab": "multiscale", "hp": 0.9}), want())
+assert close(dm(field={32: 1.0}), want(mult=0.75)) and close(dm(field={34: 1.0}), want()) and close(dm(field={34: 1.0}, move=(80, 0, "spec", "normal")), want(mult=0.75))
+assert close(dm({"ab": "adaptability"}), want(mult=2.0)) and close(dm({"ab": "sharpness"}, move=(80, 0, "phys", "normal", "psychocut")), want(bp=120))
+fire = lambda **kw: dm(move=(80, 0, "spec", "fire"), **kw)
+assert close(fire(field={0: 1.0}), want(bp=120, mult=1.0)) and close(fire(field={2: 1.0}), want(bp=40, mult=1.0)) and close(fire(field={0: 1.0}, att={"ab": "cloudnine"}), want(mult=1.0))
+assert close(dm(move=(80, 0, "phys", "normal", "bodypress"), stats=(300, 60, 200, 60, 60, 100)), want(a=200)) and close(dm(move=(80, 0, "phys", "normal", "foulplay")), want(a=259))
+assert close(dm(dfn={"item": "leftovers"}, move=(80, 0, "phys", "normal", "knockoff")), want(bp=120)) and close(dm(move=(80, 0, "phys", "normal", "knockoff")), want())
+# 테라: 원래 타입과 같은 타입으로 테라하면 자속 2배(관측 타입 칸은 테라 타입으로 덮이니 원래 타입은 종 표에서), 아니면 1.5, 위력 60 미만 기술은 60으로
+snor = {"species": "snorlax", "tera": "normal"}
+assert close(dm(snor), want(mult=2.0)) and close(dm(snor, move=(40, 0, "phys", "normal")), want(bp=60, mult=2.0))
+assert close(dm({"species": "snorlax", "tera": "fire"}, move=(80, 0, "phys", "fire")), want(mult=1.5)) and close(dm({"species": "snorlax", "tera": "fire"}), want())
+assert close(dm({**snor, "ab": "adaptability"}), want(mult=2.25))
 print("matchup v7 OK")

@@ -1,10 +1,9 @@
-"""상대 세트 신념(SetBelief) 사전학습: 팀 데이터(Showdown 내보내기)만 쓰고 배틀은 필요 없음.
+"""상대 세트 추정(SetBelief) 사전학습: 팀 데이터(Showdown 내보내기)만 쓰고 배틀은 필요 없음.
 포켓몬마다 무작위로 일부 정보만 공개한 부분 관측(공개 기술 0~4개, 도구/특성 공개 여부)을 만들고, 정답은 그 포켓몬의 **완전한 세트**(안 드러난 기술/도구/특성).
 배틀 로그의 "나중에 드러난 것"과 달리 끝까지 안 쓴 기술/도구도 라벨이라 편향이 없고, 샘플은 매 스텝 새로 뽑으니 사실상 무한.
 학습용 팀 풀만 사용 (평가용 풀은 학습에 안 씀, 평가 지표만 따로 계산). 팀 단위로 5%를 떼어 검증.
-사용: python src/training/pretrain_belief.py [--steps 12000] [--out checkpoints/belief.pt]
+사용: python src/training/pretrain_belief.py   (결과: checkpoints/belief_<입력 수치 폭 NUM_DIM>.pt — train_fp_distill.py가 모델의 폭에 맞는 파일을 찾아 씀)
 참고(ponytail): 도구 효과로 종족값을 곱하는 인코더 보정(구애 계열 등)은 흉내 내지 않음 / 배틀 상황 입력(HP, 증거)은 기본값이라 미세조정에서 배움"""
-import argparse
 import json
 import math
 import os
@@ -28,6 +27,8 @@ TRAIN_POOLS = [("metamon", "data/team_pool_metamon.json", 0.5), ("randomset", "d
 EVAL_POOLS = [("holdout(A)", "data/team_pool_metamon_holdout.json"), ("rare(B)", "data/team_pool_rare.json"), ("randomset(C)", "data/team_pool_randomset.json")]
 REVEAL_P = [0.25, 0.30, 0.20, 0.15, 0.10]    # 공개 기술 수 0~4개 분포 (대전에서 상대 활성의 공개 기술 수 분포와 비슷)
 P_ITEM_KNOWN, P_ABILITY_KNOWN = 0.25, 0.30
+STEPS, BATCH, LR = 12000, 4096, 2e-3
+OUT = f"checkpoints/belief_{NUM_DIM}.pt"
 STAT_COEF = 0.5                              # 능력치 회귀 손실 가중 (기술 NLL ~3 대비)
 norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
 STATS = ["hp", "atk", "def", "spa", "spd", "spe"]
@@ -203,12 +204,6 @@ def evaluate(model, A, hid, unk_move, gen, n_batches=20, batch=4096, calib=False
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=12000)
-    ap.add_argument("--batch", type=int, default=4096)
-    ap.add_argument("--lr", type=float, default=2e-3)
-    ap.add_argument("--out", default="checkpoints/belief.pt")
-    args = ap.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vm = VocabManager.get_instance("data/vocab.json")
     dex = GenData.from_gen(9).pokedex
@@ -232,26 +227,26 @@ def main():
         if os.path.exists(p):
             evals[n] = to_arrays(load_pool(p, vm, dex), vm, dev)[0]
     model = SetBelief().to(dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     warm = 300
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: (s + 1) / warm if s < warm else 0.02 + 0.98 * 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, args.steps - warm))))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: (s + 1) / warm if s < warm else 0.02 + 0.98 * 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, STEPS - warm))))
     gen = torch.Generator(device=dev).manual_seed(0)
-    for step in range(1, args.steps + 1):
+    for step in range(1, STEPS + 1):
         model.train()
-        idx = torch.multinomial(sample_w, args.batch, replacement=True, generator=gen)
+        idx = torch.multinomial(sample_w, BATCH, replacement=True, generator=gen)
         cat, num, tgt = make_batch(A, idx, hid, unk_move + 1, gen)
         loss, st = belief_loss(model(cat, num), tgt, unk_move)
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step(); sched.step()
-        if step % 1000 == 0 or step == args.steps:
-            print(f"[{step}/{args.steps}] 손실 {loss.item():.3f} | 기술 상위4 적중 {st['move_top4']:.3f} | 도구 {st.get('item_top1', 0):.3f} | 특성 {st.get('ability_top1', 0):.3f} | 능력치 오차 {st['stat_mae']:.3f} (표준가정 {st['stat_base']:.3f}) | {time.time() - t0:.0f}s", flush=True)
+        if step % 1000 == 0 or step == STEPS:
+            print(f"[{step}/{STEPS}] 손실 {loss.item():.3f} | 기술 상위4 적중 {st['move_top4']:.3f} | 도구 {st.get('item_top1', 0):.3f} | 특성 {st.get('ability_top1', 0):.3f} | 능력치 오차 {st['stat_mae']:.3f} (표준가정 {st['stat_base']:.3f}) | {time.time() - t0:.0f}s", flush=True)
     print("\n== 검증 (학습에 안 쓴 팀 / 평가용 풀). 지표: 안 드러난 기술의 상위 4 적중률, 숨은 도구/특성의 상위 1/3 적중, 기술 확률 보정 오차(ECE), 능력치 배율 오차(표준 가정 252/무보정과 비교)")
     for n, E in evals.items():
         r = evaluate(model, E, hid, unk_move, gen, calib=True)
         print(f"  {n:14s} 기술 상위4 {r['move_top4']:.3f} | 도구 top1 {r.get('item_top1', 0):.3f} top3 {r.get('item_top3', 0):.3f} | 특성 top1 {r.get('ability_top1', 0):.3f} | ECE {r['ECE']:.3f} | 능력치 오차(로그) {r['stat_mae']:.3f} / 표준가정 {r['stat_base']:.3f}")
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    torch.save({"cfg": model.cfg, "state": {k: v.cpu() for k, v in model.state_dict().items()}}, args.out)
-    print("저장:", args.out)
+    os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
+    torch.save({"cfg": model.cfg, "state": {k: v.cpu() for k, v in model.state_dict().items()}}, OUT)
+    print("저장:", OUT)
 
 
 if __name__ == "__main__":

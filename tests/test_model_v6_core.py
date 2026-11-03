@@ -1,6 +1,6 @@
 """엔티티 토큰 모델 v6의 공통 구조 self-check (1~7 공통 + 8 숨은 기술 후보/능력치 예측): PYTHONPATH=. python tests/test_model_v6_core.py
 1) 롤아웃(한 턴씩) == 학습(forward_sequences), 2) 인과성, 3) 빈 슬롯 입력은 출력에 영향 없음 / 공개된 기술 수와 미공개 칸 내용은 영향,
-4) 기술/후보 정보와 상대 기술 위력이 교체 점수에 반영, 5) 신념: 상대 종 ID는 신념에만 쓰이고 내 쪽 종 ID는 무시, 정책/가치 손실은 신념에 안 닿고 숨김정보 손실은 신념 밖에 안 닿음,
+4) 기술/후보 정보와 상대 기술 위력이 교체 점수에 반영, 5) 세트 추정: 상대 종 ID는 세트 추정에만 쓰이고 내 쪽 종 ID는 무시, 정책/가치 손실은 세트 추정에 안 닿고 숨김정보 손실은 세트 추정 밖에 안 닿음,
 6) 기술 속성 표, 7) 체크포인트 왕복, 8) 상위 8개 후보 구조(가중치 범위/공개 후 0), 숨은 기술 예측과 노력치 예측이 정책에 반영"""
 import json
 import os
@@ -89,7 +89,7 @@ with torch.no_grad():
         return seq(q)["policy_logits"]
     assert (alive_obs(0.2)[:, 8:14] - alive_obs(0.9)[:, 8:14]).abs().max() > 1e-4
 
-    # 5) 신념: 출력 형태, 상대 종 ID는 신념에 반영, 내 쪽 종 ID는 무시
+    # 5) 세트 추정: 출력 형태, 상대 종 ID는 세트 추정에 반영, 내 쪽 종 ID는 무시
     out_b = seq(obs[0])
     assert out_b["hid_move"].shape[:2] == (5, 6) and out_b["hid_item"].shape[:2] == (5, 6) and out_b["hid_ability"].shape[:2] == (5, 6)
     sb = [t.clone() for t in obs[0]]; sb[3][:, 1, 10] = obs[0][3][:, 1, 10] + 3
@@ -97,7 +97,7 @@ with torch.no_grad():
     sm = [t.clone() for t in obs[0]]; sm[0][:, :, 10] = obs[0][0][:, :, 10] + 5
     assert torch.allclose(seq(sm)["policy_logits"], base_o, atol=1e-5), "내 쪽 종 ID는 무시"
 
-# 5b) 기울기 분리: 정책/가치 손실은 신념에 닿지 않고, 숨김정보 손실은 신념 밖에 닿지 않음 (학습 모드)
+# 5b) 기울기 분리: 정책/가치 손실은 세트 추정에 닿지 않고, 숨김정보 손실은 세트 추정 밖에 닿지 않음 (학습 모드)
 model.train(); model.zero_grad()
 g1 = seq(obs[0])
 (g1["policy_logits"][masks[0]].sum() + g1["value"].sum()).backward()

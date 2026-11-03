@@ -423,7 +423,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
             cat_emb = self.embeddings(species_stats_i, it, ab, t1, t2, st, mvs, mv_num_i)  # [B, 360]
             tera_emb = self.embeddings.type_embed(cat_i[:, 9])  # [B, 16]
-            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 18:]], dim=-1)  # [B, 396]
+            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 18:27]], dim=-1)  # [B, 396]  (포켓몬별 추가 수치 MON_EXT는 이 구조가 모름: 27칸 뒤는 버림)
             vec_i = self.pkmn_fc(full_i)
 
             # 빈 슬롯(HP stat == 0)인 경우 인코딩 벡터 0 처리
@@ -456,7 +456,7 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
             cat_emb = self.embeddings(species_stats_i, it, ab, t1, t2, st, mvs, mv_num_i)
             tera_emb = self.embeddings.type_embed(cat_i[:, 9])  # [B, 16]
-            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 18:]], dim=-1)  # [B, 396]
+            full_i = torch.cat([cat_emb, battle_num_i, tera_emb, num_i[:, 18:27]], dim=-1)  # [B, 396]  (포켓몬별 추가 수치 MON_EXT는 이 구조가 모름: 27칸 뒤는 버림)
             vec_i = self.pkmn_fc(full_i)
 
             is_empty = (species_stats_i[:, 0] == 0.0).unsqueeze(-1)
@@ -578,22 +578,21 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
 
 def build_model(cfg: dict) -> nn.Module:
-    """구조 인자로 모델 생성: model 키가 v7(model_v7.py)/v6(model_v6.py, 서버 탑재)/v4(model_v4_legacy.py)이면 엔티티 토큰 모델, 없으면 v1 구조(DeepPokemonBattleTransformerNet).
-    v4 구조는 롤백용 체크포인트(v4_full_tv) 호환 전용이라 퇴역 시 삭제."""
+    """구조 인자로 모델 생성: model 키가 v8(model_v8.py)/v6(model_v6.py, 서버 탑재)이면 엔티티 토큰 모델, 없으면 v1 구조(DeepPokemonBattleTransformerNet)."""
     cfg = dict(cfg)
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
     kind = cfg.pop("model", "v1")
-    if kind == "v7":                                     # v6 + 특성 EXEC 규칙(matchup_v7) + 합법 요약 슬롯 순서 통로 제거
-        from src.core.model_v7 import EntityPokemonNetV7
-        return EntityPokemonNetV7(**cfg)
+    if kind == "v8":                                     # v6 + 특성 EXEC 규칙(matchup_v7) + 합법 요약 슬롯 순서 통로 제거 + 숨은 특성/도구 기대 임베딩 + 융합층 활성 토큰 입력
+        from src.core.model_v8 import EntityPokemonNetV8
+        return EntityPokemonNetV8(**cfg)
+    if kind == "v9":                                     # v8 몸통 + 사슬 헤드 (docs/chain_design.md)
+        from src.core.model_v9 import EntityPokemonNetV9
+        return EntityPokemonNetV9(**cfg)
     if kind == "v6":                                     # 서버 탑재 구조
         from src.core.model_v6 import EntityPokemonNetV6
         return EntityPokemonNetV6(**cfg)
-    if kind == "v4":                                     # v4_full_tv(서버 롤백용) 호환 전용, 퇴역 시 삭제
-        from src.core.model_v4_legacy import EntityPokemonNetV4Legacy
-        return EntityPokemonNetV4Legacy(**cfg)
     if kind != "v1":
         raise ValueError(f"지원하지 않는 구조: {kind}")
     return DeepPokemonBattleTransformerNet(**cfg)

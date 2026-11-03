@@ -71,3 +71,16 @@ if __name__ == "__main__":
     test_choice_illegal_in_mask_gives_none()
     test_no_choice_arg_returns_none()
     print("ok")
+
+
+def test_action_values_pooled_by_world():
+    from src.training.build_fp_dataset import action_values
+    st = _state(["thunderbolt", "surf"], ["pikachu", "gyarados"])
+    worlds = [{"p": 0.5, "o": [["thunderbolt", 100, 60.0], ["surf", 50, 20.0], ["switch gyarados", 10, 3.0]]},
+              {"p": 0.5, "o": [["thunderbolt", 300, 120.0]]}]
+    q, v = action_values(st, worlds)
+    assert abs(q[0] - 0.45) < 1e-6 and v[0] == 400       # (0.5*60 + 0.5*120) / (0.5*100 + 0.5*300), 방문 합 400
+    assert abs(q[1] - 0.4) < 1e-6 and abs(q[9] - 0.3) < 1e-6   # 교체 gyarados = 슬롯 8+1
+    assert np.isnan(q[2]) and v[2] == 0
+    q0, v0 = action_values(st, None)
+    assert np.isnan(q0).all() and (v0 == 0).all()

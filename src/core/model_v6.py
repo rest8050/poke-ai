@@ -1,13 +1,13 @@
-"""현행 정책/가치 네트워크 v6 (독립 구조, 상속 없음): 엔티티 토큰 트랜스포머 + 규칙 기반 매치업 + 신념 + 합법성/효과 입력.
+"""현행 정책/가치 네트워크 v6 (독립 구조, 상속 없음): 엔티티 토큰 트랜스포머 + 규칙 기반 매치업 + 세트 추정 + 합법성/효과 입력.
 1) 규모: d_model 256 / 6층 / 8헤드. 한 턴 = 포켓몬 12 + 기술 48 + 필드 3 + CLS 1 = 64개 토큰, 압축 없이 전부 어텐션
 2) 매치업 특징(src/core/matchup.py, 파라미터 없음): 상대 기술이 내 포켓몬에 주는 배율·데미지·KO, 내 기술이 상대 포켓몬에 주는 효과, 스피드 우열
    - 포켓몬/기술 토큰 입력에 요약치를 더하고, 어텐션 로짓에 편향 bias[h,i,j] = f_h(배율, 데미지, KO, 공격기여부)를 더함 (층마다 따로 학습)
    - 교체 후보 점수와 교체/기술 판단(type_head)에 후보별·활성 매치업 요약을 직접 입력
    - 천진은 상대 공격/방어 랭크를 무시하고 계산, 교체 후보의 데미지/KO는 장판(스텔스록·압정) 피해를 뺀 HP 기준, 후보별 진입 피해 비율을 후보 특징과 포켓몬 토큰에 추가
-3) 상대 세트 신념(belief, src/core/belief.py): 자기 완결형 모듈, 출력은 detach라서 정책/가치 손실은 신념에 닿지 않음 (숨김정보 손실로만 학습)
+3) 상대 세트 추정(belief, src/core/belief.py): 자기 완결형 모듈, 출력은 detach라서 정책/가치 손실은 세트 추정에 닿지 않음 (숨김정보 손실로만 학습)
    - 숨은 기술은 마리당 확률 상위 12개 후보의 혼합으로 취급: 후보의 세트 포함 확률 w(= 미공개 칸 수 x 확률, 최대 1)로 포켓몬 쌍마다
      P_KO = 1 - Π(1 - w·KO), 그럴듯한 최대 데미지 = w >= 0.15인 후보의 최대 데미지 → 포켓몬 토큰 요약, 교체 후보 특징, 포켓몬<->포켓몬 어텐션 편향에 반영
-   - 신념이 예측한 상대 능력치 배율(노력치/성격)을 매치업의 상대 능력치에 곱하고 상대 포켓몬 토큰에도 입력
+   - 세트 추정이 예측한 상대 능력치 배율(노력치/성격)을 매치업의 상대 능력치에 곱하고 상대 포켓몬 토큰에도 입력
 4) 합법성 입력: 서버 요청 기반 순수 합법 마스크(legal_mask, 휴리스틱 가지치기 없음)를 특징으로 받음 (구애·돌격조끼 고정, 도발·앵콜·사슬묶기, PP 소진, 교체 봉쇄)
    - 토큰: 내 활성 기술 토큰마다 "사용 가능" 플래그, 내 포켓몬 토큰마다 "교체 가능" 플래그
    - 요약(LEG_G=25): 합법 비트 14 + 합법 기술 수·공격기 수·교체 수·테라 가능·"기술 한 개만 가능"·"고정 의심" 6 + 사용 가능한 기술만으로 다시 계산한 공격 요약 3 + 고정으로 잃은 화력 2
@@ -17,7 +17,7 @@
 6) 히스토리: 턴 요약 = [CLS, 내 활성 토큰, 상대 활성 토큰, 필드/직전 사건 벡터]을 인과 트랜스포머로 요약
 7) 미공개 기술 칸도 토큰으로 유지 (빈 슬롯만 마스킹) + 포켓몬 토큰에 공개된 기술 수/4
 8) my_pos=False: 내 쪽 팀 슬롯/기술 칸 위치 임베딩을 끔 → 내 팀 순서 순열에 대해 정확히 대칭 (순서가 팀 지문 통로가 되는 것을 막음). 상대 쪽은 공개된 순서라 유지
-인터페이스: forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt. 옛 구조는 model_v4_legacy.py (퇴역 시 삭제)
+인터페이스: forward/forward_sequences/get_action, cfg + save_ckpt/model_from_ckpt.
 arch: {"model": "v6", "my_pos": false}"""
 import torch
 import torch.nn as nn
@@ -26,14 +26,15 @@ import torch.nn.functional as F
 from src.core.belief import STAT_SCALE, SetBelief, build_move_table
 from src.core.matchup import Matchup
 from src.core.model import MAX_TURNS, DeepPokemonBattleTransformerNet, PokemonEmbeddingLayer
-from src.core.tensor_encoder import EFFECT_DIM, EFFECT_START, FIELD_DIM, MOVE_NUM_DIM
+from src.core.tensor_encoder import EFFECT_DIM, EFFECT_START, EXT_START, MOVE_NUM_DIM
 
 # 3차원 어텐션 마스크(헤드별 편향)는 추론용 빠른 커널에서 학습 경로와 값이 달라짐(CLS 기준 2e-3) → 학습과 같은 일반 경로만 쓰도록 끔
 torch.backends.mha.set_fastpath_enabled(False)
 
 N_TOK = 64            # 포켓몬 12 + 기술 48 + 필드 3 + CLS 1
 MV_EXTRA = 3
-BASE_IN = 204         # 포켓몬 토큰 기본 입력 차원 (종족값 투영 64 + 도구/특성/타입/상태/테라 임베딩 + 배틀 수치 + 이벤트 증거)
+OLD_NUM = 27          # v6가 학습한 포켓몬별 수치 폭 (인코더가 이후에 추가한 열은 버림: 옛 체크포인트 호환)
+BASE_IN = 177 + OLD_NUM         # 포켓몬 토큰 기본 입력 차원 (종족값 투영 64 + 도구/특성/타입/상태/테라 임베딩 + 배틀 수치 + 이벤트 증거)
 K_GUESS = 12          # 마리당 후보 기술 수 (숨은 기술 재현율: 상위 4 0.73 / 상위 8 0.94 / 상위 12 0.98)
 PLAUSIBLE = 0.15      # 이 이상의 세트 포함 확률이면 "그럴듯한" 후보
 MULT_RANGE = (0.6, 1.25)
@@ -60,14 +61,14 @@ class EntityPokemonNetV6(nn.Module):
                         history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
                         species_dim=species_dim, belief_hidden=belief_hidden, belief_species_dropout=belief_species_dropout, my_pos=my_pos)
         d = self.d = d_model
-        field_dim = FIELD_DIM
+        field_dim = EXT_START      # v6가 학습한 field_vec 폭 (뒤에 붙은 확장 블록은 _fit_field가 버림)
         self.n_heads = n_heads
         self.latent_dim = latent_dim
         pos = torch.ones(12) if my_pos else torch.tensor([0.0] * 6 + [1.0] * 6)       # 내 쪽 슬롯/기술 칸 순서는 임의(팀 export 순서)라서 끌 수 있음. 상대 쪽 순서는 공개된 순서라 정보가 있어 유지
         self.register_buffer("pos_gate", pos, persistent=False)
         self.embeddings = PokemonEmbeddingLayer(vocab_path=vocab_path, feature_path="data/entity_features.npz" if entity_features else "")
         self.matchup = Matchup(vocab_path, entry=True)
-        self.belief = SetBelief(vocab_path, species_dim, belief_hidden, belief_species_dropout)
+        self.belief = SetBelief(vocab_path, species_dim, belief_hidden, belief_species_dropout, num_dim=OLD_NUM)
         self.register_buffer("move_table", build_move_table(vocab_path), persistent=False)
         self.unk_move = nn.Parameter(torch.zeros(d))                        # 미공개 기술 칸 표시
         self.hid_proj = nn.Linear(1 + MOVE_NUM_DIM + 48, d)                 # 후보 기술 혼합(확률 합, 수치, 임베딩) -> 상대 포켓몬 토큰
@@ -134,7 +135,7 @@ class EntityPokemonNetV6(nn.Module):
         return b
 
     def _top_guess(self, logits, opp_cat, opp_mv, opp_num):
-        """신념의 기술 확률 -> 마리당 상위 K 후보. idx/w [B,6,K] (w = 세트 포함 확률 근사, 미공개 칸이 없으면 0), pseudo [B,6,K,46] (기울기 없음)"""
+        """세트 추정의 기술 확률 -> 마리당 상위 K 후보. idx/w [B,6,K] (w = 세트 포함 확률 근사, 미공개 칸이 없으면 0), pseudo [B,6,K,46] (기울기 없음)"""
         with torch.no_grad():
             lg = logits["move"].detach().float()
             V = lg.size(-1)
@@ -200,7 +201,7 @@ class EntityPokemonNetV6(nn.Module):
         mvn = torch.cat([my_move_num, opp_move_num], 1).reshape(B * 12, 4, -1)
         E = self.embeddings
         parts = [E.species_proj(num[:, 11:18]), E._emb("item", cat[:, 0]), E._emb("ability", cat[:, 1]), E.type_embed(cat[:, 2]),
-                 E.type_embed(cat[:, 3]), E.status_embed(cat[:, 4]), E.type_embed(cat[:, 9]), num[:, :11], num[:, 18:]]
+                 E.type_embed(cat[:, 3]), E.status_embed(cat[:, 4]), E.type_embed(cat[:, 9]), num[:, :11], num[:, 18:OLD_NUM]]
         raw = E._emb("move", cat[:, 5:9])
         revealed = (mvn.abs().sum(-1) > 0)
         n_rev = revealed.float().sum(-1, keepdim=True) / 4.0
@@ -221,7 +222,7 @@ class EntityPokemonNetV6(nn.Module):
         mv_flag[ar, act_m] = leg[:, :4]                                                              # 내 활성 포켓몬의 기술 4칸만 합법성이 의미 있음
         off_act = O.view(B, 6, 6, 4, 4)[ar, opp_act][ar, act_m]                                      # [B,4,4] 내 활성의 기술 4칸이 상대 활성에게
         n_rev_act = (my_move_num[ar, act_m].abs().sum(-1) > 0).sum(-1).float()
-        leg_g = torch.cat([self._legal_summary(leg, off_act, n_rev_act), field_vec[:, EFFECT_START:]], -1)      # 합법성 요약 + 양쪽 활성의 효과 열
+        leg_g = torch.cat([self._legal_summary(leg, off_act, n_rev_act), field_vec[:, EFFECT_START:EFFECT_START + EFFECT_DIM]], -1)      # 합법성 요약 + 양쪽 활성의 효과 열
         mon_in = torch.cat(parts + [mon_extra.reshape(B * 12, MON_X), n_rev, mon_flag.reshape(B * 12, 1)], -1)
         mv_in = torch.cat([E.move_encoder(raw, mvn), raw, mvn, mv_extra.reshape(B * 12, 4, 3), mv_flag.reshape(B * 12, 4, 1)], -1)
         side = torch.arange(12, device=dev) // 6
