@@ -39,12 +39,14 @@ with tempfile.TemporaryDirectory() as td:
     e = os.path.join(td, "e.npz"); de = make(e, [3], 46, 3)
     np.savez(e, **de, pos=np.array([0, 2, 3]))
     H.write_group("e", e, out)
-    z = np.load(out)
+    with np.load(out) as f:
+        z = {k: f[k] for k in f.files}
     names = [str(n) for n in z["src_names"]]
     src = np.repeat(z["src"], z["lens"])
     assert list(z["pos"][src == names.index("e")]) == [0, 2, 3] and list(z["pos"][src == names.index("b")]) == [0, 1, 2, 3]
     H.write_group("b", b, out)
-    z = np.load(out)
+    with np.load(out) as f:
+        z = {k: f[k] for k in f.files}
     src = np.repeat(z["src"], z["lens"])
     assert list(z["pos"][src == names.index("e")]) == [0, 2, 3] and len(z["pos"]) == int(z["lens"].sum())
 print("ok")
