@@ -58,6 +58,7 @@ LEG_G = 8 + 6 + 3 + 2    # 합법 비트 8(기술 4 + 테라 4) + 플래그 6 + 
 MON_X = 7 + 2 + 6 + 1    # 포켓몬 토큰 추가 수치: 매치업 요약 7 + 숨은 기술 위협 2 + 상대 능력치 예측 6 + 진입 피해 비율 1
 CAND_N = 9 + 2 + 1 + 3   # 교체 후보 특징: 요약 9 + 상대 활성의 숨은 기술 위협 2 + 진입 피해 비율 1 + 위협 효과 3
 TERA_N = 9     # tera_feat: 기술칸마다 (테라 후 공격 3, 테라 전후 차 2, 상대 활성 위협 전/후 4)
+TERA_DEF_N = 28   # tera_def: 기술칸과 무관한 방어 쪽 수치. 상대 활성의 공개 기술 4개(전 데미지 큰 순) x (배율, 데미지, KO) 테라 전/후 = 24 + 숨은 기술의 (P_KO, 그럴듯한 최대 데미지) 테라 전/후 = 4
 G_DIM = LEG_G + EFFECT_DIM + 1   # 전역 요약: 합법성 요약 + 양쪽 활성의 효과 열 + 재생력 회복량
 
 
@@ -74,7 +75,7 @@ class EntityPokemonNetV8(nn.Module):
                  head_width: int = 192, entity_features: bool = True,
                  species_dim: int = 32, belief_hidden: int = 256, belief_species_dropout: float = 0.3,
                  mon_moves: bool = False, pair_glu: int = 0, pair_mode: str = "glu", tera_feat: bool = False,
-                 type_lse: bool = False, value_detach: bool = False):
+                 type_lse: bool = False, value_detach: bool = False, tera_def: bool = False, tera_gate: bool = False):
         super().__init__()
         self.cfg = dict(model="v8", d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
                         history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
@@ -91,6 +92,16 @@ class EntityPokemonNetV8(nn.Module):
         self.tera_feat = tera_feat
         if tera_feat:                 # 켰을 때만 cfg에 기록
             self.cfg["tera_feat"] = True
+        self.tera_def, self.tera_gate = tera_def, tera_gate
+        assert not tera_def or tera_feat or tera_gate, "tera_def는 tera_feat 또는 tera_gate와 함께 써야 함 (수치를 넣을 곳이 없음)"
+        self.need_tera = tera_feat or tera_gate          # 인코더가 테라 가정 수치를 계산할지
+        self.tera_dim = TERA_N + (TERA_DEF_N if tera_def else 0)
+        if tera_def:                  # 기술칸마다 붙는 TERA_N 뒤에 방어 수치 TERA_DEF_N개 추가 (앞 TERA_N열의 의미는 그대로)
+            self.cfg["tera_def"] = True
+        if tera_gate:                 # 테라할지 여부를 기술과 따로 정하는 게이트: 테라 기술 4칸의 로짓에 같은 값을 더함. 마지막 층 0 시작 = 꺼진 모델과 같은 출력. 켰을 때만 cfg에 기록
+            self.cfg["tera_gate"] = True
+            self.tera_gate_net = nn.Sequential(nn.Linear(latent_dim + self.tera_dim, 64), nn.GELU(), nn.Linear(64, 1))
+            nn.init.zeros_(self.tera_gate_net[-1].weight); nn.init.zeros_(self.tera_gate_net[-1].bias)
         self.type_lse = type_lse
         if type_lse:                  # 종류 로짓에 alpha x logsumexp(그 종류의 합법 행동 점수)를 더함: 후보 점수가 P(교체)/P(기술)에 처음 영향. alpha 0 시작 = 꺼진 모델과 같은 출력. 켰을 때만 cfg에 기록
             self.cfg["type_lse"] = True
@@ -137,7 +148,7 @@ class EntityPokemonNetV8(nn.Module):
         fuse_in = history_dim + G_DIM + 3 * d
         self.fusion =nn.Sequential(nn.Linear(fuse_in, latent_dim * 2), nn.LayerNorm(latent_dim * 2), nn.GELU(), nn.Dropout(0.1),
                                     nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
-        self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d + (TERA_N if tera_feat else 0), head_width), nn.GELU(), nn.Linear(head_width, 2))
+        self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d + (self.tera_dim if tera_feat else 0), head_width), nn.GELU(), nn.Linear(head_width, 2))
         self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_N + G_DIM + 1, head_width), nn.GELU(), nn.Linear(head_width, 1))
         self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_N + 2 + G_DIM, head_width), nn.GELU(), nn.Linear(head_width, 2))
         is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
@@ -176,7 +187,7 @@ class EntityPokemonNetV8(nn.Module):
         b[:, :, 6:12, 0:6] = fh.transpose(2, 3)
         return b
 
-    def _tera_feat(self, D, O, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, field_vec, q_opp, p_scarf, mult, act_m, act_o, ar):
+    def _tera_feat(self, D, O, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, field_vec, q_opp, p_scarf, mult, act_m, act_o, ar, guess=None, M=None):
         """내 활성의 기술칸 4개마다 "지금 테라하면" 가정 매치업 [B,4,TERA_N]: 테라 후 상대 활성에 대한 (배율, 데미지, KO), 테라 전 대비 데미지/KO 차,
         상대 활성의 공개 기술이 내 활성에 주는 최대 (데미지, KO)의 테라 전/후. 매치업은 num[..,9](테라 중)일 때만 테라 타입을 쓰므로 내 쪽 테라 플래그를 켠 사본으로 한 번 더 계산"""
         B = my_cat.size(0)
@@ -188,7 +199,24 @@ class EntityPokemonNetV8(nn.Module):
             off_t = Mt["off"].view(B, 6, 6, 4, 4)[ar, act_o][ar, act_m].float()
             thr_n = D.view(B, 6, 6, 4, 4)[ar, act_m][ar, act_o][..., 1:3].float().amax(1)      # [B,2] 최대 (데미지, KO)
             thr_t = Mt["def"].view(B, 6, 6, 4, 4)[ar, act_m][ar, act_o][..., 1:3].float().amax(1)
-            return torch.cat([off_t[..., :3], (off_t - off_n)[..., 1:3], thr_n[:, None].expand(-1, 4, -1), thr_t[:, None].expand(-1, 4, -1)], -1)
+            f = torch.cat([off_t[..., :3], (off_t - off_n)[..., 1:3], thr_n[:, None].expand(-1, 4, -1), thr_t[:, None].expand(-1, 4, -1)], -1)
+            if not self.tera_def:
+                return f
+            # 방어 쪽 수치 (기술칸과 무관, 4칸에 같은 값): 상대 활성의 공개 기술 4개를 테라 전 데미지가 큰 순으로 세워 칸마다 (배율, 데미지, KO)의 전/후
+            dn = D.view(B, 6, 6, 4, 4)[ar, act_m][ar, act_o][..., :3].float()               # [B,4,3] 테라 전
+            dt = Mt["def"].view(B, 6, 6, 4, 4)[ar, act_m][ar, act_o][..., :3].float()      # [B,4,3] 테라 후
+            order = dn[..., 1].argsort(1, descending=True)[..., None].expand(-1, -1, 3)
+            mv_def = torch.cat([dn.gather(1, order), dt.gather(1, order)], -1).reshape(B, 24)
+            # 숨은 기술(세트 추정 상위 K 후보)이 내 활성에 주는 (P_KO, 그럴듯한 최대 데미지)의 전/후: _matchup_feats의 H와 같은 계산을 테라 켠 사본으로 한 번 더
+            w, K = guess["w"][:, None], guess["idx"].size(-1)
+            hid = []
+            for num_v, Mv in ((my_num, M), (my_t, Mt)):
+                Dp = self.matchup._pair(opp_cat, opp_num, guess["pseudo"], False, q_opp, my_cat, num_v, True, self.matchup._onehot(my_cat), att_mult=mult,
+                                        entry=Mv["entry_frac"], cand_f=(Mv["entry_opp"][..., 0], Mv["entry_opp"][..., 1]), mid=guess["idx"], field=field_vec)
+                dmg, ko = Dp[..., 1].view(B, 6, 6, K), Dp[..., 2].view(B, 6, 6, K)
+                h = torch.stack([1 - (1 - w * ko).prod(-1), (dmg * (w >= PLAUSIBLE)).amax(-1)], -1)       # [B,6(내),6(상대),2]
+                hid.append(h[ar, act_m][ar, act_o].float())                                            # [B,2] 내 활성 대 상대 활성의 숨은 기술
+            return torch.cat([f, torch.cat([mv_def, hid[0], hid[1]], -1)[:, None].expand(-1, 4, -1)], -1)
 
     def _top_guess(self, logits, opp_cat, opp_mv, opp_num):
         """세트 추정의 기술 확률 -> 마리당 상위 K 후보. idx/w [B,6,K] (w = 세트 포함 확률 근사, 미공개 칸이 없으면 0), pseudo [B,6,K,46] (기울기 없음)"""
@@ -293,7 +321,7 @@ class EntityPokemonNetV8(nn.Module):
         D, O, H, mon_extra, mv_extra, cand, ar, act_m, exit_heal, Mx = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
                                                                              opp_move_num, guess, mult, stat, field_vec, q_opp, p_scarf)
         opp_act = opp_team_num[:, :, 0].argmax(1)
-        tera_f = self._tera_feat(D, O, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec, q_opp, p_scarf, mult, act_m, opp_act, ar) if self.tera_feat else None
+        tera_f = self._tera_feat(D, O, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec, q_opp, p_scarf, mult, act_m, opp_act, ar, guess, Mx) if self.need_tera else None
         # ---- 합법성: 토큰 플래그 + 요약 ----
         leg = torch.ones(B, 22, device=dev) if legal is None else legal.float()
         is_act = torch.zeros(B, 6, dtype=torch.bool, device=dev)
@@ -357,7 +385,12 @@ class EntityPokemonNetV8(nn.Module):
             mv_in = torch.cat([mv_in, enc["tera_feat"].to(mv_in.dtype)], -1)
         sw_in = torch.cat([latent[:, None].expand(-1, 6, -1), enc["my_mon"], cand, lg[:, None].expand(-1, 6, -1), enc["leg_sw"][..., None].to(lg.dtype)], -1)
         mv, sw = self.move_score(mv_in), self.switch_score(sw_in).squeeze(-1)
-        detail = torch.cat([mv[..., 0], mv[..., 1], sw, latent.new_full((B, 8), -1e9)], 1)
+        mv_tera = mv[..., 1]
+        if self.tera_gate:            # 테라 여부 게이트: 기술칸과 무관한 방어 수치 + 칸별 공격 이득의 최대를 보고 테라 4칸에 같은 값을 더함
+            tf = enc["tera_feat"].to(latent.dtype)
+            gate = self.tera_gate_net(torch.cat([latent, tf[:, 0, 5:], tf[..., :5].amax(1)], -1))
+            mv_tera = mv_tera + gate
+        detail = torch.cat([mv[..., 0], mv_tera, sw, latent.new_full((B, 8), -1e9)], 1)
         type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr, lg], -1))
         if action_mask is not None:
             detail = detail.masked_fill(~action_mask, -1e9)

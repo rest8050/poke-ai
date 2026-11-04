@@ -39,6 +39,11 @@ assert st_good["move_top4"] > 0.99 and st_good["item_acc"] == 1.0 and st_good["a
 cat2 = cat.clone(); cat2[2, 0, 10] = 9
 l2, st2 = hidden_loss(logits(True, True, True), {"opp_team_cat": cat2, "seq_index": b["seq_index"]}, U)
 assert st2["move_n"] == 0 or st2["move_n"] < st_good["move_n"] + 1
+# 슬롯 순서가 바뀌어도(인코더는 새 포켓몬이 나올 때마다 프리뷰만 본 포켓몬의 슬롯을 옮김) 같은 종이면 정답을 가져옴
+cat3 = cat.clone(); cat3[2, 3], cat3[2, 0] = cat[2, 0].clone(), torch.zeros(11, dtype=torch.long)       # 마지막 턴에는 같은 종이 슬롯 3에 있음
+l3, st3 = hidden_loss(logits(True, True, True), {"opp_team_cat": cat3, "seq_index": b["seq_index"]}, U)
+assert st3["move_n"] == 3 and st3["item_n"] == 2 and st3["ability_n"] == 2 and st3["move_top4"] > 0.99, st3
+assert st2["move_n"] < 3          # 마지막 턴에 그 종이 아예 없으면 여전히 건너뜀
 # 모델이 hid_* 출력을 내고 손실이 세트 추정 모듈로 역전파
 from src.core.tensor_encoder import FIELD_DIM, NUM_DIM
 g = torch.Generator().manual_seed(0)

@@ -1,6 +1,6 @@
 """상대의 숨겨진 정보(기술/도구/특성) 예측 보조 손실. 정답은 같은 배틀의 마지막 턴 관측에서 얻음(외부 표/재가공 불필요):
 턴 t에 아직 안 보이는데 이 배틀이 끝나기 전에 드러난 기술/도구/특성이 정답. 끝내 안 드러난 것은 모름(음성 라벨 아님)이라
-정답 집합에 대한 소프트맥스 CE(양성만)로 계산. 이미 드러난 기술은 후보에서 제외. 마지막 턴에 같은 슬롯이 같은 종이 아닌 경우는 건너뜀.
+정답 집합에 대한 소프트맥스 CE(양성만)로 계산. 이미 드러난 기술은 후보에서 제외. 마지막 턴에 같은 종이 없으면 건너뜀(슬롯 위치가 달라도 종으로 찾음).
 필요 입력: b["opp_team_cat"] [N,6,11](0 도구, 1 특성, 5~8 기술, 10 종), b["seq_index"] [N] (결정이 배틀 순서대로 이어 붙어 있음)"""
 import json
 
@@ -17,8 +17,11 @@ def hidden_loss(logits: dict, b: dict, unk: dict):
     """logits: {"move": [N,6,Vm], "item": [N,6,Vi], "ability": [N,6,Va]} -> (손실 합, 통계 dict)"""
     cat = b["opp_team_cat"].long()
     counts = torch.bincount(b["seq_index"])
-    last = cat[(torch.cumsum(counts, 0) - 1)[b["seq_index"]]]                     # 각 결정이 속한 배틀의 마지막 턴 관측
-    same = (cat[..., 10] > 0) & (last[..., 10] == cat[..., 10])                    # 같은 슬롯에 같은 종
+    last_all = cat[(torch.cumsum(counts, 0) - 1)[b["seq_index"]]]                 # 각 결정이 속한 배틀의 마지막 턴 관측 (슬롯 순서 그대로)
+    # 상대 슬롯 순서는 인코더가 "본 순서 + 프리뷰만 본 것"으로 채워 새 포켓몬이 나올 때마다 바뀌므로, 같은 슬롯이 아니라 같은 종의 마지막 턴 슬롯에서 정답을 가져옴
+    match = (cat[..., 10] > 0)[..., :, None] & (cat[..., 10][..., :, None] == last_all[..., 10][..., None, :])     # [N,6(지금 슬롯),6(마지막 턴 슬롯)]
+    same = match.any(-1)                                                          # 마지막 턴에도 이 종이 있음 (한 팀에 같은 종은 하나)
+    last = torch.gather(last_all, 1, match.float().argmax(-1)[..., None].expand(-1, -1, last_all.size(-1)))
     total, stats = logits["move"].new_zeros(()), {}
     # 기술: 앞으로 드러날 기술들에 대한 CE (이미 드러난 기술은 후보에서 제외)
     cur, fut = cat[..., 5:9], last[..., 5:9]
