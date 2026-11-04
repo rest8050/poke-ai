@@ -1,14 +1,13 @@
-"""v8 입력 연결 추가 옵션 self-check: PYTHONPATH=. python tests/test_new_feats.py
-tera_feat(테라 가정 매치업을 기술 점수 입력에), bench_off(교체 후보의 상대 벤치 공격 요약), pair_feat(쌍 모듈에 수치 쌍 특징: 교차 편 상성 + 속도 대소)
-1) 꺼져 있으면 cfg/파라미터 그대로, 켜면 cfg 기록 2) 특징 모양/유한/의미(테라 전후 차가 실제로 생김, 벤치 요약이 후보 특징 뒤에 붙음)
-3) pair_feat는 pair_glu 필요, 투영을 0으로 두면 pair_feat 없는 모델과 출력 동일 4) 세 옵션 다 켠 모델의 체크포인트 왕복과 my_pos=False 순열 대칭"""
+"""v8 tera_feat(테라 가정 매치업을 기술 점수 입력에) self-check: PYTHONPATH=. python tests/test_new_feats.py
+1) 꺼져 있으면 cfg/파라미터 그대로, 켜면 cfg 기록 2) 특징 모양/유한/의미(테라 전후 차가 실제로 생김) 3) 켠 모델의 체크포인트 왕복과 my_pos=False 순열 대칭
+(bench_off, pair_feat는 이득이 없어 제거됨)"""
 import os
 import tempfile
 
 import torch
 
 from src.core.model import build_model, model_from_ckpt, save_ckpt
-from src.core.model_v8 import BENCH_N, CAND_N, TERA_N
+from src.core.model_v8 import TERA_N
 from src.core.tensor_encoder import FIELD_DIM, NUM_DIM
 
 
@@ -35,12 +34,7 @@ fw = lambda m, o, mk=mask: m.forward_sequences(o, Z, T, 1, mk)["policy_logits"]
 enc = lambda m, o=obs: m._encode_turn(*o, legal=mask)
 
 base = build_model(small).eval()
-assert not any(k in base.cfg for k in ("tera_feat", "bench_off", "pair_feat"))
-try:
-    build_model({**small, "pair_glu": 0, "pair_feat": True}); raise SystemExit("pair_feat가 pair_glu 없이 만들어짐")
-except AssertionError:
-    pass
-
+assert "tera_feat" not in base.cfg
 with torch.no_grad():
     # 2) 개별 옵션
     t = build_model({**small, "tera_feat": True}).eval()
@@ -55,37 +49,15 @@ with torch.no_grad():
     tf1 = t._encode_turn(*o2, legal=mk2)["tera_feat"]
     assert tf1[..., 3:5].abs().max() == 0 and torch.equal(tf1[..., 5:7], tf1[..., 7:9])
     assert enc(base)["tera_feat"] is None
-    b = build_model({**small, "bench_off": True}).eval()
-    bsd = b.state_dict()
-    b.load_state_dict({k: v for k, v in base.state_dict().items() if k in bsd and v.shape == bsd[k].shape}, strict=False)   # 신념 모듈 등 같은 가중치로
-    assert b.cfg["bench_off"] is True and enc(b)["cand"].shape[-1] == CAND_N + BENCH_N and enc(base)["cand"].shape[-1] == CAND_N
-    assert torch.equal(enc(b)["cand"][..., :CAND_N], enc(base)["cand"]), "기존 후보 특징이 바뀜"
-    ex = enc(b)["cand"][..., CAND_N:]
-    assert torch.isfinite(ex).all() and ex.abs().max() > 0
-    p = build_model({**small, "pair_feat": True}).eval()
-    assert p.cfg["pair_feat"] is True and any(k.startswith("pair.0.pf") for k in p.state_dict())
-    # 3) pf 투영을 0으로 두면 pair_feat 없는 모델과 동일, 키우면 변함
-    ref = build_model(small).eval()
-    sd = {k: v for k, v in p.state_dict().items() if ".pf." not in k}
-    ref.load_state_dict(sd)
-    for mod in list(p.pair) + list(ref.pair):
-        torch.nn.init.normal_(mod.to_bias.weight, std=0.5); torch.nn.init.normal_(mod.to_tok.weight, std=0.5)
-    ref.load_state_dict({k: v for k, v in p.state_dict().items() if ".pf." not in k})
-    for mod in p.pair:
-        torch.nn.init.zeros_(mod.pf.weight)
-    assert torch.allclose(fw(p, obs), fw(ref, obs), atol=1e-5)
-    for mod in p.pair:
-        torch.nn.init.normal_(mod.pf.weight, std=1.0)
-    assert (fw(p, obs) - fw(ref, obs)).abs().max() > 1e-6, "pair_feat가 출력에 안 닿음"
-    # 4) 전부 켠 모델
-    allm = build_model({**small, "tera_feat": True, "bench_off": True, "pair_feat": True}).eval()
+    # 3) 켠 모델
+    allm = t
     for mod in allm.pair:
         torch.nn.init.normal_(mod.to_bias.weight, std=0.3); torch.nn.init.normal_(mod.to_tok.weight, std=0.3)
     assert torch.isfinite(fw(allm, obs)[mask]).all()
     with tempfile.TemporaryDirectory() as d:
         pth = os.path.join(d, "m.pt"); save_ckpt(allm, pth)
         y = model_from_ckpt(pth).eval()
-        assert all(y.cfg[k] is True for k in ("tera_feat", "bench_off", "pair_feat"))
+        assert y.cfg["tera_feat"] is True
         assert torch.allclose(fw(y, obs), fw(allm, obs), atol=1e-6)
     perm = torch.tensor([3, 0, 5, 1, 4, 2])
     ob2 = [obs[0][:, perm], obs[1][:, perm], obs[2][:, perm]] + obs[3:]

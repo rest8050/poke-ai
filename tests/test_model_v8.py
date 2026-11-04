@@ -109,73 +109,12 @@ with torch.no_grad():
     # 8) 융합층은 CLS + 히스토리 + 요약 + 활성 토큰 2개를 받음
     assert model.fusion[0].in_features == 3 * model.d + 64 + G_DIM
 
-# 9) 히스토리 보조 헤드(hist_aux): 처음엔 세트 추정과 같은 로짓, 기울기는 히스토리 모듈과 이 헤드로만 (트렁크/세트 추정 불변), 켜지 않은 모델의 cfg는 그대로
-aux = build_model({"model": "v8", **small, "hist_aux": True}).eval()
-assert aux.cfg["hist_aux"] is True and "hist_aux" not in model.cfg and not hasattr(model, "hist_hid")
-out = aux.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask)
-for k in ("move", "item", "ability"):
-    assert out[f"hidh_{k}"].shape == out[f"hid_{k}"].shape and torch.allclose(out[f"hidh_{k}"], out[f"hid_{k}"], atol=1e-6)
-for m in aux.hist_hid.values():
-    torch.nn.init.normal_(m.weight, std=0.02)
-out = aux.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask)
-out["hidh_move"].square().sum().backward()
-assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in aux.history_seq.parameters()), "히스토리 모듈에 기울기가 안 옴"
-assert all(p.grad is None for n, p in aux.named_parameters() if n.startswith(("layers.", "mon_proj", "move_proj", "belief.", "fusion", "move_score"))), "보조 손실이 트렁크/세트 추정에 닿음"
-
-# 10) 다중 γ 분류형 가치 헤드: 켜지 않은 모델의 cfg/출력은 그대로, 켜면 [N,G,K] 로짓과 기본 γ(0.995) 기대값, two-hot 손실이 목표값 쪽으로 학습됨
-from src.training.train_fp_distill import two_hot_ce
-vg = build_model({"model": "v8", **small, "value_gammas": [0.9, 0.995], "value_bins": 11}).eval()
-assert "value_gammas" not in model.cfg and not hasattr(model, "value_support") and vg.cfg["value_gammas"] == [0.9, 0.995] and vg.value_primary == 1
-out = vg.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask)
-assert out["value_logits"].shape == (len(mask), 2, 11) and out["value"].shape == (len(mask), 1) and (out["value"].abs() <= 1).all()
-assert torch.allclose(out["value"][:, 0], (out["value_logits"][:, 1].softmax(-1) * vg.value_support).sum(-1), atol=1e-6)
-tgt = torch.tensor([[0.3, -1.0], [1.0, 0.55]])
-lg = torch.zeros(2, 2, 11, requires_grad=True)
-assert abs(two_hot_ce(torch.zeros(2, 2, 11), tgt, vg.value_support).item() - torch.log(torch.tensor(11.0)).item()) < 1e-5    # 균등 분포의 손실 = ln(K) (two-hot 가중치 합이 1)
-opt = torch.optim.SGD([lg], lr=5.0)
-for _ in range(200):
-    opt.zero_grad(); two_hot_ce(lg, tgt, vg.value_support).backward(); opt.step()
-assert torch.allclose((lg.softmax(-1) * vg.value_support).sum(-1), tgt, atol=1e-2), (lg.softmax(-1) * vg.value_support).sum(-1)
-with tempfile.TemporaryDirectory() as td:
-    save_ckpt(vg, os.path.join(td, "v.pt"))
-    assert model_from_ckpt(os.path.join(td, "v.pt")).cfg == vg.cfg
-
-# 11) 마지막 기술 입력(prev_act): 켜지 않은 모델은 그대로, 켠 모델은 prev_move가 출력에 영향, 인과적(미래 턴의 prev_move는 앞 턴 출력을 안 바꿈), None = 0, 체크포인트 왕복
-pa = build_model({"model": "v8", **small, "prev_act": True}).eval()
-assert "prev_act" not in model.cfg and model.pm_emb is None and pa.cfg["prev_act"] is True
-with torch.no_grad():
-    pm = torch.randint(1, pa.n_mv, (len(mask), 2))
-    ref = pa.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask)["policy_logits"]
-    assert torch.equal(ref, pa.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask, prev_move=torch.zeros_like(pm))["policy_logits"]), "None != 0"
-    with_pm = pa.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask, prev_move=pm)["policy_logits"]
-    assert not torch.allclose(ref, with_pm), "prev_move가 출력에 영향 없음"
-    pm2 = pm.clone(); last = (time_index == time_index[seq_index == 0].max()) & (seq_index == 0)       # 시퀀스 0의 마지막 턴만 바꿈
-    pm2[last] = (pm2[last] % (pa.n_mv - 1)) + 1
-    alt = pa.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask, prev_move=pm2)["policy_logits"]
-    assert torch.allclose(alt[~last], with_pm[~last], atol=1e-5) and not torch.allclose(alt[last], with_pm[last]), "인과성 위반"
-with tempfile.TemporaryDirectory() as td:
-    save_ckpt(pa, os.path.join(td, "p.pt"))
-    assert model_from_ckpt(os.path.join(td, "p.pt")).cfg == pa.cfg
-
-# 12) pm_fusion(마지막 기술을 융합층에도 직접)과 hist_only(융합층이 현재 턴 토큰을 직접 안 받음): 기본 모델 불변, 켜면 융합 입력 폭이 맞고 학습 경로 == 롤아웃, 체크포인트 왕복
-assert model.cfg.get("pm_fusion") is None and model.cfg.get("hist_only") is None
-for flags in ({"pm_fusion": True}, {"hist_only": True}, {"pm_fusion": True, "hist_only": True}):
-    v = build_model({"model": "v8", **small, "prev_act": True, **flags}).eval()
-    want = 64 + G_DIM + (0 if flags.get("hist_only") else 3 * v.d) + (32 if flags.get("pm_fusion") else 0)
-    assert v.fusion[0].in_features == want, (flags, v.fusion[0].in_features, want)
-    with torch.no_grad():
-        pm = torch.randint(1, v.n_mv, (len(mask), 2))
-        a1 = v.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask, prev_move=pm)["policy_logits"]
-        a0 = v.forward_sequences(flat, seq_index, time_index, len(lengths), action_mask=mask)["policy_logits"]
-    assert not torch.allclose(a1, a0), flags
-    with tempfile.TemporaryDirectory() as td:
-        save_ckpt(v, os.path.join(td, "f.pt"))
-        assert model_from_ckpt(os.path.join(td, "f.pt")).cfg == v.cfg
-try:
-    build_model({"model": "v8", **small, "pm_fusion": True})
-    raise SystemExit("prev_act 없이 pm_fusion이 통과함")
-except AssertionError:
-    pass
+# 9~12) hist_aux / 다중 γ 가치 / prev_act / pm_fusion / hist_only 검사는 해당 옵션을 제거하면서 삭제 (제거된 옵션 cfg는 build_model이 거부: 아래 검사)
+for bad in ({"hist_aux": True}, {"prev_act": True}, {"loop_n": 4}, {"value_gammas": [0.9]}, {"pair_mon": 16}, {"bench_off": True}, {"mon_moves": "mlp"}):
+    try:
+        build_model({"model": "v8", **small, **bad}); raise SystemExit(f"제거된 옵션이 통과함: {bad}")
+    except ValueError:
+        pass
 
 # 6) 체크포인트 왕복
 with tempfile.TemporaryDirectory() as td:

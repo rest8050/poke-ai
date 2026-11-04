@@ -580,9 +580,13 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 def build_model(cfg: dict) -> nn.Module:
     """구조 인자로 모델 생성: model 키가 v8(model_v8.py)/v6(model_v6.py, 서버 탑재)이면 엔티티 토큰 모델, 없으면 v1 구조(DeepPokemonBattleTransformerNet)."""
     cfg = dict(cfg)
-    for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
+    for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False),
+                       ("hist_aux", False), ("prev_act", False), ("pm_fusion", False), ("hist_only", False), ("loop_n", 0), ("loop_layers", 2),
+                       ("value_gammas", []), ("value_bins", 51), ("pair_scope", "all"), ("pair_feat", False), ("pair_mon", 0), ("bench_off", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
+    if cfg.get("mon_moves", True) is not True:
+        raise ValueError('제거된 옵션 mon_moves="mlp"를 쓰는 체크포인트는 더 이상 로드할 수 없음')
     kind = cfg.pop("model", "v1")
     if kind == "v8":                                     # v6 + 특성 EXEC 규칙(matchup_v7) + 합법 요약 슬롯 순서 통로 제거 + 숨은 특성/도구 기대 임베딩 + 융합층 활성 토큰 입력
         from src.core.model_v8 import EntityPokemonNetV8

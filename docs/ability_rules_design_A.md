@@ -132,7 +132,7 @@ p_scarf = softmax(item logits, 특수 칸 제외)[choicescarf]   # [B,6]
 ## 10. 구현 현황 (2026-10-25)
 
 구현됨: `src/core/matchup_v7.py`, `src/core/model_v7.py`, `build_model`의 `"v7"` 분기, `tests/test_matchup_v7.py`, `tests/test_model_v7.py`. 기본 학습 구조(`train_fp_distill.py`)는 아직 v6 그대로(채택 전). 배포 파일 목록에도 아직 없음.
-학습 명령: `ARCH='{"model":"v7","my_pos":false}' bash logs/train_full.sh v7_full v6_full` (또는 `train_fp_distill.py --arch '{"model":"v7","my_pos":false}'`).
+학습 명령: `ARCH='{"model":"v7","my_pos":false}' bash logs/archive/train_full.sh v7_full v6_full` (또는 `train_fp_distill.py --arch '{"model":"v7","my_pos":false}'`).
 
 설계와 달라진 점:
 - 특성 표 폭은 `<unk> + 2`(세트 추정 특성 로짓 폭 319)로 맞춤 (처음에 `max id + 3 = 320`으로 해서 세트 추정과 크기가 어긋났음).

@@ -1,6 +1,6 @@
 """
 사람 대전 데이터(data/human/gen9ou_s0_r1600_*.npz, tools/parse_human.py 출력)로 모델을 처음부터 행동 복제(BC) 학습.
-마지막 기술 입력(prev_act) 유무만 다른 두 모델을 비교하려는 용도 (밤샘 진단: history_diag.py의 H 변형이 실제 모델에서도 이득인지).
+(마지막 기술 입력 prev_act 비교 실험은 이득이 없어 모델에서 제거됨. 지금은 같은 구조의 사람 데이터 BC 기준선만 학습)
 
 - 정책 손실: 사람이 고른 행동(22칸)의 NLL, 라벨 없는 결정(action=-1)은 상태만 히스토리에 쓰고 손실에서 뺌
 - 보조 손실(두 모델 공통): 상대의 이번 턴 행동 종류(기술/교체/테라)와 상대가 쓴 기술 id를 latent에서 예측 (+ 가치 MSE)
@@ -8,7 +8,7 @@
 - 분할: 판 단위 (game*7919%10: 0 테스트, 1 검증, 나머지 학습; 같은 판의 두 시점은 같은 쪽). 최저 검증 NLL 에폭을 저장하고, 끝에 테스트 + 입력/히스토리 제거 실험
 - 세트 추정(belief)은 팀 데이터로 사전학습한 가중치를 불러와 얼림 (정책 경로에서 어차피 detach돼서 기울기가 안 가고, 숨김정보 정답은 사람 데이터에 없음)
 
-사용: PYTHONPATH=. python src/training/train_human.py --tag h1 --arch '{"model":"v8","my_pos":false,"prev_act":true}'
+사용: PYTHONPATH=. python src/training/train_human.py --tag h1 --arch '{"model":"v8","my_pos":false}'
 """
 import argparse
 import glob
@@ -116,12 +116,11 @@ def batches(d, lm, starts, lens, seq_ids, size, shuffle):
         yield b
 
 
-def step(model, aux, b, pm=True):
-    """한 배치의 손실 묶음. pm=False면 마지막 기술 입력을 0(없음)으로 (제거 실험)"""
+def step(model, aux, b):
+    """한 배치의 손실 묶음"""
     b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
-        out = model.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"],
-                                      prev_move=b["prev_move"] if pm else torch.zeros_like(b["prev_move"]))
+        out = model.forward_sequences([b[k] for k in OBS_KEYS], b["seq_index"], b["time_index"], b["n_seq"], action_mask=b["action_mask"])
     out = {k: v.float() for k, v in out.items()}
     logp = F.log_softmax(out["policy_logits"], -1)
     lab = b["action"] >= 0
@@ -135,13 +134,13 @@ def step(model, aux, b, pm=True):
     return loss, {"nll": nll.detach(), "lab": lab, "logp": logp.detach(), "v": v.detach(), "cls": cls_nll.detach() * oc, "oc": oc, "mv": mv_nll.detach() * om, "om": om}
 
 
-def evaluate(model, aux, d, lm, starts, lens, seq_ids, pm=True, nll_out=None):
+def evaluate(model, aux, d, lm, starts, lens, seq_ids, nll_out=None):
     """검증/테스트: 라벨 있는 결정의 사람 행동 NLL·일치율, 상대 행동 종류/기술 보조 NLL, 가치 MSE. nll_out(전체 결정 길이 배열)에 결정별 NLL 기록"""
     model.eval()
     t = dict(nll=0.0, agree=0.0, n=0, cls=0.0, nc=0, mv=0.0, nm=0, v=0.0, nd=0)
     with torch.no_grad():
         for b in batches(d, lm, starts, lens, seq_ids, BATCH_SEQ, False):
-            _, r = step(model, aux, b, pm)
+            _, r = step(model, aux, b)
             lab = r["lab"].cpu()
             t["nll"] += r["nll"].sum().item(); t["n"] += lab.sum().item()
             t["agree"] += ((r["logp"].argmax(-1) == b["action"].to(DEVICE)) & r["lab"]).sum().item()
@@ -189,7 +188,7 @@ def main(args):
             yield from batches(d, lm, starts, lens, split_ids(d)[0], BATCH_SEQ // args.accum, True)
 
     model = build_model(json.loads(args.arch))
-    if args.init:      # 다른 체크포인트(예: FP 증류 v8_full)에서 시작: 구조가 같은 가중치만 가져오고 새 모듈(prev_act 등)은 무작위로 남김
+    if args.init:      # 다른 체크포인트(예: FP 증류 v8_full)에서 시작: 구조가 같은 가중치만 가져오고 새 모듈은 무작위로 남김
         load_compatible(model, torch.load(args.init, map_location="cpu"))
     model.belief.load_state_dict(torch.load(f"checkpoints/belief_{model.belief.num_dim}.pt", map_location="cpu")["state"])
     for p in model.belief.parameters():
@@ -245,9 +244,6 @@ def final(model, aux, d, lm, forced, starts, lens, te, args, best):
         if m.sum():
             lines.append(f"  레이팅 {lo}-{hi}: n={m.sum():6d} NLL {nll[pos][m].mean():.4f}")
     np.savez_compressed(f"logs/human_{args.tag}_test.npz", nll=nll[pos], pos=pos, game=np.repeat(d["game"][te], lens[te]))
-    if model.prev_act:
-        z = evaluate(model, aux, d, lm, starts, lens, te, pm=False)
-        lines.append(f"테스트 마지막 기술 입력을 0으로: {fmt(z)}  (ΔNLL {z['nll'] - full['nll']:+.4f})")
     orig = model._history
     zero = lambda ts: torch.zeros(ts.size(0), ts.size(1), model.history_out.out_features, device=ts.device, dtype=ts.dtype)
 

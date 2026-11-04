@@ -42,7 +42,7 @@ import torch.nn.functional as F
 from src.core.belief import STAT_SCALE, SetBelief, build_move_table
 from src.core.matchup_v7 import MatchupV7
 from src.core.model import MAX_TURNS, DeepPokemonBattleTransformerNet, PokemonEmbeddingLayer
-from src.core.pair_glu import PairGLU, PairMon
+from src.core.pair_glu import PairGLU
 from src.core.tensor_encoder import EFFECT_DIM, EFFECT_START, FIELD_DIM, MOVE_NUM_DIM, NUM_DIM
 
 # 3차원 어텐션 마스크(헤드별 편향)는 추론용 빠른 커널에서 학습 경로와 값이 달라짐(CLS 기준 2e-3) → 학습과 같은 일반 경로만 쓰도록 끔
@@ -57,8 +57,7 @@ MULT_RANGE = (0.6, 1.25)
 LEG_G = 8 + 6 + 3 + 2    # 합법 비트 8(기술 4 + 테라 4) + 플래그 6 + 사용 가능한 기술만의 공격 요약 3 + 고정으로 잃은 화력 2
 MON_X = 7 + 2 + 6 + 1    # 포켓몬 토큰 추가 수치: 매치업 요약 7 + 숨은 기술 위협 2 + 상대 능력치 예측 6 + 진입 피해 비율 1
 CAND_N = 9 + 2 + 1 + 3   # 교체 후보 특징: 요약 9 + 상대 활성의 숨은 기술 위협 2 + 진입 피해 비율 1 + 위협 효과 3
-PM_DIM, PM_DROPOUT = 16, 0.3   # prev_act: 마지막 기술 id 임베딩 폭, 드롭아웃
-TERA_N, BENCH_N = 9, 3     # tera_feat: 기술칸마다 (테라 후 공격 3, 테라 전후 차 2, 상대 활성 위협 전/후 4) | bench_off: 교체 후보의 상대 벤치 공격 요약 3
+TERA_N = 9     # tera_feat: 기술칸마다 (테라 후 공격 3, 테라 전후 차 2, 상대 활성 위협 전/후 4)
 G_DIM = LEG_G + EFFECT_DIM + 1   # 전역 요약: 합법성 요약 + 양쪽 활성의 효과 열 + 재생력 회복량
 
 
@@ -73,54 +72,32 @@ class EntityPokemonNetV8(nn.Module):
     def __init__(self, vocab_path: str = "data/vocab.json", my_pos: bool = True, d_model: int = 256, n_layers: int = 6, n_heads: int = 8,
                  ff_mult: int = 4, dropout: float = 0.0, history_dim: int = 256, hist_layers: int = 2, latent_dim: int = 256,
                  head_width: int = 192, entity_features: bool = True,
-                 species_dim: int = 32, belief_hidden: int = 256, belief_species_dropout: float = 0.3, hist_aux: bool = False,
-                 value_gammas: tuple = (), value_bins: int = 51, prev_act: bool = False, pm_fusion: bool = False, hist_only: bool = False,
-                 loop_n: int = 0, loop_layers: int = 2, mon_moves=False, pair_glu: int = 0, pair_mode: str = "glu", pair_scope: str = "all",
-                 tera_feat: bool = False, bench_off: bool = False, pair_feat: bool = False, pair_mon: int = 0):
+                 species_dim: int = 32, belief_hidden: int = 256, belief_species_dropout: float = 0.3,
+                 mon_moves: bool = False, pair_glu: int = 0, pair_mode: str = "glu", tera_feat: bool = False,
+                 type_lse: bool = False, value_detach: bool = False):
         super().__init__()
         self.cfg = dict(model="v8", d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
                         history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
                         species_dim=species_dim, belief_hidden=belief_hidden, belief_species_dropout=belief_species_dropout, my_pos=my_pos)
-        if hist_aux:                  # 옛 체크포인트의 cfg와 같게 두려고 켰을 때만 기록
-            self.cfg["hist_aux"] = True
-        self.hist_aux = hist_aux
         self.mon_moves = mon_moves
         if mon_moves:                 # 포켓몬 토큰에 자기 기술 가방(공개된 기술 임베딩 합 + 숨은 칸은 세트 추정 기대값)을 직접 입력. 켰을 때만 cfg에 기록
-            self.cfg["mon_moves"] = mon_moves     # True = 임베딩을 그대로 합, "mlp" = 기술마다 비선형 변환(48->96->48) 후 합
+            self.cfg["mon_moves"] = True
             self.bag_proj = nn.Linear(48, d_model)
-            if mon_moves == "mlp":
-                self.bag_mv = nn.Sequential(nn.Linear(48, 96), nn.GELU(), nn.Linear(96, 48))
         self.pair_k = pair_glu
+        assert pair_mode == "glu", "pair_mode는 glu만 지원 (bilin/add는 효과 없어 제거)"
         if pair_glu:                  # 기술 x 포켓몬 쌍 모듈(src/core/pair_glu.py, 층마다 하나): 켰을 때만 cfg에 기록
             self.cfg["pair_glu"], self.cfg["pair_mode"] = pair_glu, pair_mode
-            if pair_scope != "all":
-                self.cfg["pair_scope"] = pair_scope
-            self.pair = nn.ModuleList([PairGLU(d_model, pair_glu, n_heads, pair_mode, pair_scope, 4 if pair_feat else 0) for _ in range(n_layers)])
-        self.pair_mk = pair_mon
-        if pair_mon:                  # 포켓몬 x 포켓몬 쌍 모듈(src/core/pair_glu.py PairMon, 층마다 하나): 켰을 때만 cfg에 기록
-            self.cfg["pair_mon"] = pair_mon
-            self.pair_m = nn.ModuleList([PairMon(d_model, pair_mon, n_heads) for _ in range(n_layers)])
-        assert pair_glu or not pair_feat, "pair_feat는 pair_glu 필요"
-        self.tera_feat, self.bench_off, self.pair_feat = tera_feat, bench_off, pair_feat
-        for flag, on in (("tera_feat", tera_feat), ("bench_off", bench_off), ("pair_feat", pair_feat)):
-            if on:                    # 켰을 때만 cfg에 기록
-                self.cfg[flag] = True
-        self.pair_reg = None          # 마지막 순전파의 쌍 희소성 항 (학습이 --pair-l1 배로 손실에 더함)
-        self.prev_act = prev_act
-        if prev_act:                  # 직전에 쓴 기술(내/상대) 입력: 켰을 때만 cfg에 기록
-            self.cfg["prev_act"] = True
-        assert prev_act or not pm_fusion, "pm_fusion은 prev_act 필요"
-        self.pm_fusion, self.hist_only = pm_fusion, hist_only
-        if pm_fusion:                 # 마지막 기술 임베딩을 융합층에도 직접 입력 (히스토리를 거치지 않는 경로)
-            self.cfg["pm_fusion"] = True
-        if hist_only:                 # 융합층이 현재 턴 CLS/활성 토큰을 직접 받지 않고 히스토리 출력(마지막 위치 = 현재 턴)만 받음: Metamon의 actor처럼 시퀀스 인코더 출력만 봄
-            self.cfg["hist_only"] = True
-        self.loop_n = loop_n
-        if loop_n:                    # 반복 추론: 트렁크 뒤에 새 층 loop_layers개(가중치 공유)를 loop_n번 되풀이해 엔티티 토큰을 더 다듬음. 켰을 때만 cfg에 기록
-            self.cfg["loop_n"], self.cfg["loop_layers"] = loop_n, loop_layers
-        self.value_gammas = tuple(value_gammas)
-        if self.value_gammas:         # 다중 γ 분류형(two-hot) 가치 헤드: γ마다 value_bins개 구간. 켰을 때만 cfg에 기록
-            self.cfg["value_gammas"], self.cfg["value_bins"] = list(self.value_gammas), value_bins
+            self.pair = nn.ModuleList([PairGLU(d_model, pair_glu, n_heads) for _ in range(n_layers)])
+        self.tera_feat = tera_feat
+        if tera_feat:                 # 켰을 때만 cfg에 기록
+            self.cfg["tera_feat"] = True
+        self.type_lse = type_lse
+        if type_lse:                  # 종류 로짓에 alpha x logsumexp(그 종류의 합법 행동 점수)를 더함: 후보 점수가 P(교체)/P(기술)에 처음 영향. alpha 0 시작 = 꺼진 모델과 같은 출력. 켰을 때만 cfg에 기록
+            self.cfg["type_lse"] = True
+            self.lse_alpha = nn.Parameter(torch.zeros(2))          # (기술, 교체)
+        self.value_detach = value_detach
+        if value_detach:              # 가치 헤드 입력을 detach: 가치 손실이 공유 몸통/융합층에 기울기를 주지 않음. 켰을 때만 cfg에 기록
+            self.cfg["value_detach"] = True
         d = self.d = d_model
         field_dim = FIELD_DIM
         self.n_heads = n_heads
@@ -141,16 +118,9 @@ class EntityPokemonNetV8(nn.Module):
         self.mslot_emb, self.act_emb, self.fld_emb = nn.Embedding(4, d), nn.Embedding(2, d), nn.Embedding(3, d)
         self.layers = nn.ModuleList([nn.TransformerEncoderLayer(d, n_heads, d * ff_mult, dropout=dropout, activation="gelu",
                                                                 batch_first=True, norm_first=True) for _ in range(n_layers)])
-        if loop_n:      # 출력 투영을 0으로 시작: 처음엔 항등이라 v8 가중치에서 이어 학습해도 기존 정책이 그대로고, 반복이 쓸모 있을 때만 값이 생김
-            self.loop = nn.ModuleList([nn.TransformerEncoderLayer(d, n_heads, d * ff_mult, dropout=dropout, activation="gelu",
-                                                                  batch_first=True, norm_first=True) for _ in range(loop_layers)])
-            for layer in self.loop:
-                for lin in (layer.self_attn.out_proj, layer.linear2):
-                    nn.init.zeros_(lin.weight); nn.init.zeros_(lin.bias)
-            self.iter_emb = nn.Parameter(torch.zeros(loop_n, d))                 # 반복 번호 신호 (공유 층이 몇 번째 반복인지 알도록)
         self.norm = nn.LayerNorm(d)
         # 층별 어텐션 편향: 입력 4채널(배율, 데미지, KO, 공격기) -> 헤드별 값 / 숨은 기술 위협 2채널 -> 헤드별 값. 작게 시작
-        n_bias = n_layers + (loop_layers if loop_n else 0)
+        n_bias = n_layers
         self.bias_def = nn.ModuleList([nn.Linear(4, n_heads) for _ in range(n_bias)])
         self.bias_off = nn.ModuleList([nn.Linear(4, n_heads) for _ in range(n_bias)])
         self.bias_hid = nn.ModuleList([nn.Linear(2, n_heads) for _ in range(n_bias)])
@@ -159,29 +129,21 @@ class EntityPokemonNetV8(nn.Module):
             nn.init.zeros_(lin.bias)
         n_mv = len(json.load(open(vocab_path, encoding="utf-8"))["move"])
         self.n_mv = n_mv
-        self.pm_emb, self.pm_drop = (nn.Embedding(2 * n_mv, PM_DIM), nn.Dropout(PM_DROPOUT)) if prev_act else (None, None)     # 마지막 기술 id를 저차원 임베딩+드롭아웃으로 규제 (내 id, 상대 id + n_mv). history_diag H 변형: 규제 없으면 과적합
-        self.turn_proj = nn.Linear(3 * d + field_dim + (2 * PM_DIM if prev_act else 0), history_dim)
+        self.turn_proj = nn.Linear(3 * d + field_dim, history_dim)
         self.turn_pos = nn.Embedding(MAX_TURNS, history_dim)
         hl = nn.TransformerEncoderLayer(history_dim, 4, history_dim * 2, dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
         self.history_seq = nn.TransformerEncoder(hl, hist_layers, enable_nested_tensor=False)
         self.history_out = nn.Linear(history_dim, history_dim)
-        if hist_aux:      # 기록 반영 숨김정보 보조 헤드: 세트 추정 로짓에 더하는 잔차 (0으로 시작해 처음엔 세트 추정과 같음). 정답(나중에 드러난 기술/도구/특성)이 상대의 지난 행동에서만 나올 수 있는 만큼 히스토리가 일을 하게 됨
-            self.hist_hid = nn.ModuleDict({k: nn.Linear(history_dim, 6 * getattr(self.belief, k).out_features) for k in ("move", "item", "ability")})
-            for m in self.hist_hid.values():
-                nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
-        fuse_in = history_dim + G_DIM + (0 if hist_only else 3 * d) + (2 * PM_DIM if pm_fusion else 0)
+        fuse_in = history_dim + G_DIM + 3 * d
         self.fusion =nn.Sequential(nn.Linear(fuse_in, latent_dim * 2), nn.LayerNorm(latent_dim * 2), nn.GELU(), nn.Dropout(0.1),
                                     nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
         self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d + (TERA_N if tera_feat else 0), head_width), nn.GELU(), nn.Linear(head_width, 2))
-        self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_N + (BENCH_N if bench_off else 0) + G_DIM + 1, head_width), nn.GELU(), nn.Linear(head_width, 1))
-        self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_N + (BENCH_N if bench_off else 0) + 2 + G_DIM, head_width), nn.GELU(), nn.Linear(head_width, 2))
+        self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_N + G_DIM + 1, head_width), nn.GELU(), nn.Linear(head_width, 1))
+        self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_N + 2 + G_DIM, head_width), nn.GELU(), nn.Linear(head_width, 2))
         is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
         is_switch[8:14] = True
         self.register_buffer("is_switch", is_switch, persistent=False)
-        self.value_head = nn.Sequential(nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, len(self.value_gammas) * value_bins if self.value_gammas else 1))
-        if self.value_gammas:
-            self.register_buffer("value_support", torch.linspace(-1, 1, value_bins), persistent=False)
-            self.value_primary = min(range(len(self.value_gammas)), key=lambda i: abs(self.value_gammas[i] - 0.995))   # 기존 value(단일 γ=0.995)와 같은 의미로 내보낼 헤드
+        self.value_head = nn.Sequential(nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, 1))
 
     def _fit_field(self, fv):
         """field_vec 폭을 이 모델이 학습한 폭에 맞춤: 더 넓으면(인코더가 뒤에 열을 추가) 뒤를 버리고, 더 좁으면(옛 데이터) 0으로 채움"""
@@ -199,17 +161,6 @@ class EntityPokemonNetV8(nn.Module):
     def _turn_vec(enc):
         return torch.cat([enc["cls"], enc["active_mon"], enc["opp_active_mon"], enc["field"]], -1)
 
-    def _tv(self, enc, prev_move):
-        """히스토리 입력 턴 벡터. prev_act면 직전에 쓴 기술 id [B,2] (내, 상대; 0 = 없음/모름)의 임베딩을 이어 붙임"""
-        tv = self._turn_vec(enc)
-        if not self.prev_act:
-            return tv
-        if prev_move is None:
-            prev_move = torch.zeros(tv.size(0), 2, dtype=torch.long, device=tv.device)
-        e = self.pm_drop(self.pm_emb(prev_move + torch.tensor([0, self.n_mv], device=tv.device)).flatten(1)).to(tv.dtype)
-        enc["pm"] = e
-        return torch.cat([tv, e], -1)
-
     def _bias(self, D, O, H, layer):
         """어텐션 편향 [B,H,64,64]: 내 포켓몬<->상대 기술 토큰(36..59), 상대 포켓몬<->내 기술 토큰(12..35), 내 포켓몬<->상대 포켓몬(숨은 기술 위협)"""
         B, NH = D.size(0), self.n_heads
@@ -225,17 +176,6 @@ class EntityPokemonNetV8(nn.Module):
         b[:, :, 6:12, 0:6] = fh.transpose(2, 3)
         return b
 
-    def _bench_off(self, O, opp_num, opp_act):
-        """교체 후보 i의 공격이 상대 벤치(들어올 쪽, 활성 제외, 생존)에 통하는 정도 [B,6,3]: 최대 데미지, 평균 데미지, 평균 KO. 벤치가 없으면 0"""
-        B = O.size(0)
-        OS = O.view(B, 6, 6, 4, 4)                                              # [B,상대 o,내 i,기술,(배율,데미지,KO,공격기)]
-        dmg, ko = OS[..., 1].amax(-1), OS[..., 2].amax(-1)                       # [B,o,i]
-        ok = (opp_num[..., 11] > 0) & (opp_num[..., 2] > 0) & ~F.one_hot(opp_act, 6).bool()      # [B,6] 존재 + 생존 + 활성 아님
-        w = ok.to(dmg.dtype)[:, :, None]
-        n = w.sum(1).clamp_min(1.0)
-        mx = (dmg * w).amax(1)
-        return torch.stack([mx, (dmg * w).sum(1) / n, (ko * w).sum(1) / n], -1).float()
-
     def _tera_feat(self, D, O, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, field_vec, q_opp, p_scarf, mult, act_m, act_o, ar):
         """내 활성의 기술칸 4개마다 "지금 테라하면" 가정 매치업 [B,4,TERA_N]: 테라 후 상대 활성에 대한 (배율, 데미지, KO), 테라 전 대비 데미지/KO 차,
         상대 활성의 공개 기술이 내 활성에 주는 최대 (데미지, KO)의 테라 전/후. 매치업은 num[..,9](테라 중)일 때만 테라 타입을 쓰므로 내 쪽 테라 플래그를 켠 사본으로 한 번 더 계산"""
@@ -249,17 +189,6 @@ class EntityPokemonNetV8(nn.Module):
             thr_n = D.view(B, 6, 6, 4, 4)[ar, act_m][ar, act_o][..., 1:3].float().amax(1)      # [B,2] 최대 (데미지, KO)
             thr_t = Mt["def"].view(B, 6, 6, 4, 4)[ar, act_m][ar, act_o][..., 1:3].float().amax(1)
             return torch.cat([off_t[..., :3], (off_t - off_n)[..., 1:3], thr_n[:, None].expand(-1, 4, -1), thr_t[:, None].expand(-1, 4, -1)], -1)
-
-    def _pair_feats(self, D, O, M, B):
-        """쌍 모듈 수치 특징 [B,48,12,4]: 교차 편 쌍은 (배율, 데미지, KO) (내 기술 x 상대 포켓몬은 O, 상대 기술 x 내 포켓몬은 D), 나머지 0 / 4번째는 모든 쌍의 속도 대소 log2 비 (기술 주인 대 포켓몬)"""
-        OS, DS = O.view(B, 6, 6, 4, 4), D.view(B, 6, 6, 4, 4)
-        pf = O.new_zeros(B, 48, 12, 4)
-        pf[:, :24, 6:, :3] = OS.permute(0, 2, 3, 1, 4).reshape(B, 24, 6, 4)[..., :3]      # [B,(내 i, 기술 m), 상대 o]
-        pf[:, 24:, :6, :3] = DS.permute(0, 2, 3, 1, 4).reshape(B, 24, 6, 4)[..., :3]      # [B,(상대 o, 기술 m), 내 i]
-        spe = torch.cat([M["spe_my"], M["spe_opp"]], 1).float()                            # [B,12]
-        owner = torch.arange(48, device=O.device) // 4
-        pf[..., 3] = (torch.log2(spe[:, owner, None].clamp_min(1.0) / spe[:, None, :].clamp_min(1.0)).clamp(-2, 2) / 2).to(pf.dtype)
-        return pf
 
     def _top_guess(self, logits, opp_cat, opp_mv, opp_num):
         """세트 추정의 기술 확률 -> 마리당 상위 K 후보. idx/w [B,6,K] (w = 세트 포함 확률 근사, 미공개 칸이 없으면 0), pseudo [B,6,K,46] (기울기 없음)"""
@@ -364,10 +293,7 @@ class EntityPokemonNetV8(nn.Module):
         D, O, H, mon_extra, mv_extra, cand, ar, act_m, exit_heal, Mx = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
                                                                              opp_move_num, guess, mult, stat, field_vec, q_opp, p_scarf)
         opp_act = opp_team_num[:, :, 0].argmax(1)
-        if self.bench_off:
-            cand = torch.cat([cand, self._bench_off(O, opp_team_num, opp_act)], -1)
         tera_f = self._tera_feat(D, O, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec, q_opp, p_scarf, mult, act_m, opp_act, ar) if self.tera_feat else None
-        pf = self._pair_feats(D, O, Mx, B) if self.pair_feat else None
         # ---- 합법성: 토큰 플래그 + 요약 ----
         leg = torch.ones(B, 22, device=dev) if legal is None else legal.float()
         is_act = torch.zeros(B, 6, dtype=torch.bool, device=dev)
@@ -390,7 +316,7 @@ class EntityPokemonNetV8(nn.Module):
         mon = self.mon_proj(mon_in).view(B, 12, d) + base + self.role_emb.weight[0]
         mon = mon + torch.cat([torch.zeros_like(mon[:, :6]), self.hid_proj(g)], 1)
         if self.mon_moves:      # 기술 가방: 양쪽 같은 경로. 내 쪽은 전부 공개라 숨은 항이 0, 상대는 공개되면 실제 임베딩이 들어가고 숨은 칸 기대값은 그만큼 줄어듦
-            bag = ((self.bag_mv(raw) if self.mon_moves == "mlp" else raw) * revealed[..., None]).sum(1).view(B, 12, -1)
+            bag = (raw * revealed[..., None]).sum(1).view(B, 12, -1)
             bag = bag + torch.cat([torch.zeros_like(bag[:, :6]), g[..., -48:].to(bag.dtype)], 1)
             mon = mon + self.bag_proj(bag)
         mv = self.move_proj(mv_in).view(B, 12, 4, d) + base[:, :, None] + self.mslot_emb.weight[None, None] * self.pos_gate[None, :, None, None] + self.role_emb.weight[1]
@@ -402,29 +328,14 @@ class EntityPokemonNetV8(nn.Module):
         x = torch.cat([x[:, :12], x[:, 12:60] + unrevealed.reshape(B, 48, 1) * self.unk_move, x[:, 60:]], 1)
         pad = torch.cat([mon_pad, mon_pad[:, :, None].expand(B, 12, 4).reshape(B, 48), mon_pad.new_zeros(B, 4)], 1)
         pad_f = torch.zeros(B, 1, 1, N_TOK, device=dev, dtype=x.dtype).masked_fill(pad[:, None, None, :], float("-inf"))
-        is_status = (mvn[..., 4] > 0.9).view(B, 48).float() if self.pair_k else None      # 공개된 변화기 기술 (기술 수치 5번째 = 분류, 변화기 1.0)
-        regs = []
         for li, layer in enumerate(self.layers):
             bias = self._bias(D, O, H, li).to(x.dtype)
             if self.pair_k:
-                pb, pt, rg = self.pair[li](x, mon_pad, is_status, pf)
-                regs.append(rg)
+                pb, pt = self.pair[li](x, mon_pad)
                 bias = bias + pb.to(x.dtype)
                 x = torch.cat([x[:, :12], x[:, 12:60] + pt.to(x.dtype), x[:, 60:]], 1)
-            if self.pair_mk:
-                pbm, ptm = self.pair_m[li](x, mon_pad)
-                bias = bias + pbm.to(x.dtype)
-                x = torch.cat([x[:, :12] + ptm.to(x.dtype), x[:, 12:]], 1)
             mask = (bias + pad_f).reshape(B * self.n_heads, N_TOK, N_TOK)
             x = layer(x, src_mask=mask)
-        if regs:
-            self.pair_reg = torch.stack(regs).mean().float()
-        if self.loop_n:
-            masks = [(self._bias(D, O, H, len(self.layers) + j).to(x.dtype) + pad_f).reshape(B * self.n_heads, N_TOK, N_TOK) for j in range(len(self.loop))]   # 반복마다 같으니 한 번만
-            for t in range(self.loop_n):
-                x = x + self.iter_emb[t]
-                for layer, mask in zip(self.loop, masks):
-                    x = layer(x, src_mask=mask)
         out = self.norm(x)
         my_mon = out[:, :6]
         return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, act_m], "opp_active_mon": out[:, 6:12][ar, opp_act],
@@ -434,10 +345,7 @@ class EntityPokemonNetV8(nn.Module):
     def _heads(self, enc, history, action_mask=None):
         B = history.size(0)
         lg = enc["leg_g"].to(history.dtype)
-        cur = [] if self.hist_only else [enc["cls"]]
-        tail = [] if self.hist_only else [enc["active_mon"], enc["opp_active_mon"]]
-        pm = [enc["pm"].to(history.dtype)] if self.pm_fusion else []
-        latent = self.fusion(torch.cat(cur + [history, lg] + tail + pm, -1))
+        latent = self.fusion(torch.cat([enc["cls"], history, lg, enc["active_mon"], enc["opp_active_mon"]], -1))
         cand = enc["cand"]
         ok = action_mask[:, 8:14] if action_mask is not None else torch.ones(B, 6, dtype=torch.bool, device=latent.device)
         act_feat = cand[torch.arange(B, device=latent.device), enc["act_m"]]
@@ -453,6 +361,10 @@ class EntityPokemonNetV8(nn.Module):
         type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr, lg], -1))
         if action_mask is not None:
             detail = detail.masked_fill(~action_mask, -1e9)
+        if self.type_lse:             # 합법 행동이 없으면 -30으로 눌러 유한값 유지 (그 종류는 아래에서 어차피 -1e9로 가려짐)
+            lse = torch.stack([torch.logsumexp(detail[:, :8].clamp(min=-30.0), -1), torch.logsumexp(detail[:, 8:14].clamp(min=-30.0), -1)], 1)
+            type_logits = type_logits + self.lse_alpha.to(lse.dtype) * lse
+        if action_mask is not None:
             no_move = ~(action_mask & ~self.is_switch).any(dim=1)
             no_switch = ~(action_mask & self.is_switch).any(dim=1)
             type_logits = type_logits.masked_fill(torch.stack([no_move, no_switch], dim=1), -1e9)
@@ -461,34 +373,27 @@ class EntityPokemonNetV8(nn.Module):
         lp_switch = F.log_softmax(detail.masked_fill(~self.is_switch, -1e9), -1)
         policy_logits = torch.where(self.is_switch, lp_type[:, 1:2] + lp_switch, lp_type[:, 0:1] + lp_move)
         bl = enc["belief_logits"]
-        out = {"policy_logits": policy_logits, "latent": latent, "value": self.value_head(latent),
+        out = {"policy_logits": policy_logits, "latent": latent, "value": self.value_head(latent.detach() if self.value_detach else latent),
                "hid_move": bl["move"], "hid_item": bl["item"], "hid_ability": bl["ability"]}
-        if self.value_gammas:
-            out["value_logits"] = out["value"].view(B, len(self.value_gammas), -1)
-            out["value"] = (out["value_logits"].float().softmax(-1) * self.value_support).sum(-1)[:, self.value_primary:self.value_primary + 1]
         return out
 
     def forward(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec,
-                history_state=None, action_mask=None, legal_mask=None, prev_move=None):
+                history_state=None, action_mask=None, legal_mask=None):
         enc = self._encode_turn(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec,
                                 legal=legal_mask if legal_mask is not None else action_mask)
-        cur = self._tv(enc, prev_move).unsqueeze(1)
+        cur = self._turn_vec(enc).unsqueeze(1)
         seq = cur if history_state is None else torch.cat([history_state.to(cur.dtype), cur], dim=1)
         out = self._heads(enc, self._history(seq)[:, -1], action_mask)
         out["history_state"] = seq
         return out
 
-    def forward_sequences(self, obs, seq_index, time_index, n_seq, action_mask=None, legal_mask=None, prev_move=None):
+    def forward_sequences(self, obs, seq_index, time_index, n_seq, action_mask=None, legal_mask=None):
         enc = self._encode_turn(*obs, legal=legal_mask if legal_mask is not None else action_mask)
-        tv = self._tv(enc, prev_move)
+        tv = self._turn_vec(enc)
         T = int(time_index.max().item()) + 1
         turn_seq = tv.new_zeros(n_seq, T, tv.size(-1))
         turn_seq[seq_index, time_index] = tv
         out = self._heads(enc, self._history(turn_seq)[seq_index, time_index], action_mask)
-        if self.hist_aux:   # 보조 가지는 턴 벡터를 detach해서 트렁크를 건드리지 않고, 히스토리 모듈과 이 헤드만 학습 (훈련 전용: 추론 경로에는 안 나옴)
-            h = self._history(turn_seq.detach())[seq_index, time_index]
-            for k in ("move", "item", "ability"):
-                out[f"hidh_{k}"] = enc["belief_logits"][k].detach() + self.hist_hid[k](h).view(h.size(0), 6, -1)
         return out
 
     get_action = DeepPokemonBattleTransformerNet.get_action

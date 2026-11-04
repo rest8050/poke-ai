@@ -47,14 +47,14 @@ def attach_targets(data, files, lens):
     print(f"사슬 정답: 응수 클래스 있는 행 {valid.mean():.1%}, 결과(r) 학습 행 {t['r_valid'].mean():.1%} | 클래스 사전 {np.round(prior / prior.sum(), 3).tolist()}")
 
 
-def _batches(data, offsets, idx, size, shuffle, gammas):
+def _batches(data, offsets, idx, size, shuffle):
     """train_fp_distill.make_batches의 배틀 묶음 하나하나에 사슬 정답 열을 같이 잘라 붙임 -> (배치, 선택한 배틀 번호)"""
     idx = list(idx)
     if shuffle:
         random.shuffle(idx)
     for i in range(0, len(idx), size):
         sel = idx[i:i + size]
-        b = next(T.make_batches(data, offsets, sel, len(sel), False, gammas))
+        b = next(T.make_batches(data, offsets, sel, len(sel), False))
         for k in CHAIN_KEYS:
             b[k] = torch.from_numpy(np.concatenate([data[k][offsets[j]:offsets[j + 1]] for j in sel]))
         yield b, sel
@@ -116,7 +116,7 @@ def run(model, data, offsets, idx, args, train, opt=None):
     tot = dict(ce=0.0, v=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, reg=0.0, reg_n=0, reg_q=0.0, reg_base=0.0)
     dg = {}
     prior = torch.from_numpy(data["_prior_logp"]).to(DEVICE)
-    for bi, (b, _) in enumerate(_batches(data, offsets, idx, T.BATCH_BATTLES // args.accum, train, getattr(model, "value_gammas", ()))):
+    for bi, (b, _) in enumerate(_batches(data, offsets, idx, T.BATCH_BATTLES // args.accum, train)):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         b["_prior_logp"] = prior
         with torch.set_grad_enabled(train):

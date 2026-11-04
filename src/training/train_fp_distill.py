@@ -36,7 +36,6 @@ BELIEF_FT_LR_MULT = 0.1   # 사전학습된 세트 추정의 미세조정 학습
 LR = 1e-3                 # 피크 학습률. 스윕(코사인, 학생 상태 홀드아웃 CE): 1e-3 1.5005 / 2e-3 1.4906 / 3e-3 1.4958 / 4e-3 1.5034 (표준 레시피는 1e-3)
 BATCH_BATTLES, VALUE_COEF, VAL_FRAC = 32, 0.25, 0.1
 WARMUP_FRAC, LR_MIN_RATIO = 0.05, 0.05   # 학습률: 웜업(0 → lr) 후 코사인 감쇠(lr → lr x LR_MIN_RATIO). 높은 학습률에서 첫 에폭에 정책이 무너지는 충격을 웜업이, 마지막 지점의 흔들림을 감쇠가 줄임
-HIST_HIDDEN_COEF = 0.3   # --arch의 hist_aux가 켜졌을 때 히스토리 반영 숨김정보 손실 가중치 (히스토리 모듈과 잔차 헤드에만 닿음. 크게 잡으면 일반 기울기 클립 예산을 정책 학습에서 가져감)
 HIDDEN_COEF = 1.0   # 숨김정보 손실 가중치: 세트 추정 모듈 파라미터에만 닿고(입출력 detach) 기울기 클리핑도 따로라서 정책 학습과 간섭하지 않음
 KEYS = OBS_KEYS + ["action_mask", "target", "action_taken"]
 CAT_KEYS = ("my_team_cat", "opp_team_cat")   # 어휘 번호 열: 메모리에는 int16로 두고 배치를 만들 때 long으로
@@ -46,7 +45,7 @@ Q_MIN_VIS = 100                # 이 방문 수 이상인 행동의 Q만 믿음 
 GAMMA = 0.995  # replay_dataset.py / build_fp_dataset.py와 동일
 
 
-def make_batches(data, offsets, idx, size, shuffle, gammas=()):
+def make_batches(data, offsets, idx, size, shuffle):
     idx = list(idx)
     if shuffle:
         random.shuffle(idx)
@@ -57,24 +56,12 @@ def make_batches(data, offsets, idx, size, shuffle, gammas=()):
         lens = [offsets[j + 1] - offsets[j] for j in sel]
         # 가치 타겟 = 할인된 최종 결과 γ^(남은 턴)·(±1) → 가치 헤드가 승패 기대값(승률)을 직접 배움 (예전 저장값 value_target은 Φ를 뺀 차이값이라 안 씀)
         b["value_target"] = torch.cat([GAMMA ** torch.arange(n - 1, -1, -1, dtype=torch.float32) * float(data["outcome"][j]) for j, n in zip(sel, lens)])
-        if len(gammas):                  # 다중 γ 가치 헤드(--arch value_gammas)용: γ마다 γ^(남은 턴)·(±1) [N, G]
-            b["value_targets"] = torch.stack([torch.cat([g ** torch.arange(n - 1, -1, -1, dtype=torch.float32) * float(data["outcome"][j]) for j, n in zip(sel, lens)]) for g in gammas], 1)
         if "teacher_value" in data:      # 교사(탐색)가 결정마다 본 승률 0~1 → ±1 척도 (build_fp_dataset로 만든 새 데이터에만 있음)
             b["teacher_value"] = torch.from_numpy(np.concatenate([data["teacher_value"][offsets[j]:offsets[j + 1]] for j in sel])).float() * 2 - 1
         b["seq_index"] = torch.cat([torch.full((n,), s) for s, n in enumerate(lens)])
         b["time_index"] = torch.cat([torch.arange(n) for n in lens])
         b["n_seq"] = len(sel)
         yield b
-
-
-def two_hot_ce(logits, target, support):
-    """분류형 가치 손실: 목표값 [N,G] (-1..1)을 이웃한 두 구간에 가중치로 나눠(two-hot) 로짓 [N,G,K]의 교차 엔트로피. support = 구간 중심 [K]"""
-    pos = (target.clamp(-1, 1) - support[0]) / (support[1] - support[0])
-    lo = pos.floor().clamp(0, len(support) - 2)
-    w = (pos - lo).unsqueeze(-1)
-    lo = lo.long().unsqueeze(-1)
-    two_hot = torch.zeros_like(logits).scatter(-1, lo, 1 - w).scatter_add(-1, lo + 1, w)
-    return -(two_hot * F.log_softmax(logits, -1)).sum(-1).mean()
 
 
 def pg_loss(logp, b, adv):
@@ -106,8 +93,8 @@ def q_terms(b):
 
 def run(model, data, offsets, idx, args, train, opt=None):
     model.train(bool(train))  # 학습 중에는 드롭아웃을 켬(융합층 0.1, 직전 기술 임베딩 0.3, 세트 추정 종 0.3. 트렁크는 기본 0.0). 검증은 항상 끔
-    tot = dict(ce=0.0, v=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, hidh=0.0, hidh_top4=0.0, agree=0, n=0, reg=0.0, reg_n=0)
-    for bi, b in enumerate(make_batches(data, offsets, idx, BATCH_BATTLES // args.accum, train, getattr(model, "value_gammas", ()))):
+    tot = dict(ce=0.0, v=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, reg=0.0, reg_n=0)
+    for bi, b in enumerate(make_batches(data, offsets, idx, BATCH_BATTLES // args.accum, train)):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):   # 손실 계산은 아래에서 float32로 (큰 모델의 메모리/시간 절약)
@@ -123,9 +110,7 @@ def run(model, data, offsets, idx, args, train, opt=None):
                     w = torch.where(valid & (gap.max(-1).values >= HARD_STAKES), torch.full_like(w, args.hard_weight), w)
                 reg_arg = gap.gather(-1, logp.argmax(-1, keepdim=True)).squeeze(-1)              # argmax 선택의 손해 (평가/체크포인트 선택용)
             v = F.mse_loss(out["value"].view(-1), b["value_target"])           # 기록/비교용: 항상 할인된 결과 기준
-            if "value_logits" in out:      # 다중 γ 분류형 가치 (v는 기본 γ 헤드의 기대값 MSE로 기록만)
-                v_loss = two_hot_ce(out["value_logits"], b["value_targets"], model.value_support)
-            elif args.teacher_value_mix == 0:
+            if args.teacher_value_mix == 0:
                 v_loss = v
             else:
                 tv = b["teacher_value"]
@@ -135,13 +120,7 @@ def run(model, data, offsets, idx, args, train, opt=None):
             if "hid_move" in out:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
                 hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]}, b, UNK)
                 tot["hid_top4"] += hs.get("move_top4", 0.0) * hs["move_n"]; tot["hid_nb"] += hs["move_n"]
-            hid_h = ce.new_zeros(())
-            if "hidh_move" in out:     # 히스토리를 반영한 숨김정보 예측 (세트 추정 + 히스토리 잔차): 같은 정답, 히스토리 모듈과 잔차 헤드만 학습
-                hid_h, hh = hidden_loss({"move": out["hidh_move"], "item": out["hidh_item"], "ability": out["hidh_ability"]}, b, UNK)
-                tot["hidh_top4"] += hh.get("move_top4", 0.0) * hh["move_n"]
-            loss = (w * ce_i).sum() / w.sum() + args.value_coef * v_loss + args.pg_coef * pg + HIDDEN_COEF * hid + HIST_HIDDEN_COEF * hid_h
-            if train and args.pair_l1 > 0 and getattr(model, "pair_reg", None) is not None:      # 쌍 모듈 희소성(L1): 켜진 쌍의 평균 |z|
-                loss = loss + args.pair_l1 * model.pair_reg
+            loss = (w * ce_i).sum() / w.sum() + args.value_coef * v_loss + args.pg_coef * pg + HIDDEN_COEF * hid
         if train:
             # ponytail: --accum k면 배틀 32개를 k개로 나눠 기울기를 누적(VRAM 절약). 미세 배치를 같은 가중으로 평균(결정 수 차이는 무시), 에폭 끝의 덜 찬 묶음은 버림
             if bi % args.accum == 0:
@@ -155,16 +134,16 @@ def run(model, data, offsets, idx, args, train, opt=None):
         with torch.no_grad():
             want, got = b["target"].argmax(-1), logp.argmax(-1)
         n = len(want)
-        tot["ce"] += ce.item() * n; tot["v"] += v.item() * n; tot["pg"] += pg.item() * n; tot["hid"] += hid.item() * n; tot["hidh"] += hid_h.item() * n; tot["n"] += n
+        tot["ce"] += ce.item() * n; tot["v"] += v.item() * n; tot["pg"] += pg.item() * n; tot["hid"] += hid.item() * n; tot["n"] += n
         tot["agree"] += (got == want).sum().item()
         if "q_mean" in b:
             tot["reg"] += (reg_arg * valid).sum().item(); tot["reg_n"] += valid.sum().item()
     n = max(1, tot["n"])
-    return {"reg": tot["reg"] / tot["reg_n"] if tot["reg_n"] else None, "ce": tot["ce"] / n, "v": tot["v"] / n, "pg": tot["pg"] / n, "hid": tot["hid"] / n, "hid_top4": tot["hid_top4"] / max(1, tot["hid_nb"]), "hidh": tot["hidh"] / n, "hidh_top4": tot["hidh_top4"] / max(1, tot["hid_nb"]), "agree": tot["agree"] / n, "n": tot["n"]}
+    return {"reg": tot["reg"] / tot["reg_n"] if tot["reg_n"] else None, "ce": tot["ce"] / n, "v": tot["v"] / n, "pg": tot["pg"] / n, "hid": tot["hid"] / n, "hid_top4": tot["hid_top4"] / max(1, tot["hid_nb"]), "agree": tot["agree"] / n, "n": tot["n"]}
 
 
 def fmt(r):
-    return (f"소프트CE {r['ce']:.4f} | 탐색 선택과 일치 {r['agree']:.3f} | V {r['v']:.3f} | PG {r['pg']:.4f}" + (f" | regret {r['reg']:.4f}" if r["reg"] is not None else "") + (f" | 숨김정보 {r['hid']:.3f}(기술 상위4 적중 {r['hid_top4']:.2f})" if r["hid"] else "") + (f" | 히스토리 반영 숨김정보 {r['hidh']:.3f}(상위4 {r['hidh_top4']:.2f})" if r["hidh"] else ""))
+    return (f"소프트CE {r['ce']:.4f} | 탐색 선택과 일치 {r['agree']:.3f} | V {r['v']:.3f} | PG {r['pg']:.4f}" + (f" | regret {r['reg']:.4f}" if r["reg"] is not None else "") + (f" | 숨김정보 {r['hid']:.3f}(기술 상위4 적중 {r['hid_top4']:.2f})" if r["hid"] else ""))
 
 
 def load(pattern):
@@ -300,7 +279,6 @@ if __name__ == "__main__":
     ap.add_argument("--lr", type=float, default=LR, help="피크 학습률 (이어서 학습할 때는 낮게)")
     ap.add_argument("--hard-weight", type=float, default=1.0, help="중요도(Q* - 최저Q) >= 0.3인 결정의 정책 손실 가중 (1=끔). Q가 든 데이터만")
     ap.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (기본 1e-4)")
-    ap.add_argument("--pair-l1", type=float, default=0.0, help="쌍 모듈(--arch pair_glu) 상호작용 벡터의 평균 절댓값(L1)에 곱할 계수 (0=끔)")
     ap.add_argument("--value-coef", type=float, default=VALUE_COEF, help="가치 손실 가중치 (기본 0.25). 0이면 가치 헤드는 학습 안 되니 --pg-coef 0도 같이 (PG 기준선이 가치 예측)")
     ap.add_argument("--pg-coef", type=float, default=0.05, help="실제 승패(할인된 결과 − 가치 예측 = advantage) 기반 정책 그라디언트 보조 손실 가중치 (0=끔)")
     ap.add_argument("--teacher-value-mix", type=float, default=0.0, help="가치 타깃 = 이 비율 x 교사 가치(탐색이 결정마다 본 승률) + 나머지 x 할인된 결과. 0=결과만 (교사 가치가 있는 새 데이터 필요)")

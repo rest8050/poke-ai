@@ -66,3 +66,20 @@
 - v9는 에폭 5까지 검증 CE가 계속 내려갔음(v8m은 에폭 5~6에서 정체). 6에폭이 부족했을 수 있으나 코사인 스케줄 효과와 분리하지 못함: 판단 보류.
 - 구현만 하고 미검증: `pair_mon=k`(src/core/pair_glu.py PairMon, 포켓몬 x 포켓몬 144쌍 GLU, 편향 [B,H,12,12] + 포켓몬 토큰 가산, 투영 0 시작, tests/test_pair_mon.py). 밤샘 큐 logs/night2_queue.sh(pair_mon 32, 층 8, 합친 구성 또는 층 4)는 첫 파일럿 시작 직후 세션 종료로 멈춰 결과 없음.
 - 쌍 모듈 출력은 두 곳(어텐션 로짓 편향, 기술 토큰 가산)으로 가는데 어느 쪽이 이득의 출처인지는 따로 끄고 비교한 적 없음. 쌍 모듈 안의 게이트 형태는 add 대조군(ad1)과 구간이 겹쳐 본질이 아닐 가능성이 높음.
+
+## 갱신 5 (2026-11-05): 대국 결과와 실험 옵션 정리
+- v9 대 v8m 대국(SPRT, δ=0.03, 12 작업자): 균형 2262판에서 v9 1190승 1072패, 승률 52.6% [50.5%, 54.7%], "v9가 낫다" 판정(총 3097판에서 종료). 학생 상태 regret 개선(-0.0012)이 대국 승률로도 확인됨.
+- 10% 파일럿에서 포켓몬 쌍 모듈 `pair_mon` 32는 comb 대비 +0.0001 [-0.0005,+0.0006]으로 효과 없음.
+- 정리: 쓰는 체크포인트가 없거나 효과 없음으로 끝난 옵션 제거. 제거: `hist_aux`, `value_gammas/value_bins`(다중 γ 가치 헤드), `prev_act/pm_fusion/hist_only`, `loop_n/loop_layers`, `pair_scope`, `pair_feat`, `pair_mode`의 bilin/add(glu만 남김), `pair_mon`(PairMon 클래스 포함), `bench_off`, `mon_moves="mlp"`, 학습의 `--pair-l1`/히스토리 숨김정보 손실/two-hot 가치 손실, 대응 테스트(test_loop_block, test_pair_mon). 남김: `mon_moves`(가방 합), `pair_glu`(glu), `tera_feat`(다음 테라 실험 출발점), `dropout` 인자.
+- 제거한 옵션을 쓰는 cfg는 `build_model`이 ValueError로 거부(hp_t2, hp_bagmlp, hp_ad1, hp_pairmon 등 파일럿 체크포인트는 더 이상 못 읽음, 가중치 파일은 그대로). v6_full, v8_full, v8m, v9, hp_base, hp_comb, hp_gl1, hp_vc05, hp_mm1은 정리 전과 같은 입력에서 정책/가치 출력이 정확히 같음(최대 차이 0), 전체 테스트 통과, 짧은 학습 실행(8.76M)도 확인.
+- 이 정리는 `model_v8.py`, `pair_glu.py`, `model.py`(제거 옵션 거부), `train_fp_distill.py`, `train_chain.py`, `train_human.py`와 테스트에 걸침.
+
+## 갱신 6 (2026-11-05): 세 약점 점검 파일럿 (logs/night3_queue.sh, 결과 logs/night3_queue.txt)
+- 배경: 다른 세션의 평가가 세 약점을 제기. 1) 교체 확률이 `type_head`에서만 나옴(입력 = 잠재벡터 + 활성 포켓몬의 후보 특징 15개 + best_off/min_thr/lg), 2) 세트 추정이 일관된 세트를 못 나타냄, 3) 가치 헤드가 정책을 방해하고 품질이 낮음.
+- 새 옵션(둘 다 끄면 이전과 출력이 같음): `type_lse`(종류 로짓 += α·logsumexp(그 종류의 합법 후보 점수), α=zeros(2) 학습, `_heads`) / `value_detach`(`value_head(latent.detach())`). tests/test_type_lse.py.
+- 10% 파일럿(sp12, 에폭 10에서 끊음), comb 대비 홀드아웃 쌍 비교(노이즈 ±0.0007, 채택 기준 -0.0007 이하): `lse`(type_lse, 가치 0.05) +0.0004 [-0.0002,+0.0009], `vdet`(value_detach, 가치 0.25) +0.0003 [-0.0003,+0.0009], `p3`(n_layers 8, 가치 0.05) +0.0001 [-0.0005,+0.0006]. 셋 다 효과 없음, 채택 없음. 합친 구성(lse+vdet)은 기준 미달로 돌리지 않음.
+- 종류 수준 분해(tools/type_regret.py): comb에서 종류 수준 몫 약 35%, 종류 오라클 0.0202. lse 0.0208, vdet 0.0209, p3 0.0203으로 분해도 거의 그대로. 종류 결정에 후보 점수 요약을 더해도 종류 수준 regret은 줄지 않았다(이 파일럿 규모에서).
+- 가치 품질(tools/value_quality.py, 교사 가치 대비 상관/MSE): base 0.504/0.343, comb 0.582/0.290, lse 0.541/0.321, vdet 0.604/0.134, p3 0.587/0.244. vdet는 교사 가치에 더 가깝게 맞지만 승패 결과 대비 상관은 0.179(comb 0.250)로 낮고 argmax regret은 변화 없음.
+- 세트 정보 오라클(tools/oracle_fill.py): 나중에 드러난 기술/도구/특성을 입력에 미리 채우면 regret +0.0008(나빠짐). 교사(FP)도 진짜 세트를 모르고 둔 수라서 "숨은 정보가 병목이 아니다"의 증거가 못 됨. 약점 2는 "진짜 세트"가 아니라 "FP의 사후분포를 따라 하는가"의 문제.
+- FP 세트 사후분포 진단(tools/set_posterior.py, 사람 로그 r1400+ 1500판, 드러난 값 하나를 빼고 맞히기): 도구 사후 MAP 0.584 vs 사용률 최빈 0.558, 특성 0.920 vs 0.931, 테라 0.505 vs 0.416. 이득은 테라에서만 눈에 띔. 풀 팀(정답 앎)에서는 사후 MAP이 현재 변환기 추정보다 낮음(도구 0.381 vs 0.639). 정책 regret에 미치는 효과는 측정하지 않음.
+- 결론 범위: 입력 연결/헤드 구조/층 수를 바꾼 이 세 가지로는 10% 파일럿에서 개선이 안 보였다. 전체 데이터에서도 같다는 확인은 없음.
