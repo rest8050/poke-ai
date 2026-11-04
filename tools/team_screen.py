@@ -12,7 +12,6 @@ import os
 import random
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -49,7 +48,7 @@ async def worker(a):
     from poke_env import AccountConfiguration, ServerConfiguration
     from poke_env.concurrency import POKE_LOOP
     from src.core.model import model_from_ckpt
-    from src.evaluation.analyze_model import LoggingPlayer
+    from src.evaluation.logging_player import LoggingPlayer
     from src.core.team_pool import RandomPoolTeambuilder
 
     teams = json.load(open(a.cands, encoding="utf-8"))["teams"][a.idx::a.workers]
@@ -75,7 +74,7 @@ async def worker(a):
             continue
 
         def make(suffix, exports):
-            p = Player(mode="argmax", model=model, search_lambda=None, battle_format="gen9ou", server_configuration=server,
+            p = Player(mode="argmax", model=model, battle_format="gen9ou", server_configuration=server,
                        account_configuration=AccountConfiguration(f"s{a.stage}{a.idx}x{n % 1000}{suffix}", None), max_concurrent_battles=a.concurrent)
             p._team = RandomPoolTeambuilder(exports)
             return p

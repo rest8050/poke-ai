@@ -4,16 +4,15 @@ Foul Play(탐색 봇) 대전 기록 → 증류 학습 데이터 (train_fp_distil
 입력
   --decisions  Foul Play가 남긴 결정 JSONL (foul-play repo의 fp/decision_log.py, 환경변수 FP_DECISION_LOG)
                start(팀 전체) / decision(전체 탐색 분포) / end(승자) / protocol(자기 시점 공개 로그) 레코드
-  --protocols  상대편(poke-env)이 저장한 배틀별 공개 프로토콜 JSONL ({"tag", "won", "protocol"}). 생략 가능 —
-               FoulPlay vs FoulPlay(자가대전)처럼 상대편 쪽 수집기가 없으면 각 컨테이너의 protocol 레코드를 대신 씀
                (자가대전은 양쪽 컨테이너 dec 파일에 같은 배틀 태그가 나오므로 파일 단위로 구분해서 따로 처리 — 한쪽으로 덮이지 않음)
 처리
   프로토콜을 Foul Play 쪽 시점으로 재생하되, 내 팀 정보는 사후 추정이 아니라 Foul Play가 실제로 쓴 팀(start 레코드)으로 채움
   → 실시간 인코더와 같은 완전한 내 팀 정보. 결정 지점(턴 시작/기절 후 교체)마다 Foul Play의 탐색 분포를 22칸 행동 분포로 변환
 출력 npz: OBS_KEYS + action_mask + target(22) + value_target, teacher_value(탐색이 본 이 쪽 승률 0~1, 결정마다), lens(배틀별 길이), outcome
 
-사용: python src/training/build_fp_dataset.py --decisions "data/fp_gen/ms050/dec_*.jsonl" --protocols "data/fp_gen/ms050/prot_*.jsonl" --out data/fp_gen/ms050/fp_data.npz
-자가대전: python src/training/build_fp_dataset.py --decisions "data/fp_selfplay/ms050/dec_*.jsonl" --out data/fp_selfplay/ms050/fp_data.npz
+재생 중 reveals.py 추적기가 예외를 내면 그 배틀은 이후 상태가 어긋나므로 버리고 통계에 세며, 버려진 배틀이 1%를 넘으면 빌드를 실패시킴
+
+사용: python src/training/build_fp_dataset.py --decisions "data/fp_selfplay/ms050/dec_*.jsonl" --out data/fp_selfplay/ms050/fp_data.npz
 """
 import sys
 import os
@@ -26,6 +25,7 @@ while _current_dir != os.path.dirname(_current_dir):
     _current_dir = os.path.dirname(_current_dir)
 import argparse
 import glob
+import gzip
 import json
 import multiprocessing as mp
 from collections import Counter, defaultdict
@@ -33,16 +33,21 @@ from collections import Counter, defaultdict
 import numpy as np
 from poke_env.battle import Battle
 
-from src.training.replay_dataset import OBS_KEYS, _LOGGER, _capture, _norm, _preview_mon, legal_from_request
+import src.core.events as events
+from src.training.replay_dataset import MOVE_ID, OBS_KEYS, _LOGGER, _capture, _norm, _opp_actions, _preview_mon, legal_from_request
 
 GAMMA = 0.995
+KEEP_RATIO = 0.2     # 탐색 분포에서 최고 확률의 이 비율 이상만 목표로 (방문이 극히 적은 꼬리만 제거, 0이면 원본 분포 전체). tools/teacher_ceiling.py가 같은 값을 씀
+MIN_MATCHED = 0.6    # 탐색 분포 중 우리 행동 칸에 매칭돼야 하는 최소 질량 비율
+WORKERS = 8          # 배틀별 재생 병렬 프로세스 수
+MAX_TRACKER_FAIL = 0.01   # 추적기 예외로 버린 배틀이 전체의 이 비율을 넘으면 빌드 실패
 
 
 def load_jsonl(pattern):
     """pattern: 콤마로 여러 glob 패턴 지정 가능 (train_fp_distill.py --data와 동일한 규칙)"""
-    paths = sorted({p for pat in pattern.split(",") for p in glob.glob(pat.strip())})
+    paths = sorted({p for pat in pattern.split(",") for p in glob.glob(pat.strip()) + glob.glob(pat.strip() + ".gz")})   # 압축한 원본(.jsonl.gz)도 같은 패턴으로 읽음
     for path in paths:
-        with open(path, encoding="utf-8") as f:
+        with (gzip.open(path, "rt", encoding="utf-8") if path.endswith(".gz") else open(path, encoding="utf-8")) as f:
             for line in f:
                 if line.strip():
                     r = json.loads(line)
@@ -187,11 +192,34 @@ def replay_states(protocol, side, name, team):
     return states
 
 
+def action_values(state, worlds):
+    """탐색이 본 행동별 가치 -> (q_mean[22], q_vis[22]). 세계(상대 세트 표본)마다 기록된 [옵션, 방문 수, 누적 점수]를 22칸에 모아
+    세계 가중치 p x 방문 수로 평균 낸 점수(0~1 승률 척도)와 방문 수 합. 방문이 없는 칸의 q_mean은 NaN"""
+    moves, team = [_norm(m) for m in state["moves"]], [_norm(s) for s in state["team_species"]]
+    num, den, vis = np.zeros(22), np.zeros(22), np.zeros(22)
+    for w in worlds or []:
+        p = float(w.get("p", 1.0))
+        for name, v, s in w.get("o", []):
+            i = _choice_index(name, moves, team)
+            if i is not None and state["mask"][i]:
+                num[i] += p * s
+                den[i] += p * v
+                vis[i] += v
+    return np.where(den > 0, num / np.maximum(den, 1e-9), np.nan).astype(np.float32), vis.astype(np.float32)
+
+
 def _states(task):
     return replay_states(*task)
 
 
-def build(decisions, protocols, min_matched, keep_ratio, workers=1):
+def _replay_counted(task):
+    """replay_states + 이 배틀 재생 중 reveals.py 추적기가 낸 예외 수 (워커 프로세스 안에서 재야 하므로 결과에 같이 돌려줌)"""
+    before = sum(events.REV_ERRORS.values())
+    states = replay_states(*task)
+    return states, sum(events.REV_ERRORS.values()) - before
+
+
+def build(decisions, workers=1):
     decisions = list(decisions)  # 아래서 두 번(결정 집계 + 자기기록 프로토콜 추출) 훑음
     # (파일, 태그)로 묶음: 자가대전은 두 컨테이너가 같은 배틀 태그를 쓰므로 태그만으로 묶으면 서로 덮어씀
     by_tag = defaultdict(lambda: {"dec": []})
@@ -201,10 +229,8 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
             d["dec"].append(r)
         else:
             d[r["type"]] = r
-    # 공개 프로토콜: 상대편(poke-env) 기록이 있으면 그걸, 없으면(자가대전) FoulPlay 자신이 남긴 걸 씀. 태그만으로 묶음(양쪽 다 같은 공개 로그)
+    # 공개 프로토콜: FoulPlay 자신이 남긴 걸 씀. 태그만으로 묶음(양쪽 다 같은 공개 로그)
     prot_by_tag = {}
-    for p in protocols:
-        prot_by_tag.setdefault(p["tag"], p["protocol"])
     for r in decisions:
         if r["type"] == "protocol":
             prot_by_tag.setdefault(r["tag"], r["lines"])
@@ -213,7 +239,7 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
     unmatched = defaultdict(lambda: [0, None])       # 22칸에 못 넣은 옵션 이름 -> [횟수, 첫 사례 (태그, 턴)]
     out, jobs = [], []
     for (_src, tag), d in by_tag.items():
-        # 자기 컨테이너의 프로토콜을 우선 (자기 쪽 서버 요청 |request|가 들어 있어 순수 합법 마스크를 만들 수 있음), 없으면 상대편 수집분
+        # 자기 컨테이너의 프로토콜을 우선 (자기 쪽 서버 요청 |request|가 들어 있어 순수 합법 마스크를 만들 수 있음), 없으면 같은 태그의 다른 컨테이너 기록
         protocol = d["protocol"]["lines"] if "protocol" in d else prot_by_tag.get(tag)
         if not protocol or "start" not in d or "end" not in d or d["end"]["winner"] is None:
             stat["배틀 제외(결정/종료/프로토콜 기록 없음)"] += 1
@@ -223,20 +249,25 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
         if side is None:
             stat["배틀 제외(플레이어 못 찾음)"] += 1
             continue
-        jobs.append((d, user, (protocol, side, user, d["start"]["team"])))
+        lines = [l.split("|") for l in protocol if l.startswith("|") and l != "|"]
+        opp_map = _opp_actions([x for x in lines if len(x) > 1], "p2" if side == "p1" else "p1")        # 턴 -> (상대 선택 0 기술/1 교체/2 테라+기술/-1 행동 못 함, 기술)
+        jobs.append((d, user, (protocol, side, user, d["start"]["team"]), opp_map))
     if workers > 1:  # 배틀별 재생은 서로 독립 → 프로세스 풀
         with mp.get_context("spawn").Pool(workers) as pool:
-            all_states = pool.map(_states, [j[2] for j in jobs], chunksize=4)
+            all_states = pool.map(_replay_counted, [j[2] for j in jobs], chunksize=4)
     else:
-        all_states = [_states(j[2]) for j in jobs]
-    for (d, user, _), states in zip(jobs, all_states):
+        all_states = [_replay_counted(j[2]) for j in jobs]
+    for (d, user, _, opp_map), (states, n_err) in zip(jobs, all_states):
         if states is None:
             stat["배틀 제외(재생 실패)"] += 1
+            continue
+        if n_err:
+            stat["배틀 제외(추적기 예외)"] += 1
             continue
         queues = defaultdict(list)
         for st, turn, kind in states:
             queues[(turn, kind)].append(st)
-        steps, tvals = [], []
+        steps, tvals, qms, qvs, extra = [], [], [], [], []
         for r in d["dec"]:
             key = (r["turn"], int(r["force_switch"]))
             if not queues[key]:
@@ -261,12 +292,17 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
                 if not (st["mask"][:4][:info["n_moves"]] | pe[:info["n_moves"]]).all():         # PP가 바닥난 기술은 정당하게 빠짐
                     stat["　그중 공개된 기술이 마스크에서 빠진 결정"] += 1
                     unmatched["[제약 없는 상태에서 기술 누락] " + ",".join(str(m) for m in st["moves"]) + " | 마스크 " + "".join("1" if x else "0" for x in st["mask"][:8])][0] += 1
-            target, matched, action_idx = to_target(st, r["policy"], keep_ratio, r.get("choice"))
-            if target is None or matched < min_matched:
+            target, matched, action_idx = to_target(st, r["policy"], KEEP_RATIO, r.get("choice"))
+            if target is None or matched < MIN_MATCHED:
                 stat["결정 제외(행동 매칭 실패)"] += 1
                 continue
             steps.append((st, target, -1 if action_idx is None else action_idx))
+            cls, mid = opp_map.get(r["turn"], (-1, "")) if key[1] == 0 else (-2, "")       # 강제 교체 상태에서는 상대가 행동하지 않음(-2)
+            extra.append((st["turn"], key[1], cls, MOVE_ID.get(mid, 0)))
             tvals.append(float(r["value"]))
+            qm, qv = action_values(st, r.get("worlds"))
+            qms.append(qm)
+            qvs.append(qv)
             stat["결정 사용"] += 1
         if len(steps) < 2:
             continue
@@ -278,6 +314,8 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
         seq["action_taken"] = np.array([a for _, _, a in steps], np.int64)  # 정책 그라디언트용, -1=실제 선택 매칭 실패
         seq["value_target"] = (GAMMA ** np.arange(T - 1, -1, -1, dtype=np.float32)) * outcome - np.array([s["phi"] for s, _, _ in steps], np.float32)
         seq["teacher_value"] = np.array(tvals, np.float32)
+        seq["q_mean"], seq["q_vis"] = np.stack(qms), np.stack(qvs)     # 행동별 탐색 가치/방문 수 (regret 평가용, tools/regret_eval.py)
+        seq["turn"], seq["kind"], seq["opp_action"], seq["opp_move"] = (np.array(c, dt) for c, dt in zip(zip(*extra), (np.int16, np.int8, np.int8, np.int16)))     # 동역학/상대 행동 예측용: 게임 턴, 0 턴 결정/1 강제 교체, 그 턴 상대의 행동 종류, 상대가 쓴 기술(어휘 번호)
         seq["outcome"] = outcome
         out.append(seq)
         stat["배틀 사용"] += 1
@@ -285,17 +323,19 @@ def build(decisions, protocols, min_matched, keep_ratio, workers=1):
 
 
 def main(args):
-    protocols = load_jsonl(args.protocols) if args.protocols else []
-    seqs, stat, unmatched = build(load_jsonl(args.decisions), protocols, args.min_matched, args.keep_ratio, args.workers)
+    seqs, stat, unmatched = build(load_jsonl(args.decisions), WORKERS)
     if not seqs:
         raise SystemExit(f"❌ 만들어진 배틀이 없음: {dict(stat)}")
-    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken"]}
+    if stat["배틀 제외(추적기 예외)"] > MAX_TRACKER_FAIL * (len(seqs) + stat["배틀 제외(추적기 예외)"]):
+        raise SystemExit(f"❌ reveals.py 추적기 예외로 버린 배틀이 {stat['배틀 제외(추적기 예외)']}개(전체의 {MAX_TRACKER_FAIL:.0%} 초과): src/core/reveals.py 확인 {dict(stat)}")
+    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken", "q_mean", "q_vis", "turn", "kind", "opp_action", "opp_move"]}
     data["lens"] = np.array([len(s["action_mask"]) for s in seqs])
     data["outcome"] = np.array([s["outcome"] for s in seqs], np.float32)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    np.savez(args.out, **data)
+    np.savez_compressed(args.out, **data)
     ent = -(data["target"] * np.log(np.clip(data["target"], 1e-9, 1))).sum(-1)
     print(f"✅ {len(seqs)}판 / 결정 {int(data['lens'].sum())}개 → {args.out}")
+    print(f"   reveals.py 추적기 예외로 버린 배틀 {stat['배틀 제외(추적기 예외)']}개")
     print(f"   Foul Play 승률(이 데이터) {np.mean(data['outcome'] > 0):.3f} | 교사 분포 평균 엔트로피 {ent.mean():.3f} | 최상위 행동 평균 확률 {data['target'].max(-1).mean():.3f}")
     print("   ", dict(stat))
     n_mask = (stat["마스크: 서버 요청 기반"] + stat["마스크: 규칙 대체(요청 못 찾음)"]) or 1
@@ -315,11 +355,5 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--decisions", required=True, help="Foul Play 결정 JSONL glob")
-    ap.add_argument("--protocols", default=None,
-                    help="상대편(poke-env)이 남긴 프로토콜 JSONL glob. 자가대전(FoulPlay vs FoulPlay)처럼 상대편 기록이 없으면 생략 — "
-                         "FoulPlay 자신이 남긴 protocol 레코드를 씀")
     ap.add_argument("--out", default="data/fp/fp_data.npz")
-    ap.add_argument("--workers", type=int, default=8, help="재생 병렬 프로세스 수")
-    ap.add_argument("--keep-ratio", type=float, default=0.2, help="탐색 분포에서 최고 확률의 이 비율 이상만 목표로. 낮을수록 원본 분포에 가까움(0=전체, Foul Play 자체 선택 규칙은 0.75지만 그대로 쓰면 알고리즘 절차를 모방하게 됨)")
-    ap.add_argument("--min-matched", type=float, default=0.6, help="탐색 분포 중 우리 행동 칸에 매칭돼야 하는 최소 질량 비율")
     main(ap.parse_args())

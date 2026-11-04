@@ -18,7 +18,7 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.teambuilder import Teambuilder
 
 from src.core.model import model_from_ckpt
-from src.evaluation.analyze_model import LoggingPlayer
+from src.evaluation.logging_player import LoggingPlayer
 from src.core.team_pool import RandomPoolTeambuilder
 
 
@@ -65,7 +65,7 @@ class RecordingPlayer(LoggingPlayer):
 def make(ckpt, name, exports, mode):
     model = model_from_ckpt(ckpt)
     model.eval()
-    p = RecordingPlayer(exports=exports, mode=mode, model=model, search_lambda=None,
+    p = RecordingPlayer(exports=exports, mode=mode, model=model,
                         account_configuration=AccountConfiguration(name, None), battle_format="gen9ou",
                         server_configuration=LocalhostServerConfiguration, max_concurrent_battles=8)
     p._team = RandomPoolTeambuilder(exports)

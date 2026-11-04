@@ -1,8 +1,7 @@
 """SPRT / 장부 / Bradley–Terry self-check: PYTHONPATH=. python tests/test_sprt.py"""
-import math
 import random
 
-from tools.bt_report import fit_bt, win_table
+from tools.bt_report import fit_bt
 from tools.ledger import balanced, pair_counts
 from tools.sprt import decide
 

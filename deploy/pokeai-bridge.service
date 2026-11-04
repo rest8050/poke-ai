@@ -6,7 +6,7 @@ After=network.target
 User=opc
 WorkingDirectory=/home/opc/pokeai-bridge
 Environment=PYTHONPATH=/home/opc/pokeai-bridge
-Environment=POKEAI_CKPT=checkpoints/supervised_v2_fp_v10boot.pt
+Environment=POKEAI_CKPT=checkpoints/supervised_v2_fp_v6_full.pt
 Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 ExecStart=/home/opc/pokeai-bridge/venv/bin/python -m src.core.bridge_server

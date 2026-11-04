@@ -1,7 +1,5 @@
 """순수 합법 마스크 self-check: PYTHONPATH=. python tests/test_legal_mask.py
 1) 서버 요청 -> 22칸 마스크 (정상 / 구애 고정 / 기술 한 개만 남는 고정 / 교체 봉쇄 / PP 소진 / 강제 교체 / 폼 이름 접두사), 2) 인코더가 순수 합법 마스크(legal_mask)와 휴리스틱 가지치기 마스크(action_mask)를 따로 주고 후자가 전자의 부분집합"""
-import numpy as np
-
 from src.core.tensor_encoder import BattleTensorEncoder, DummyBattle
 from src.training.replay_dataset import legal_from_request
 

@@ -8,7 +8,7 @@
   def  [B,6,24,4]  내 포켓몬 i가 상대 기술칸 j(상대 포켓몬 j//4의 j%4번 기술)에 맞을 때: (배율/4, 데미지 비율[최대HP 대비, 1.5 상한 후 /1.5], 확정 KO 가능, 공격기 여부)
   off  [B,6,24,4]  상대 포켓몬 o가 내 기술칸 j(내 포켓몬 j//4의 j%4번 기술)에 맞을 때: 같은 4개
   spd_my [B,6] 내 포켓몬 i의 스피드 / 상대 활성 스피드 (log2, ±2 상한 후 /2), spd_opp [B,6] 상대 포켓몬 o / 내 활성
-근사(ponytail): 레벨 100 가정, 상대 능력치는 종족값 → 252노력치/무보정 추정(2b+99, HP 2b+204; mult를 주면 신념이 예측한 배율을 곱함), 랜덤 편차는 평균 0.925(KO 판정은 최댓값 1.0),
+근사(ponytail): 레벨 100 가정, 상대 능력치는 종족값 → 252노력치/무보정 추정(2b+99, HP 2b+204; mult를 주면 세트 추정이 예측한 배율을 곱함), 랜덤 편차는 평균 0.925(KO 판정은 최댓값 1.0),
   급소/도구/특성 위력 보정/벽/공중부양 외 특성 면역은 미반영. 테라: 방어는 테라 타입 하나, 공격 자속은 원래 타입 + 테라 타입"""
 import json
 
@@ -58,7 +58,7 @@ class Matchup(nn.Module):
         v = num[..., 11:17] * 255.0                                                # hp, atk, def, spa, spd, spe
         if not mine:
             v = torch.cat([2 * v[..., :1] + 204, 2 * v[..., 1:] + 99], -1)
-            if mult is not None:                                                   # 신념이 예측한 노력치/성격 배율 [..., 6] (hp, atk, def, spa, spd, spe)
+            if mult is not None:                                                   # 세트 추정이 예측한 노력치/성격 배율 [..., 6] (hp, atk, def, spa, spd, spe)
                 v = v * mult
         st = self._stage(num[..., 3:8]) if staged else torch.ones_like(num[..., 3:8])    # atk, def, spa, spd, spe (staged=False: 랭크 무시 = 천진 상대)
         return v[..., 0], v[..., 1] * st[..., 0], v[..., 2] * st[..., 1], v[..., 3] * st[..., 2], v[..., 4] * st[..., 3], v[..., 5] * st[..., 4]

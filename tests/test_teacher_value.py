@@ -6,7 +6,6 @@ import tempfile
 import numpy as np
 
 from src.core.tensor_encoder import MOVE_NUM_DIM
-from src.training.replay_dataset import OBS_KEYS
 from src.training.train_fp_distill import KEYS, load
 
 

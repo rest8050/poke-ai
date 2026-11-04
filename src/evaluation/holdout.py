@@ -58,5 +58,5 @@ def write_group(name, path_in, path_out=PATH):
     else:
         names = [name]
         merged = {**new, "src": np.zeros(len(new["lens"]), np.int8)}
-    np.savez(path_out, **merged, src_names=np.array(names))
+    np.savez_compressed(path_out, **merged, src_names=np.array(names))
     return names, len(new["lens"]), int(new["lens"].sum())

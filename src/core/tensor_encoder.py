@@ -7,6 +7,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import Dict, Any, Tuple, List, Optional
 
+from poke_env.battle import Effect
+
 from src.core.events import SLOT_DIM, TURN_DIM
 
 
@@ -224,7 +226,7 @@ _DISRUPT = {"taunt", "encore", "disable", "torment", "healblock", "imprison", "t
 # (thunderclap: 상대가 공격기가 아니면 우선도 0으로 처리됨 / suckerpunch, upperhand: 조건 불충족 시 기술 자체가 실패).
 # 명목 priority 피처(4번)는 그대로 두고, "이 값은 상대 선택에 달려 있어 불확실하다"는 플래그만 따로 추가함
 # (날씨볼처럼 관측 가능한 상태에서 정답을 계산해 넣는 것과 달리, 상대의 동시 선택은 관측 불가능해 정답을 못 만듦 —
-#  대신 모델이 이미 갖고 있는 상대 행동 예측(opp_action_head)과 엮어 스스로 위험도를 배우게 유도하는 용도).
+#  대신 불확실 플래그만 넣어 모델이 스스로 위험도를 배우게 유도하는 용도).
 _CONDITIONAL_PRIORITY = {"thunderclap", "suckerpunch", "upperhand"}
 _RESIDUAL = {"leechseed", "saltcure", "partiallytrapped", "nightmare"}
 _HAZARDS = {"stealthrock", "spikes", "toxicspikes", "stickyweb"}
@@ -337,7 +339,7 @@ def move_effect_features(move_id: str) -> Tuple[float, ...]:
 
 def defender_ability(mon: Any) -> Optional[str]:
     """상성 판단용 방어측 특성: 공개됐거나 후보가 1개일 때만. 미공개면 ""(타입 상성만) — 이름 기반 세트 추정은 쓰지 않음"""
-    from src.core.rct_player import ability as known_ability
+    from src.core.effectiveness import ability as known_ability
     return known_ability(mon) or ""
 
 
@@ -414,7 +416,7 @@ def move_effectiveness(battle: Any, move: Any, defender: Any, def_ability: Optio
     """
     if defender is None or not (getattr(move, "base_power", 0) or 0):
         return 0.25
-    from src.core.rct_player import eff_move
+    from src.core.effectiveness import eff_move
     move_type = effective_move_type(battle, move)
     return min(4.0, eff_move(battle, move_type, defender, def_ability)) / 4.0
 
@@ -533,9 +535,13 @@ def _move_obj(move_id: str):
 # my_num / opp_num 레이아웃 [.., BASE_NUM] (죽은 칸 정리 후):
 #   0 필드 위, 1 기절, 2 HP비율, 3~7 공/방/특공/특방/스피드 랭크, 8 레벨, 9 기믹 활성, 10 기믹 사용가능,
 #   11 종족값(또는 내 쪽은 아는 경우 실능력치) HP, 12~16 공/방/특공/특방/스피드, 17 몸무게,
-#   18 아직 팀프리뷰로만 보임(상대 전용) — 뒤 SLOT_DIM칸은 상대 슬롯별 증거 (events.py)
+#   18 아직 팀프리뷰로만 보임(상대 전용) — 뒤 SLOT_DIM칸은 상대 슬롯별 증거 (events.py), 그 뒤 MON_EXT칸은 행동/카운터 (아래 MON_EXT). 팀 프리뷰로만 아는 상대 포켓몬의 HP는 1.0 (교사와 같음)
 BASE_NUM = 19
-NUM_DIM, CAT_DIM = BASE_NUM + SLOT_DIM, 11  # 카테고리 [0..9]=도구/특성/타입/상태/기술/테라, [10]=종 ID (상대만 모델이 씀)
+# 포켓몬별 추가 수치 (BASE_NUM + SLOT_DIM 뒤): 교사(Foul Play)가 엔진에 넘기는 행동/카운터 정보
+#   0 등장 직후 첫 턴, 1 등장 후 경과 턴/10, 2 수면 카운터/3, 3 맹독 카운터/15, 4 방어 연속/4, 5 반동으로 쉬는 중,
+#   6~11 마지막 행동 원핫 (기술칸 0~3, 교체, 없음), 12~15 등장 후 쓴 기술 (기술칸 0~3)  -- 활성 포켓몬만 값이 있음 (카운터는 교체 후보도)
+MON_EXT = 16
+NUM_DIM, CAT_DIM = BASE_NUM + SLOT_DIM + MON_EXT, 11  # 카테고리 [0..9]=도구/특성/타입/상태/기술/테라, [10]=종 ID (상대만 모델이 씀)
 # 양쪽 활성 포켓몬의 행동 제약 효과 (field_vec 뒤쪽 열, 내 쪽 다음 상대 쪽): 기술을 막는 효과 3 + 교체를 막는 효과 1 + 남은 턴 비율 3
 # (트집·기술 고정·교감은 poke-env가 효과로 안 남기거나 데이터에 거의 없어서 뺌: 난동 같은 고정은 합법 마스크가 "기술 1개만 가능"으로 알려 줌)
 # 남은 턴 = (지속 턴 - poke-env 카운터) / 지속 턴. 카운터는 시작 때 0, 턴이 끝날 때마다 +1. 지속 턴은 프로토콜 실측(앵콜/도발은 시작 2턴 뒤 종료 = 결정 2번 제약)과 게임 규칙
@@ -545,7 +551,19 @@ EFFECT_TURNS = {"TAUNT": 3, "ENCORE": 3, "DISABLE": 4}
 EFFECT_SIDE = len(EFFECT_FLAGS) + 1 + len(EFFECT_TURNS)
 EFFECT_DIM = 2 * EFFECT_SIDE
 EFFECT_START = 48 + TURN_DIM
-FIELD_DIM = EFFECT_START + EFFECT_DIM
+# 확장 블록 (EFFECT_START + EFFECT_DIM 뒤, 내 쪽 다음 상대 쪽): 활성 포켓몬의 휘발성 효과 전체 멀티핫(poke-env Effect 전 멤버) + 소원(진행 여부, 남은 턴/2) + 미래예지(진행 여부, 남은 턴/3)
+EFFECTS = list(Effect)
+EFFECT_INDEX = {e: i for i, e in enumerate(EFFECTS)}
+# Foul Play가 직접 붙이지만 poke-env Effect에는 없는 휘발성 이름을 뒤에 덧붙임 (unburden, truant, 충전 기술의 준비 상태 등)
+_EFFECT_NAMES = [re.sub(r"[^a-z0-9]", "", e.name.lower()) for e in EFFECTS]
+EFFECT_NAMES = _EFFECT_NAMES + [n for n in ("unburden", "truant", "solarbeam", "meteorbeam", "skyattack", "razorwind", "freezeshock", "iceburn", "skullbash",
+                                            "geomancy", "dig", "dive", "fly", "bounce", "phantomforce", "shadowforce", "skydrop") if n not in set(_EFFECT_NAMES)]
+NAME_INDEX = {n: i for i, n in enumerate(EFFECT_NAMES)}
+# poke-env는 가두기 기술마다 따로 효과를 붙이지만 Foul Play는 모두 partiallytrapped 하나로 봄
+TRAP_ALIASES = {"bind", "wrap", "firespin", "magmastorm", "sandtomb", "whirlpool", "clamp", "infestation", "snaptrap", "thundercage"}
+SIDE_EXT = len(EFFECT_NAMES) + 4
+EXT_START = EFFECT_START + EFFECT_DIM
+FIELD_DIM = EXT_START + 2 * SIDE_EXT
 
 
 def active_effect_vec(mon: Any) -> List[float]:
@@ -561,6 +579,65 @@ def active_effect_vec(mon: Any) -> List[float]:
     return v
 
 
+def _sp(pkmn):
+    return re.sub(r"[^a-z0-9]", "", str(getattr(pkmn, "species", "")).lower())
+
+
+def mon_ext(side, pkmn, is_active, battle, ev):
+    """포켓몬별 추가 수치 MON_EXT개 (MON_EXT 설명 참고). 값은 reveals.py의 추적기와 poke-env 상태에서 옴"""
+    v = [0.0] * MON_EXT
+    status = extract_enum_str(getattr(pkmn, "status", None))
+    rev = ev.rev if ev else None
+    age = rev.status_age(side, _sp(pkmn), status) if rev is not None else None
+    cnt = (age if age is not None else (getattr(pkmn, "status_counter", 0) or 0)) + 1     # 걸린 턴을 0으로 세므로 +1: 걸려 있으면 항상 0보다 큼
+    if status == "slp":
+        v[2] = min(cnt, 3) / 3.0
+    elif status == "tox":
+        v[3] = min(cnt, 15) / 15.0
+    if is_active:
+        v[4] = min(getattr(pkmn, "protect_counter", 0) or 0, 4) / 4.0
+        v[5] = 1.0 if getattr(pkmn, "must_recharge", False) else 0.0
+        if rev is not None:
+            sp = _sp(pkmn)
+            entry = rev.entry[side].get(sp)
+            if entry is not None:
+                age = max(0, (getattr(battle, "turn", 0) or 0) - entry)
+                v[0], v[1] = (1.0 if age == 0 else 0.0), min(age, 10) / 10.0
+            ids = [re.sub(r"[^a-z0-9]", "", str(getattr(m, "id", ""))) for m in list((getattr(pkmn, "moves", {}) or {}).values())[:4]]
+            act = rev.last_action[side]
+            if act is None or (act[0] == "move" and act[1] not in ids):
+                v[11] = 1.0
+            elif act[0] == "switch":
+                v[10] = 1.0
+            else:
+                v[6 + ids.index(act[1])] = 1.0
+            used = rev.used[side].get(sp, ())
+            for j, mid in enumerate(ids):
+                v[12 + j] = 1.0 if mid in used else 0.0
+    return v
+
+
+def side_ext(side, mon, ev):
+    """확장 블록 한쪽 (SIDE_EXT개): 활성 포켓몬의 휘발성 효과 멀티핫 + 소원/미래예지"""
+    v = np.zeros(SIDE_EXT, dtype=np.float32)
+    if mon is not None:
+        for e in (getattr(mon, "effects", None) or {}):
+            if e in EFFECT_INDEX:
+                v[EFFECT_INDEX[e]] = 1.0
+                if EFFECT_NAMES[EFFECT_INDEX[e]] in TRAP_ALIASES:
+                    v[NAME_INDEX["partiallytrapped"]] = 1.0
+        if getattr(mon, "must_recharge", False):
+            v[NAME_INDEX["mustrecharge"]] = 1.0
+    rev = ev.rev if ev else None
+    if rev is not None:
+        for name in rev.synth[side]:
+            if name in NAME_INDEX:
+                v[NAME_INDEX[name]] = 1.0
+        w, f = rev.wish[side], rev.future[side]
+        v[-4:] = [float(w > 0), w / 2.0, float(f > 0), f / 3.0]
+    return v
+
+
 class BattleTensorEncoder:
     """
     poke-env의 Battle 객체 또는 RCT Mod의 JSON 상태를 
@@ -570,7 +647,6 @@ class BattleTensorEncoder:
     def __init__(self, vocab_path: str = "data/vocab.json", device: str = "cpu"):
         self.vocab_mgr = VocabManager.get_instance(vocab_path)
         self.device = device
-        self.blind_preview = False  # True면 팀 프리뷰로 알게 된 상대 팀을 안 씀 (마인크래프트처럼 프리뷰가 없는 환경 재현: 상대는 등장해야 보임)
 
     def encode_battle(self, battle: Any) -> Tuple[torch.Tensor, ...]:
         """
@@ -587,6 +663,7 @@ class BattleTensorEncoder:
         field_vec = np.zeros((1, FIELD_DIM), dtype=np.float32)
         action_mask = np.zeros((1, 22), dtype=bool)
         legal_mask = np.zeros((1, 22), dtype=bool)     # 서버 요청이 알려 준 순수 합법성 (모델 입력 특징용). action_mask = 여기에 휴리스틱 가지치기를 더한 것 (로짓 마스킹 전용)
+        ev = battle.__dict__.get("_ev")  # 턴 사건/상대 증거/도구·특성 추적 (events.py, reveals.py가 parse_message에서 채움)
 
         if not hasattr(battle, "team") or not battle.team:
             return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask)
@@ -663,6 +740,7 @@ class BattleTensorEncoder:
                     my_m_num[0, i, m_idx, 8 + MOVE_EFFECT_DIM] = priority_speed_edge(battle, move, pkmn, opp_active_mon)
             for m_idx in range(min(4, len(moves_dict)), 4):  # 아직 안 드러난 기술 자리
                 my_cat[0, i, 5 + m_idx] = self.vocab_mgr.slot_id("move", None, True)
+            my_num[0, i, BASE_NUM + SLOT_DIM:] = mon_ext("me", pkmn, is_active, battle, ev)
 
             # species base_stats 7개 수치화 (my_num 뒤쪽 7 슬롯: 11~17)
             # 내 포켓몬은 노력치/성격을 알면(실전, 혹은 FoulPlay 재생) 종족값 대신 실제 능력치를 씀 → 아래 도구 배율도 그 위에 곱해짐
@@ -716,7 +794,7 @@ class BattleTensorEncoder:
         opp_team_list = list(battle.opponent_team.values()) if hasattr(battle, "opponent_team") else []
         n_seen = len(opp_team_list)
         seen_species = [re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", ""))) for p in opp_team_list]
-        for p in ([] if self.blind_preview else (getattr(battle, "teampreview_opponent_team", None) or [])):
+        for p in (getattr(battle, "teampreview_opponent_team", None) or []):
             sp = re.sub(r'[^a-z0-9]', '', str(getattr(p, "species", "")))
             # ponytail: 폼 차이(프리뷰 'urshifu' vs 실제 'urshifurapidstrike')는 접두사로만 매칭
             if sp and not any(s.startswith(sp) or sp.startswith(s) for s in seen_species):
@@ -730,7 +808,7 @@ class BattleTensorEncoder:
             
             opp_num[0, i, 0] = 1.0 if is_active else 0.0
             opp_num[0, i, 1] = 1.0 if getattr(pkmn, "fainted", False) else 0.0
-            opp_num[0, i, 2] = getattr(pkmn, "current_hp_fraction", 1.0)
+            opp_num[0, i, 2] = 1.0 if i >= n_seen else getattr(pkmn, "current_hp_fraction", 1.0)   # 팀 프리뷰로만 아는 포켓몬은 만피 (교사와 같음; 예전엔 0.0이라 매치업이 항상 KO로 계산)
             
             boosts = getattr(pkmn, "boosts", {}) or {}
             opp_num[0, i, 3] = boosts.get("atk", 0) / 6.0
@@ -763,6 +841,11 @@ class BattleTensorEncoder:
             moves_dict = getattr(pkmn, "moves", {}) or {}
             item_name = getattr(pkmn, "item", None)
             ability_name = getattr(pkmn, "ability", None)
+            if ev is not None:      # poke-env가 모르는 공개/추론된 도구와 특성 (Foul Play의 추적 규칙, reveals.py)
+                if item_name == "unknown_item":
+                    item_name = ev.rev.known_item("opp", _sp(pkmn)) or item_name
+                if not ability_name:
+                    ability_name = ev.rev.known_ability("opp", _sp(pkmn)) or ability_name
 
             opp_cat[0, i, 0] = self.vocab_mgr.slot_id("item", item_name, item_name == "unknown_item")
             opp_cat[0, i, 1] = self.vocab_mgr.slot_id("ability", ability_name, not ability_name)
@@ -830,7 +913,8 @@ class BattleTensorEncoder:
             opp_num[0, i, 15] = spd_val / 255.0
             opp_num[0, i, 16] = spe_val / 255.0
             opp_num[0, i, 17] = min(1.0, (getattr(pkmn, "weight", 0) or 0) / 500.0)
-            opp_num[0, i, BASE_NUM:] = ev.slot_vec(re.sub(r"[^a-z0-9]", "", str(getattr(pkmn, "species", "")).lower())) if ev else 0.0
+            opp_num[0, i, BASE_NUM:BASE_NUM + SLOT_DIM] = ev.slot_vec(_sp(pkmn)) if ev else 0.0
+            opp_num[0, i, BASE_NUM + SLOT_DIM:] = mon_ext("opp", pkmn, is_active, battle, ev)
 
         # --- C. 필드, 날씨, 룸 & 내/상대 사이드 조건(벽, 장판, 순풍) 48D 정밀 인코딩 ---
         if ev:  # 직전 턴 사건 10칸 (인덱스 48~57)
@@ -908,7 +992,9 @@ class BattleTensorEncoder:
         _encode_side(getattr(battle, "opponent_side_conditions", None), base_idx=32)
 
         field_vec[0, EFFECT_START:EFFECT_START + EFFECT_SIDE] = active_effect_vec(active_pkmn)
-        field_vec[0, EFFECT_START + EFFECT_SIDE:] = active_effect_vec(opp_active_mon)
+        field_vec[0, EFFECT_START + EFFECT_SIDE:EXT_START] = active_effect_vec(opp_active_mon)
+        field_vec[0, EXT_START:EXT_START + SIDE_EXT] = side_ext("me", active_pkmn, ev)
+        field_vec[0, EXT_START + SIDE_EXT:] = side_ext("opp", opp_active_mon, ev)
 
         # --- D. 행동 마스킹 ---
         if active_pkmn and hasattr(battle, "available_moves"):
