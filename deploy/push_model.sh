@@ -1,7 +1,7 @@
 #!/bin/bash
 # 서버 모델 교체 (재시작 없음): 체크포인트(+구조 설정 .cfg.json)를 올리고 포인터(checkpoints/CURRENT)만 바꾼다.
 # 브리지는 새 배틀이 시작될 때 포인터를 보고 새 모델로 바꿔 끼움(진행 중 배틀은 이전 모델로 마무리). 읽기에 실패하면 이전 모델을 유지.
-#   bash deploy/push_model.sh <이름>            예: v3_full  (checkpoints/supervised_v2_fp_<이름>.pt)
+#   bash deploy/push_model.sh <이름>            예: v6_full  (checkpoints/supervised_v2_fp_<이름>.pt)
 #   bash deploy/push_model.sh <이름> --code     코드(src/core 모델 파일, type_chart.json)도 같이 올림 — 새 구조(예: v3 첫 배포)일 때 필요.
 #                                               코드 파일을 바꿨으면 서비스 재시작이 한 번 필요: ssh oci 'sudo systemctl restart pokeai-bridge' (접속자 없을 때)
 #   bash deploy/push_model.sh --rollback        직전 포인터로 되돌림
@@ -21,7 +21,7 @@ esac
 NAME=$1; FILE=supervised_v2_fp_$NAME.pt; SRC=checkpoints/$FILE
 [ -f "$SRC" ] || { echo "체크포인트 없음: $SRC"; exit 1; }
 if [ "${2:-}" = "--code" ]; then
-  tar cf - src/__init__.py src/core/{__init__,bridge_server,events,model,model_v3,model_v3_legacy,model_v4,model_v5,model_v6,belief,matchup,rct_player,search,set_prior,tensor_encoder}.py data/type_chart.json | ssh_ "cd $REMOTE && tar xf -"
+  tar cf - src/__init__.py src/core/{__init__,bridge_server,events,model,model_v6,belief,matchup,effectiveness,actions,tensor_encoder}.py data/type_chart.json | ssh_ "cd $REMOTE && tar xf -"
   echo "코드 올림 (bridge_server/model 등을 바꿨다면 재시작 필요)"
 fi
 # 올리는 도중 반쯤 쓰인 파일을 읽지 않도록 임시 이름으로 올린 뒤 이름 변경, 구조 설정 파일이 먼저 가도록 순서 유지

@@ -12,8 +12,8 @@ except ImportError:
 
 
 if POKE_ENV_AVAILABLE:
-    from src.core.rct_player import _id, eff_move, types
-    from src.core.search import decode_action, search_pick
+    from src.core.effectiveness import _id, eff_move, types
+    from src.core.actions import decode_action
 
     def lead_score(battle, me, opps):
         """선두 점수 = 상대 팀 평균 (내 최고 공격 배율 - 상대 자속 최고 배율)"""
@@ -32,14 +32,11 @@ if POKE_ENV_AVAILABLE:
     class SmartPokemonPlayer(Player):
         """
         분리된 BattleTensorEncoder 모듈을 사용하는 스마트 poke-env 플레이어
-        search_lambda: None이면 정책만, 숫자면 1턴 탐색과 혼합 (평가/배포 전용)
         """
-        def __init__(self, model: DeepPokemonBattleTransformerNet = None, vocab_path: str = "data/vocab.json",
-                     search_lambda=None, **kwargs):
+        def __init__(self, model: DeepPokemonBattleTransformerNet = None, vocab_path: str = "data/vocab.json", **kwargs):
             super().__init__(**kwargs)
             self.model = model or DeepPokemonBattleTransformerNet(vocab_path=vocab_path)
             self.encoder = BattleTensorEncoder(vocab_path=vocab_path)
-            self.search_lambda = search_lambda
             # 배틀별 GRU 히스토리 (battle_tag -> Tensor)
             # ponytail: 끝난 배틀도 남음, 장시간 돌리면 battle.finished 기준으로 정리
             self.history = {}
@@ -71,13 +68,11 @@ if POKE_ENV_AVAILABLE:
             tensors = self.encoder.encode_battle(battle)
             my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask = tensors
 
-            # 2. 신경망 추론 (+ 선택적 1턴 탐색)
+            # 2. 신경망 추론
             tag = battle.battle_tag
-            action_idx, p_probs, opp_p_probs, val, self.history[tag] = self.model.get_action(
+            action_idx, p_probs, val, self.history[tag] = self.model.get_action(
                 my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, self.history.get(tag), action_mask, legal_mask
             )
-            if self.search_lambda is not None:
-                action_idx = search_pick(battle, p_probs[0], self.search_lambda) or action_idx
 
             # 3. 행동 매핑 (폴백: 안전한 무작위 선택)
             return self.order_for(battle, action_idx) or self.choose_random_move(battle)

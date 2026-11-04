@@ -52,7 +52,7 @@ async def worker(a):
     from poke_env.concurrency import POKE_LOOP
     import json
     from src.core.model import model_from_ckpt
-    from src.evaluation.analyze_model import LoggingPlayer
+    from src.evaluation.logging_player import LoggingPlayer
     from src.core.team_pool import RandomPoolTeambuilder
 
     pool_name, pool_path = a.pool.split("=", 1)
@@ -79,7 +79,7 @@ async def worker(a):
         chunk += 1
 
         def make(model, suffix):
-            p = Player(mode="argmax", model=model, search_lambda=None, battle_format="gen9ou", server_configuration=server,
+            p = Player(mode="argmax", model=model, battle_format="gen9ou", server_configuration=server,
                        account_configuration=AccountConfiguration(f"w{a.run}{a.idx}{chunk % 100}{suffix}", None),
                        max_concurrent_battles=a.concurrent)
             p._team = RandomPoolTeambuilder(exports)

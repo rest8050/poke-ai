@@ -11,7 +11,7 @@ class FakeMove:
 
 
 class FakePokemon:
-    """rct_player.types()/ability()가 읽는 poke-env Pokemon 속성만 최소로 흉내"""
+    """effectiveness.types()/ability()가 읽는 poke-env Pokemon 속성만 최소로 흉내"""
     def __init__(self, type_1, type_2=None):
         self.type_1 = type_1
         self.type_2 = type_2
