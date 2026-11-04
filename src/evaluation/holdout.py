@@ -11,6 +11,14 @@ LEGACY = ("dg2", "dg3", "dg4", "fp")
 MOVE_DIM = 46   # 기술 수치 칸 수: 옛 파일(44)은 0으로 채워 통일 (모델 쪽에서 필요하면 잘라 씀)
 
 
+def decision_pos(z, lens):
+    """결정마다 히스토리 위치 [N]: 배틀 안에서 몇 번째 결정 지점인가 (build_fp_dataset의 pos). pos가 없는 옛 파일은 배틀마다 0,1,2,...
+    학습(train_fp_distill.make_batches)과 평가가 같은 위치를 써야 실전 히스토리와 맞음"""
+    if "pos" in getattr(z, "files", z):
+        return np.asarray(z["pos"]).astype(np.int64)
+    return np.concatenate([np.arange(int(n)) for n in lens]) if len(lens) else np.zeros(0, np.int64)
+
+
 def pad_moves(d):
     for k in ("my_move_num", "opp_move_num"):
         if d[k].shape[-1] < MOVE_DIM:
@@ -38,22 +46,24 @@ def write_group(name, path_in, path_out=PATH):
     import os
     z = np.load(path_in)
     new = pad_moves({k: z[k] for k in KEYS + ["lens"]})
+    new["pos"] = decision_pos(z, new["lens"])
     if os.path.exists(path_out):
         old = np.load(path_out)
         names = [str(n) for n in old["src_names"]]
         old_d = {k: old[k] for k in KEYS + ["lens", "src"]}
+        old_d["pos"] = decision_pos(old, old_d["lens"])
         if name in names:      # 교체: 그 그룹의 시퀀스를 빼고 나머지를 남김
             gi = names.index(name)
             keep = old_d["src"] != gi
             dec_keep = np.repeat(keep, old_d["lens"])
-            for k in KEYS:
+            for k in KEYS + ["pos"]:
                 old_d[k] = old_d[k][dec_keep]
             old_d["lens"], old_d["src"] = old_d["lens"][keep], old_d["src"][keep]     # 이름 자리는 그대로 (번호가 바뀌지 않게)
         else:
             names.append(name)
         gi = names.index(name)
         old_d = pad_moves(old_d)
-        merged = {k: np.concatenate([old_d[k], new[k]]) for k in KEYS + ["lens"]}
+        merged = {k: np.concatenate([old_d[k], new[k]]) for k in KEYS + ["lens", "pos"]}
         merged["src"] = np.concatenate([old_d["src"], np.full(len(new["lens"]), gi, np.int8)])
     else:
         names = [name]

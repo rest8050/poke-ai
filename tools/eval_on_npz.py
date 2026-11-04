@@ -8,6 +8,7 @@ import torch
 
 sys.path.insert(0, ".")
 from src.core.model import model_from_ckpt
+from src.evaluation.holdout import decision_pos
 
 KEYS = ["my_team_cat", "my_team_num", "my_move_num", "opp_team_cat", "opp_team_num", "opp_move_num", "field_vec"]
 
@@ -23,6 +24,7 @@ for path in sys.argv[2:]:
             pad = np.zeros(z[k].shape[:-1] + (move_in - z[k].shape[-1],), dtype=z[k].dtype)
             z[k] = np.concatenate([z[k], pad], axis=-1)
     lens = z["lens"]
+    pos = decision_pos(z0, lens)          # 히스토리 위치 (학습과 같게, 옛 파일은 0,1,2,...)
     off = np.concatenate([[0], np.cumsum(lens)])
     src = z0["src"] if "src" in z0.files else np.zeros(len(lens), dtype=int)       # 그룹이 없는 파일은 통째로 한 그룹
     gname = [str(g) for g in z0["src_names"]] if "src_names" in z0.files else [path]
@@ -32,7 +34,7 @@ for path in sys.argv[2:]:
             s, e = off[b], off[b + 1]
             T = e - s
             out = model.forward_sequences([torch.tensor(z[k][s:e]) for k in KEYS], torch.zeros(T, dtype=torch.long),
-                                          torch.arange(T), 1, torch.tensor(z["action_mask"][s:e]))
+                                          torch.from_numpy(pos[s:e]).long(), 1, torch.tensor(z["action_mask"][s:e]))
             lp = torch.log_softmax(out["policy_logits"], -1)
             t = torch.tensor(z["target"][s:e])
             a = acc[int(src[b])]

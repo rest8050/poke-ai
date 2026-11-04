@@ -1,4 +1,6 @@
 """build_fp_dataset.to_target: 정책 그라디언트용 action_taken(실제로 둔 수의 22칸 인덱스) 추출이 정확한지 확인."""
+import json
+
 import numpy as np
 
 from src.training.build_fp_dataset import load_jsonl, to_target
@@ -62,6 +64,24 @@ def test_load_jsonl_reads_plain_and_gzip(tmp_path=None):
     assert len(got) == 4 and {r["_src"].split(os.sep)[-1] for r in got} == {"dec_x_00.jsonl", "dec_x_01.jsonl.gz"}
 
 
+def test_own_request_filters_side_and_broken_lines():
+    from src.training.build_fp_dataset import _own_request
+    line = lambda req: ["", "request", json.dumps(req)]
+    assert _own_request(line({"side": {"id": "p1"}, "rqid": 3}), "p1")["rqid"] == 3
+    assert _own_request(line({"side": {"id": "p2"}}), "p1") is None          # 다른 컨테이너 기록의 상대 쪽 요청
+    assert _own_request(["", "request", "{broken"], "p1") is None
+    split = ("|request|" + json.dumps({"side": {"id": "p1"}, "x": "a|b"})).split("|")      # JSON 안의 | 로 쪼개진 줄도 다시 이어 붙여 읽음
+    assert _own_request(split, "p1")["x"] == "a|b"
+
+
+def test_needs_switch_only_for_own_forced_switch():
+    from src.training.build_fp_dataset import _needs_switch
+    assert _needs_switch({"forceSwitch": [True], "side": {}})                   # 기절 후 / 피벗 교체
+    assert not _needs_switch({"forceSwitch": [False]})
+    assert not _needs_switch({"wait": True, "side": {}})                        # 상대만 교체할 때
+    assert not _needs_switch({"active": [{"moves": []}], "side": {}})          # 턴 결정
+
+
 if __name__ == "__main__":
     test_load_jsonl_reads_plain_and_gzip()
     test_move_choice_gives_matching_index()
@@ -70,6 +90,8 @@ if __name__ == "__main__":
     test_unmatched_choice_gives_none()
     test_choice_illegal_in_mask_gives_none()
     test_no_choice_arg_returns_none()
+    test_own_request_filters_side_and_broken_lines()
+    test_needs_switch_only_for_own_forced_switch()
     print("ok")
 
 

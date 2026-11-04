@@ -10,6 +10,7 @@ from scipy.stats import rankdata
 
 sys.path.insert(0, ".")
 from src.core.model import model_from_ckpt
+from src.evaluation.holdout import decision_pos
 from src.core.tensor_encoder import EFFECT_FLAGS, EFFECT_START
 
 OBS = ["my_team_cat", "my_team_num", "my_move_num", "opp_team_cat", "opp_team_num", "opp_move_num", "field_vec"]
@@ -20,6 +21,7 @@ EPS = 1e-12
 def load_set(path):
     z = np.load(path)
     d = {k: z[k] for k in OBS + ["action_mask", "target", "lens"]}
+    d["pos"] = decision_pos(z, d["lens"])          # 히스토리 위치 (학습과 같게, 옛 파일은 0,1,2,...)
     for k in ("my_move_num", "opp_move_num"):
         if d[k].shape[-1] < 46:
             d[k] = np.concatenate([d[k], np.zeros(d[k].shape[:-1] + (46 - d[k].shape[-1],), d[k].dtype)], -1)
@@ -67,7 +69,7 @@ def infer(model, d, dev):
             sl = slice(off[i], off[min(i + 32, len(lens))])
             obs = [torch.tensor(d[k][sl][..., :mv_in] if k in ("my_move_num", "opp_move_num") else d[k][sl]).to(dev) for k in OBS]
             ch = lens[i:i + 32]
-            si = torch.cat([torch.full((n,), j) for j, n in enumerate(ch)]).to(dev); ti = torch.cat([torch.arange(n) for n in ch]).to(dev)
+            si = torch.cat([torch.full((n,), j) for j, n in enumerate(ch)]).to(dev); ti = torch.from_numpy(d["pos"][sl]).long().to(dev) if "pos" in d else torch.cat([torch.arange(n) for n in ch]).to(dev)
             lg = model.forward_sequences(obs, si, ti, len(ch), action_mask=torch.tensor(d["action_mask"][sl]).to(dev))["policy_logits"]
             out.append(torch.softmax(lg.double(), -1).cpu().numpy())
     return np.concatenate(out)
