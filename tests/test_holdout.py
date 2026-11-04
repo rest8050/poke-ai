@@ -34,4 +34,17 @@ with tempfile.TemporaryDirectory() as td:
     H.write_group("a", c, out)
     seqs = H.load_holdout(("a", "b"), out)
     assert sorted(len(s[2]) for s in seqs if s[0] == "a") == [2, 2] and [len(s[2]) for s in seqs if s[0] == "b"] == [4]
+    # 히스토리 위치(pos): 옛 파일은 배틀마다 0,1,2,..., pos가 든 파일은 그대로 (빠진 결정 지점이 있으면 번호가 건너뜀), 교체해도 짝이 맞음
+    assert list(H.decision_pos({"lens": np.array([3, 2])}, [3, 2])) == [0, 1, 2, 0, 1]
+    e = os.path.join(td, "e.npz"); de = make(e, [3], 46, 3)
+    np.savez(e, **de, pos=np.array([0, 2, 3]))
+    H.write_group("e", e, out)
+    z = np.load(out)
+    names = [str(n) for n in z["src_names"]]
+    src = np.repeat(z["src"], z["lens"])
+    assert list(z["pos"][src == names.index("e")]) == [0, 2, 3] and list(z["pos"][src == names.index("b")]) == [0, 1, 2, 3]
+    H.write_group("b", b, out)
+    z = np.load(out)
+    src = np.repeat(z["src"], z["lens"])
+    assert list(z["pos"][src == names.index("e")]) == [0, 2, 3] and len(z["pos"]) == int(z["lens"].sum())
 print("ok")

@@ -15,10 +15,9 @@ import json
 import torch
 import torch.nn as nn
 
+from src.core.mechanics import IMMUNE_ABILITIES
+
 TYPE_N = 21  # 0 없음, 1~18 타입, 19 stellar, 20 <unk> (vocab과 동일) — 0/19/20은 항상 등배
-IMMUNE_ABILITIES = {"levitate": "ground", "eartheater": "ground", "flashfire": "fire", "wellbakedbody": "fire", "waterabsorb": "water",
-                    "dryskin": "water", "stormdrain": "water", "voltabsorb": "electric", "lightningrod": "electric", "motordrive": "electric",
-                    "sapsipper": "grass"}
 
 
 class Matchup(nn.Module):

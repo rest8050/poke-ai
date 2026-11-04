@@ -103,6 +103,9 @@ npz 데이터셋은 `savez_compressed`로 저장한다(빌더·holdout 기본). 
 
 증류는 누적 전체 데이터로 처음부터 학습한다 (워밍스타트와 KL 항은 지움: v6/v7/v8 모두 처음부터, KL 0). `--out`이 기존 체크포인트 이름이면 덮어쓰니 다른 이름을 쓸 것.
 
+결정 지점과 히스토리 위치 (2026-11 수정): 강제 교체 상태는 이 쪽의 `forceSwitch` 요청이 온 시점에 캡처한다. 기절 후 교체뿐 아니라 유턴·볼트체인지 같은 피벗 교체도 학습 행이 되고, 동시 기절 턴에 상대의 새 포켓몬이 미리 보이지 않는다(요청 기록이 없는 옛 프로토콜만 예전 방식).
+npz의 `pos`는 그 결정이 배틀의 몇 번째 결정 지점인지이고, 학습(`make_batches`)과 `legal_eval.infer`, `eval_on_npz`, 홀드아웃 통합이 히스토리 위치로 쓴다. 매칭 실패 등으로 빠진 결정 지점은 빈 칸으로 남아서 실전(모든 결정을 이어 붙임)과 번호가 같다. `pos`가 없는 옛 npz는 예전처럼 0,1,2,...라서 이득을 보려면 데이터를 다시 빌드해야 한다. 빌더 출력의 "결정 지점 중 학습 행" 비율로 빠진 정도를 확인할 것.
+
 ## 5. 평가
 
 ```bash
@@ -144,6 +147,16 @@ python tools/paired_eval.py --a v6_full --b v8_full --sets data/dagger/d7_ho.npz
 # 교사 잡음 상한: 같은 상태를 Foul Play가 두 번 라벨링한 결정기록 두 벌의 일치율/KL/regret (학생이 낼 수 있는 값의 기준). 재라벨은 logs/ceiling_run.sh (탐색이 시간 기반이라 다른 CPU 작업 금지)
 python tools/teacher_ceiling.py --a "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --b "data/dagger/raw/d7b/lab_rec_*_h*.jsonl"
 ```
+
+### 5-2. 행동 사건 추출 + 손계산 오차 진단 (결과 예측기 1단계)
+
+자가대전 기록에서 기술/등장 사건(직전 상태 → 결과)을 뽑고, 모델의 손계산(Matchup과 같은 근사)이 실제 피해와 어디서 어긋나는지 특성/도구/기술/날씨/벽/랭크별로 집계한다.
+메커니즘 표에 무엇부터 넣을지, 학습된 보정이 얼마나 필요한지를 여기서 정한다. 사건 추출은 표준 라이브러리만 써서 빠르고, 진단만 poke-env가 필요함.
+```bash
+python tools/extract_events.py --decisions "data/fp_selfplay/ms300/dec_sp12[abc]_*.jsonl" --out data/events/sp12.jsonl.gz   # --max-battles 500 으로 빠르게 맛보기
+python tools/damage_residual_report.py data/events/sp12.jsonl.gz --min-n 30 --tsv logs/damage_residual_sp12.tsv              # --stats standard: 노력치 표준 가정과 비교
+```
+읽는 법: 그룹의 "실제/손계산"이 1에서 멀고 n이 클수록 손계산이 놓친 메커니즘 (개별 |r| 0.1 안팎은 난수/HP 반올림 잡음). KO는 따로("최대 난수 손계산이 KO를 예측한 비율"), 장판 피해와 위협 발동 결과도 함께 찍힘.
 
 ## 6. 검증 표준 (학생 상태 홀드아웃 + 직접 대전)
 
