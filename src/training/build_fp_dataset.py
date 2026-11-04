@@ -143,35 +143,57 @@ def _apply_request(st, req, kind):
             st["pp_empty"] = np.array([i in empty for i in ids] + [False] * (4 - len(ids)))
 
 
+def _own_request(s, side):
+    """|request| 줄 -> 이 쪽(side)의 요청 dict. 깨진 줄이거나 상대 쪽 요청(다른 컨테이너 기록으로 대신 재생할 때)이면 None"""
+    try:
+        req = json.loads("|".join(s[2:]))
+    except ValueError:
+        return None
+    return req if (req.get("side") or {}).get("id") in (None, side) else None
+
+
+def _needs_switch(req):
+    """강제 교체 요청인가 (기절 후, 피벗 기술, 탈출버튼 등. 상대만 교체할 때 오는 wait 요청은 아님)"""
+    return any(req.get("forceSwitch") or []) and not req.get("wait")
+
+
 def replay_states(protocol, side, name, team):
-    """Foul Play 시점으로 재생해 결정 지점의 상태들 [(상태, 게임 턴, 종류 0=턴 1=기절 후 교체)]"""
+    """Foul Play 시점으로 재생해 결정 지점의 상태들 [(상태, 게임 턴, 종류 0=턴 1=강제 교체)] (재생 순서 = 실전에서 결정을 내리는 순서)
+    강제 교체는 이 쪽의 forceSwitch 요청이 온 시점에 캡처: 기절 후 교체뿐 아니라 유턴·볼트체인지 같은 피벗 교체도 잡히고,
+    양쪽이 동시에 쓰러진 턴에도 교체 줄들보다 앞이라 상대의 새 포켓몬이 아직 안 보임 (결정할 때 Foul Play가 아는 것과 같음).
+    이 쪽 요청 기록이 없는 프로토콜은 예전 방식(기절 뒤 내 교체 줄에서 캡처, 피벗 교체는 못 잡음)으로 대신함"""
     lines = [l.split("|") for l in protocol if l.startswith("|") and l != "|"]
     lines = [s for s in lines if len(s) > 1]
+    reqs = {i: _own_request(s, side) for i, s in enumerate(lines) if s[1] == "request"}
+    by_request = any(r is not None for r in reqs.values())
     info = team_info(team)
     battle = Battle(f"fp-{side}", name, _LOGGER, gen=9)
     states, forced = [], False
-    last_req, waiting = None, None      # 서버 요청: 턴 결정의 요청은 |turn| 줄 바로 뒤에 오고, 강제 교체의 요청은 교체 직전에 이미 와 있음
-    for s in lines:
+    waiting, forced_rqid = None, None      # 서버 요청: 턴 결정의 요청은 |turn| 줄 바로 뒤에 오고, 강제 교체의 요청은 교체 줄들보다 먼저 옴
+    for i, s in enumerate(lines):
         ev = s[1]
         if ev == "request":
-            try:
-                req = json.loads("|".join(s[2:]))
-            except ValueError:
+            req = reqs[i]
+            if req is None:
                 continue
             if waiting is not None and req.get("active"):
                 _apply_request(states[waiting][0], req, "turn")
                 waiting = None
-            last_req = req
+            elif _needs_switch(req) and (req.get("rqid") is None or req.get("rqid") != forced_rqid):      # 같은 요청을 다시 보낸 경우는 한 번만
+                st = _capture(battle, "forced")
+                _apply_request(st, req, "forced")
+                act = battle.active_pokemon
+                st["pivot"] = bool(act is not None and not act.fainted)       # 기절이 아닌 강제 교체 (피벗 기술, 탈출버튼 등)
+                states.append((st, battle.turn, 1))
+                forced_rqid = req.get("rqid")
             continue
         own = len(s) > 2 and s[2].startswith(side) and len(s[2]) > 2 and s[2][2] in "abc"
-        if own and ev == "switch" and forced:
-            st = _capture(battle, "forced")
-            if last_req and last_req.get("forceSwitch"):
-                _apply_request(st, last_req, "forced")
-            states.append((st, battle.turn, 1))
-            forced = False
-        elif own and ev == "faint":
-            forced = True
+        if not by_request:          # 요청 기록이 없을 때만: 기절 뒤 내 교체 줄에서 캡처
+            if own and ev == "switch" and forced:
+                states.append((_capture(battle, "forced"), battle.turn, 1))
+                forced = False
+            elif own and ev == "faint":
+                forced = True
         if ev == "poke" and len(s) > 3:
             if s[2] == side:
                 battle._team[f"{side}: {s[3].split(',')[0]}"] = _preview_mon(s[3], info)
@@ -264,16 +286,18 @@ def build(decisions, workers=1):
         if n_err:
             stat["배틀 제외(추적기 예외)"] += 1
             continue
-        queues = defaultdict(list)
-        for st, turn, kind in states:
-            queues[(turn, kind)].append(st)
-        steps, tvals, qms, qvs, extra = [], [], [], [], []
+        queues = defaultdict(list)          # (게임 턴, 종류) -> [(결정 지점 번호, 상태)] 재생 순서대로
+        for pos, (st, turn, kind) in enumerate(states):
+            queues[(turn, kind)].append((pos, st))
+            stat["강제 교체 결정 지점 중 피벗(기절 아님)"] += bool(kind == 1 and st.get("pivot"))
+        stat["결정 지점(재생 상태)"] += len(states)
+        rows = []                           # 결정 지점 번호 순으로 정렬해 시퀀스를 만듦 (히스토리 순서 = 실전에서 결정하는 순서)
         for r in d["dec"]:
             key = (r["turn"], int(r["force_switch"]))
             if not queues[key]:
                 stat["결정 제외(상태 못 찾음)"] += 1
                 continue
-            st = queues[key].pop(0)
+            pos, st = queues[key].pop(0)
             from_req = st.get("mask_src") == "request"      # replay_states가 서버 요청에서 만든 순수 합법 마스크 (없으면 규칙 마스크)
             stat["마스크: 서버 요청 기반" if from_req else "마스크: 규칙 대체(요청 못 찾음)"] += 1
             opt, bad = legal_from_options(r, st)             # Foul Play가 고려한 옵션: 진단용 (마스크는 요청 기반)
@@ -296,26 +320,26 @@ def build(decisions, workers=1):
             if target is None or matched < MIN_MATCHED:
                 stat["결정 제외(행동 매칭 실패)"] += 1
                 continue
-            steps.append((st, target, -1 if action_idx is None else action_idx))
             cls, mid = opp_map.get(r["turn"], (-1, "")) if key[1] == 0 else (-2, "")       # 강제 교체 상태에서는 상대가 행동하지 않음(-2)
-            extra.append((st["turn"], key[1], cls, MOVE_ID.get(mid, 0)))
-            tvals.append(float(r["value"]))
             qm, qv = action_values(st, r.get("worlds"))
-            qms.append(qm)
-            qvs.append(qv)
+            rows.append({"pos": pos, "st": st, "target": target, "a": -1 if action_idx is None else action_idx, "tv": float(r["value"]),
+                         "qm": qm, "qv": qv, "extra": (st["turn"], key[1], cls, MOVE_ID.get(mid, 0))})
             stat["결정 사용"] += 1
-        if len(steps) < 2:
+        if len(rows) < 2:
             continue
+        rows.sort(key=lambda x: x["pos"])
         outcome = 1.0 if d["end"]["winner"] == user else -1.0
-        T = len(steps)
-        seq = {k: np.stack([s["obs"][i] for s, _, _ in steps]) for i, k in enumerate(OBS_KEYS)}
-        seq["action_mask"] = np.stack([s["mask"] for s, _, _ in steps])
-        seq["target"] = np.stack([t for _, t, _ in steps])
-        seq["action_taken"] = np.array([a for _, _, a in steps], np.int64)  # 정책 그라디언트용, -1=실제 선택 매칭 실패
-        seq["value_target"] = (GAMMA ** np.arange(T - 1, -1, -1, dtype=np.float32)) * outcome - np.array([s["phi"] for s, _, _ in steps], np.float32)
-        seq["teacher_value"] = np.array(tvals, np.float32)
-        seq["q_mean"], seq["q_vis"] = np.stack(qms), np.stack(qvs)     # 행동별 탐색 가치/방문 수 (regret 평가용, tools/regret_eval.py)
-        seq["turn"], seq["kind"], seq["opp_action"], seq["opp_move"] = (np.array(c, dt) for c, dt in zip(zip(*extra), (np.int16, np.int8, np.int8, np.int16)))     # 동역학/상대 행동 예측용: 게임 턴, 0 턴 결정/1 강제 교체, 그 턴 상대의 행동 종류, 상대가 쓴 기술(어휘 번호)
+        T = len(rows)
+        seq = {k: np.stack([x["st"]["obs"][i] for x in rows]) for i, k in enumerate(OBS_KEYS)}
+        seq["action_mask"] = np.stack([x["st"]["mask"] for x in rows])
+        seq["target"] = np.stack([x["target"] for x in rows])
+        seq["action_taken"] = np.array([x["a"] for x in rows], np.int64)  # 정책 그라디언트용, -1=실제 선택 매칭 실패
+        seq["value_target"] = (GAMMA ** np.arange(T - 1, -1, -1, dtype=np.float32)) * outcome - np.array([x["st"]["phi"] for x in rows], np.float32)
+        seq["teacher_value"] = np.array([x["tv"] for x in rows], np.float32)
+        seq["q_mean"], seq["q_vis"] = np.stack([x["qm"] for x in rows]), np.stack([x["qv"] for x in rows])     # 행동별 탐색 가치/방문 수 (regret 평가용, tools/regret_eval.py)
+        seq["turn"], seq["kind"], seq["opp_action"], seq["opp_move"] = (np.array(c, dt) for c, dt in zip(zip(*[x["extra"] for x in rows]), (np.int16, np.int8, np.int8, np.int16)))     # 동역학/상대 행동 예측용: 게임 턴, 0 턴 결정/1 강제 교체, 그 턴 상대의 행동 종류, 상대가 쓴 기술(어휘 번호)
+        # 히스토리 위치: 이 배틀의 결정 지점 중 몇 번째인가. 라벨이 없어 빠진 결정 지점(매칭 실패, 기록 없음)이 있어도 실전과 같은 번호가 됨
+        seq["pos"] = np.array([x["pos"] for x in rows], np.int16)
         seq["outcome"] = outcome
         out.append(seq)
         stat["배틀 사용"] += 1
@@ -328,7 +352,7 @@ def main(args):
         raise SystemExit(f"❌ 만들어진 배틀이 없음: {dict(stat)}")
     if stat["배틀 제외(추적기 예외)"] > MAX_TRACKER_FAIL * (len(seqs) + stat["배틀 제외(추적기 예외)"]):
         raise SystemExit(f"❌ reveals.py 추적기 예외로 버린 배틀이 {stat['배틀 제외(추적기 예외)']}개(전체의 {MAX_TRACKER_FAIL:.0%} 초과): src/core/reveals.py 확인 {dict(stat)}")
-    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken", "q_mean", "q_vis", "turn", "kind", "opp_action", "opp_move"]}
+    data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken", "q_mean", "q_vis", "turn", "kind", "opp_action", "opp_move", "pos"]}
     data["lens"] = np.array([len(s["action_mask"]) for s in seqs])
     data["outcome"] = np.array([s["outcome"] for s in seqs], np.float32)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -338,6 +362,9 @@ def main(args):
     print(f"   reveals.py 추적기 예외로 버린 배틀 {stat['배틀 제외(추적기 예외)']}개")
     print(f"   Foul Play 승률(이 데이터) {np.mean(data['outcome'] > 0):.3f} | 교사 분포 평균 엔트로피 {ent.mean():.3f} | 최상위 행동 평균 확률 {data['target'].max(-1).mean():.3f}")
     print("   ", dict(stat))
+    n_pts = stat["결정 지점(재생 상태)"] or 1
+    print(f"   결정 지점 {stat['결정 지점(재생 상태)']}개 중 학습 행 {stat['결정 사용']}개 ({stat['결정 사용'] / n_pts:.1%}, 나머지는 히스토리 위치만 비워 둠), "
+          f"그중 피벗 강제 교체 지점 {stat['강제 교체 결정 지점 중 피벗(기절 아님)']}개")
     n_mask = (stat["마스크: 서버 요청 기반"] + stat["마스크: 규칙 대체(요청 못 찾음)"]) or 1
     n_free = stat["제약 없는 상태(등장 직후 첫 턴, 비고정 도구, 도발·앵콜 등 없음)"]
     n_prune = stat["요청상 합법인데 FP 옵션에 없는 행동이 있는 결정(FP 자체 가지치기)"]

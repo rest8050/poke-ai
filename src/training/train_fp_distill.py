@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from src.core.model import build_model, load_compatible, save_ckpt
+from src.evaluation.holdout import decision_pos
 from src.core.tensor_encoder import MOVE_NUM_DIM
 from src.training.hidden_labels import hidden_loss, vocab_sizes
 from src.training.replay_dataset import OBS_KEYS
@@ -62,7 +63,8 @@ def make_batches(data, offsets, idx, size, shuffle, gammas=()):
         if "teacher_value" in data:      # 교사(탐색)가 결정마다 본 승률 0~1 → ±1 척도 (build_fp_dataset로 만든 새 데이터에만 있음)
             b["teacher_value"] = torch.from_numpy(np.concatenate([data["teacher_value"][offsets[j]:offsets[j + 1]] for j in sel])).float() * 2 - 1
         b["seq_index"] = torch.cat([torch.full((n,), s) for s, n in enumerate(lens)])
-        b["time_index"] = torch.cat([torch.arange(n) for n in lens])
+        # 히스토리 위치 = 결정 지점 번호: 라벨이 없어 빠진 결정 지점은 빈 칸으로 남아 실전(모든 결정을 이어 붙임)과 같은 번호가 됨
+        b["time_index"] = torch.cat([torch.from_numpy(data["pos"][offsets[j]:offsets[j + 1]]).long() for j in sel]) if "pos" in data else torch.cat([torch.arange(n) for n in lens])
         b["n_seq"] = len(sel)
         yield b
 
@@ -206,6 +208,8 @@ def load(pattern):
     data["outcome"] = np.concatenate([p["outcome"] for p in parts])
     if any("teacher_value" in p.files for p in parts):      # 교사 가치가 없는 파일(옛 형식)은 NaN → 그 결정은 할인된 결과만으로 학습
         data["teacher_value"] = np.concatenate([p["teacher_value"] if "teacher_value" in p.files else np.full(int(p["lens"].sum()), np.nan, np.float32) for p in parts])
+    # 히스토리 위치 (build_fp_dataset의 pos: 배틀 안에서 몇 번째 결정 지점인가). 옛 파일은 배틀마다 0,1,2,... (예전과 같음)
+    data["pos"] = np.concatenate([decision_pos(p, p["lens"]) for p in parts]).astype(np.int32)
     lens = np.concatenate([p["lens"] for p in parts])
     return data, np.concatenate([[0], np.cumsum(lens)]), lens, files
 
