@@ -63,4 +63,16 @@ with torch.no_grad():
     ch[5][:, 0, 2, 2:] = 0.0
     ch[5][:, 0, 2, 0] = 1.0
     assert (fw(on, ch) - fw(on, obs)).abs().max() > 1e-7
+    # 6) mon_moves="mlp": 기술마다 비선형 변환 후 합. cfg에 "mlp"로 기록, 왕복, 순열 대칭, 합 방식과 출력이 다름
+    ml = build_model({**small, "mon_moves": "mlp"}).eval()
+    assert ml.cfg["mon_moves"] == "mlp" and any(k.startswith("bag_mv") for k in ml.state_dict()) and not any(k.startswith("bag_mv") for k in on.state_dict())
+    ml.load_state_dict({k: v for k, v in on.state_dict().items()}, strict=False)
+    assert (fw(ml, obs) - fw(on, obs)).abs().max() > 1e-6
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "m.pt"); save_ckpt(ml, p)
+        y = model_from_ckpt(p).eval()
+        assert y.cfg["mon_moves"] == "mlp" and torch.allclose(fw(y, obs), fw(ml, obs), atol=1e-6)
+    b1, b2 = fw(ml, obs), fw(ml, ob2, m2)
+    ok = b1[:, 8:14][:, perm] > -1e8
+    assert torch.allclose(b2[:, 8:14][ok], b1[:, 8:14][:, perm][ok], atol=1e-4)
 print("test_mon_moves OK")

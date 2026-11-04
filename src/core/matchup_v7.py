@@ -398,4 +398,4 @@ class MatchupV7(nn.Module):
         r = lambda a, b: (torch.log2(a.clamp_min(1.0) / b.clamp_min(1.0)).clamp(-2, 2) / 2)
         spd_my = (r(spe_my[..., None], spe_oa_c[:, None, :]) * w_oa[:, None, :]).sum(-1)               # [B,6]
         spd_opp = (r(spe_opp_c, spe_my[ar, my_act][:, None, None]) * wgt).sum(-1)                      # [B,6]
-        return {"spd_my": spd_my, "spd_opp": spd_opp, "fm_my": fm_my, "fm_opp": fm_opp}
+        return {"spd_my": spd_my, "spd_opp": spd_opp, "fm_my": fm_my, "fm_opp": fm_opp, "spe_my": spe_my, "spe_opp": spe_opp}
