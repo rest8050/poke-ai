@@ -276,7 +276,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/fp_selfplay/ms100/fp_data*.npz", help="build_fp_dataset.py 출력 (쉼표로 여러 glob)")
     ap.add_argument("--out", default="checkpoints/supervised_v2_fp_next.pt")
-    ap.add_argument("--arch", default='{"model":"v8","my_pos":false}', help="모델 구조 JSON (기본: v8). 옛 구조는 {\"model\":\"v6\",\"my_pos\":false}")
+    ap.add_argument("--arch", default='{"model":"v8","my_pos":false,"forced_legal_zero":true}', help="모델 구조 JSON (기본: v8, 강제 교체에서 고정 요약 0). 옛 구조는 {\"model\":\"v6\",\"my_pos\":false}")
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--accum", type=int, default=1, help="기울기 누적 횟수: 배틀 32개를 이 수로 나눠 처리해 VRAM을 줄임 (큰 모델용, 32의 약수)")
     ap.add_argument("--init", default="", help="시작 가중치 체크포인트 (기본: 처음부터)")

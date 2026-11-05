@@ -75,7 +75,7 @@ class EntityPokemonNetV8(nn.Module):
                  head_width: int = 192, entity_features: bool = True,
                  species_dim: int = 32, belief_hidden: int = 256, belief_species_dropout: float = 0.3,
                  mon_moves: bool = False, pair_glu: int = 0, pair_mode: str = "glu", tera_feat: bool = False,
-                 type_lse: bool = False, value_detach: bool = False, tera_def: bool = False, tera_gate: bool = False):
+                 type_lse: bool = False, value_detach: bool = False, tera_def: bool = False, tera_gate: bool = False, forced_legal_zero: bool = False):
         super().__init__()
         self.cfg = dict(model="v8", d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
                         history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
@@ -109,6 +109,9 @@ class EntityPokemonNetV8(nn.Module):
         self.value_detach = value_detach
         if value_detach:              # 가치 헤드 입력을 detach: 가치 손실이 공유 몸통/융합층에 기울기를 주지 않음. 켰을 때만 cfg에 기록
             self.cfg["value_detach"] = True
+        self.forced_legal_zero = forced_legal_zero    # 합법 기술이 0개(강제 교체)면 "기술 고정"·"잃은 화력" 요약을 0으로. 옛 체크포인트는 꺼진 채(예전 계산) 학습됨
+        if forced_legal_zero:         # 켰을 때만 cfg에 기록
+            self.cfg["forced_legal_zero"] = True
         d = self.d = d_model
         field_dim = FIELD_DIM
         self.n_heads = n_heads
@@ -238,7 +241,7 @@ class EntityPokemonNetV8(nn.Module):
         return {"idx": idx, "w": w, "pseudo": pseudo}
 
     @staticmethod
-    def _legal_summary(leg, off_act, n_rev):
+    def _legal_summary(leg, off_act, n_rev, forced_zero=False):
         """leg [B,22] (0/1), off_act [B,4,4] 활성 포켓몬의 기술 4칸 x (배율, 데미지, KO, 공격기) vs 상대 활성, n_rev [B] 공개된 활성 기술 수 -> [B, LEG_G]. 교체는 칸별 비트가 아니라 개수만 (슬롯 순서 통로 제거)"""
         mv = leg[:, :4]
         n_normal, n_attack, n_sw = mv.sum(1), (mv * off_act[..., 3]).sum(1), leg[:, 8:14].sum(1)
@@ -247,6 +250,9 @@ class EntityPokemonNetV8(nn.Module):
         full = off_act[..., :3].amax(1)
         legal_off = torch.where(mv[..., None] > 0, off_act[..., :3], torch.full_like(off_act[..., :3], -1.0)).amax(1).clamp_min(0)
         lost = torch.stack([(full[:, 1] - legal_off[:, 1]).clamp_min(0), (full[:, 2] - legal_off[:, 2]).clamp_min(0)], -1)
+        if forced_zero:   # 기술이 하나도 합법이 아닌 결정(강제 교체)은 고정/화력 손실이 아님: 실제 구애 고정 같은 신호와 섞이지 않게 0
+            has = (n_normal > 0).to(lock.dtype)
+            lock, lost = lock * has, lost * has[:, None]
         return torch.cat([leg[:, :8], torch.stack([n_normal / 4.0, n_attack / 4.0, n_sw / 5.0, leg[:, 4:8].amax(1), one_move, lock], -1), legal_off, lost], -1)
 
     @staticmethod
@@ -332,7 +338,7 @@ class EntityPokemonNetV8(nn.Module):
         mv_flag[ar, act_m] = leg[:, :4]                                                              # 내 활성 포켓몬의 기술 4칸만 합법성이 의미 있음
         off_act = O.view(B, 6, 6, 4, 4)[ar, opp_act][ar, act_m]                                      # [B,4,4] 내 활성의 기술 4칸이 상대 활성에게
         n_rev_act = (my_move_num[ar, act_m].abs().sum(-1) > 0).sum(-1).float()
-        leg_g = torch.cat([self._legal_summary(leg, off_act, n_rev_act), field_vec[:, EFFECT_START:EFFECT_START + EFFECT_DIM], exit_heal[:, None]], -1)      # 합법성 요약 + 양쪽 활성의 효과 열 + 재생력 회복량
+        leg_g = torch.cat([self._legal_summary(leg, off_act, n_rev_act, self.forced_legal_zero), field_vec[:, EFFECT_START:EFFECT_START + EFFECT_DIM], exit_heal[:, None]], -1)      # 합법성 요약 + 양쪽 활성의 효과 열 + 재생력 회복량
         mon_in = torch.cat(parts + [mon_extra.reshape(B * 12, MON_X), n_rev, mon_flag.reshape(B * 12, 1)], -1)
         mv_in = torch.cat([E.move_encoder(raw, mvn), raw, mvn, mv_extra.reshape(B * 12, 4, MV_EXTRA), mv_flag.reshape(B * 12, 4, 1)], -1)
         side = torch.arange(12, device=dev) // 6

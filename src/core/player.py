@@ -71,7 +71,8 @@ if POKE_ENV_AVAILABLE:
             # 2. 신경망 추론
             tag = battle.battle_tag
             action_idx, p_probs, val, self.history[tag] = self.model.get_action(
-                my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, self.history.get(tag), action_mask, legal_mask
+                my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, self.history.get(tag), action_mask, legal_mask,
+                prev_move=self.encoder.prev_move(battle)
             )
 
             # 3. 행동 매핑 (폴백: 안전한 무작위 선택)

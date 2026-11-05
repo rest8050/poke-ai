@@ -1,6 +1,8 @@
 """상대의 숨겨진 정보(기술/도구/특성) 예측 보조 손실. 정답은 같은 배틀의 마지막 턴 관측에서 얻음(외부 표/재가공 불필요):
 턴 t에 아직 안 보이는데 이 배틀이 끝나기 전에 드러난 기술/도구/특성이 정답. 끝내 안 드러난 것은 모름(음성 라벨 아님)이라
-정답 집합에 대한 소프트맥스 CE(양성만)로 계산. 이미 드러난 기술은 후보에서 제외. 마지막 턴에 같은 종이 없으면 건너뜀(슬롯 위치가 달라도 종으로 찾음).
+정답 집합에 대한 소프트맥스 CE(양성만)로 계산. 이미 드러난 기술은 후보에서 제외.
+정답은 슬롯 번호가 아니라 종으로 맞춤: 인코더는 상대 슬롯을 '본 순서 + 프리뷰로만 본 것'으로 채워서 새로 등장할 때마다 위치가 바뀜.
+같은 종이 없으면 폼 이름의 접두사로 맞춤(프리뷰 'urshifu' -> 실제 'urshifurapidstrike'), 마지막 턴에 그 종이 없으면 건너뜀.
 필요 입력: b["opp_team_cat"] [N,6,11](0 도구, 1 특성, 5~8 기술, 10 종), b["seq_index"] [N] (결정이 배틀 순서대로 이어 붙어 있음)"""
 import json
 
@@ -13,15 +15,45 @@ def vocab_sizes(path="data/vocab.json"):
     return {k: v[k]["<unk>"] for k in ("move", "item", "ability")}   # <unk> id 이상은 정답으로 쓰지 않음 (unk, 숨김)
 
 
+_FORM_REL = {}
+
+
+def _form_rel(device, path="data/vocab.json"):
+    """종 어휘 [V,V] bool: 같은 종이거나 한쪽 이름이 다른 쪽의 접두사 (폼 차이: urshifu ~ urshifurapidstrike). 장치별로 한 번만 만듦"""
+    if device not in _FORM_REL:
+        allsp = json.load(open(path, encoding="utf-8"))["species"]
+        sp = {n: i for n, i in allsp.items() if n and not n.startswith("<")}       # 특수 칸(<unk> 등)은 자기 자신과만 같음
+        V = max(allsp.values()) + 1
+        rel = torch.eye(V, dtype=torch.bool)
+        for n, i in sp.items():
+            for k in range(1, len(n)):
+                j = sp.get(n[:k])
+                if j is not None:
+                    rel[i, j] = rel[j, i] = True
+        _FORM_REL[device] = rel.to(device)
+    return _FORM_REL[device]
+
+
+def align_last(cat, last):
+    """결정마다 상대 슬롯 i와 같은 포켓몬이 마지막 턴 관측의 어느 슬롯에 있는지 찾아 그 행을 가져옴 -> (정렬된 last [N,6,C], 찾았는가 [N,6]).
+    같은 종을 먼저, 없으면 폼 접두사로 (한 팀에 같은 종은 하나라 겹치지 않음)"""
+    sid, lid = cat[..., 10], last[..., 10]
+    rel = _form_rel(cat.device)
+    V = rel.size(0)
+    present = (sid > 0)[..., None] & (lid > 0)[:, None, :]                        # [N,6(지금 i),6(마지막 j)]
+    exact = (sid[:, :, None] == lid[:, None, :]) & present
+    form = rel[sid.clamp(0, V - 1)[:, :, None], lid.clamp(0, V - 1)[:, None, :]] & present
+    match = torch.where(exact.any(-1, keepdim=True), exact, form)
+    j = match.float().argmax(-1)                                                  # 첫 번째로 맞는 슬롯
+    return last.gather(1, j[..., None].expand(-1, -1, last.size(-1))), match.any(-1)
+
+
 def hidden_loss(logits: dict, b: dict, unk: dict):
     """logits: {"move": [N,6,Vm], "item": [N,6,Vi], "ability": [N,6,Va]} -> (손실 합, 통계 dict)"""
     cat = b["opp_team_cat"].long()
     counts = torch.bincount(b["seq_index"])
-    last_all = cat[(torch.cumsum(counts, 0) - 1)[b["seq_index"]]]                 # 각 결정이 속한 배틀의 마지막 턴 관측 (슬롯 순서 그대로)
-    # 상대 슬롯 순서는 인코더가 "본 순서 + 프리뷰만 본 것"으로 채워 새 포켓몬이 나올 때마다 바뀌므로, 같은 슬롯이 아니라 같은 종의 마지막 턴 슬롯에서 정답을 가져옴
-    match = (cat[..., 10] > 0)[..., :, None] & (cat[..., 10][..., :, None] == last_all[..., 10][..., None, :])     # [N,6(지금 슬롯),6(마지막 턴 슬롯)]
-    same = match.any(-1)                                                          # 마지막 턴에도 이 종이 있음 (한 팀에 같은 종은 하나)
-    last = torch.gather(last_all, 1, match.float().argmax(-1)[..., None].expand(-1, -1, last_all.size(-1)))
+    last = cat[(torch.cumsum(counts, 0) - 1)[b["seq_index"]]]                     # 각 결정이 속한 배틀의 마지막 턴 관측
+    last, same = align_last(cat, last)                                             # 슬롯 i의 포켓몬이 마지막 턴에 있던 행 (같은 종/폼)
     total, stats = logits["move"].new_zeros(()), {}
     # 기술: 앞으로 드러날 기술들에 대한 CE (이미 드러난 기술은 후보에서 제외)
     cur, fut = cat[..., 5:9], last[..., 5:9]

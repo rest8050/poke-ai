@@ -1068,6 +1068,14 @@ class BattleTensorEncoder:
 
         return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask)
 
+    def prev_move(self, battle: Any) -> torch.Tensor:
+        """직전에 쓴 기술 id [1,2] (내, 상대; 0 = 아직 없음). 직전 기술을 입력으로 쓰는 모델(prev_act)의 실전 입력.
+        reveals.py가 기록한 양쪽의 마지막 사용 기술(다른 기술이 부른 기술 제외)이라 학습(train_human.last_moves: 이전 결정들까지 마지막으로 쓴 기술)과 같은 뜻"""
+        ev = battle.__dict__.get("_ev")
+        last = ev.rev.last_move_sp if ev is not None else {}
+        ids = [self.vocab_mgr.get_id("move", last[side][1]) if last.get(side) else 0 for side in ("me", "opp")]
+        return torch.tensor([ids], dtype=torch.long, device=self.device)
+
     def _to_tensors(self, my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask):
         return (
             torch.tensor(my_cat, dtype=torch.long, device=self.device),

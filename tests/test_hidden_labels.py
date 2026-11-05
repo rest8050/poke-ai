@@ -44,6 +44,18 @@ cat3 = cat.clone(); cat3[2, 3], cat3[2, 0] = cat[2, 0].clone(), torch.zeros(11, 
 l3, st3 = hidden_loss(logits(True, True, True), {"opp_team_cat": cat3, "seq_index": b["seq_index"]}, U)
 assert st3["move_n"] == 3 and st3["item_n"] == 2 and st3["ability_n"] == 2 and st3["move_top4"] > 0.99, st3
 assert st2["move_n"] < 3          # 마지막 턴에 그 종이 아예 없으면 여전히 건너뜀
+# 슬롯 순서가 바뀌어도 종(폼은 접두사)으로 맞춤: 결정 0에서 슬롯 2에 프리뷰로만 보이던 urshifu가 마지막 턴에는 슬롯 1에 urshifurapidstrike로 기술 400 공개
+import json
+SP = json.load(open("data/vocab.json", encoding="utf-8"))["species"]
+c3 = torch.zeros(2, 6, 11, dtype=torch.long)
+c3[:, :, 5:9] = HM
+c3[0, 0, 10], c3[0, 2, 10] = 7, SP["urshifu"]
+c3[1, 0, 10], c3[1, 1, 10] = 7, SP["urshifurapidstrike"]
+c3[1, 1, 5] = 400
+lg3 = {"move": torch.zeros(2, 6, Vm), "item": torch.zeros(2, 6, Vi), "ability": torch.zeros(2, 6, Va)}
+lg3["move"][0, 2, 400] = 20.0
+_, st3 = hidden_loss(lg3, {"opp_team_cat": c3, "seq_index": torch.tensor([0, 0])}, U)
+assert st3["move_n"] == 1 and st3["move_top4"] == 1.0, st3          # 슬롯 번호로만 맞추던 예전 방식은 0개
 # 모델이 hid_* 출력을 내고 손실이 세트 추정 모듈로 역전파
 from src.core.tensor_encoder import FIELD_DIM, NUM_DIM
 g = torch.Generator().manual_seed(0)
