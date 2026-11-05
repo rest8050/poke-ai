@@ -589,7 +589,8 @@ def build_model(cfg: dict) -> nn.Module:
     cfg = dict(cfg)
     for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False),
                        ("hist_aux", False), ("prev_act", False), ("pm_fusion", False), ("hist_only", False), ("loop_n", 0), ("loop_layers", 2),
-                       ("value_gammas", []), ("value_bins", 51), ("pair_scope", "all"), ("pair_feat", False), ("pair_mon", 0), ("bench_off", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
+                       ("value_gammas", []), ("value_bins", 51), ("pair_scope", "all"), ("pair_feat", False), ("pair_mon", 0), ("bench_off", False),
+                       ("tera_feat", False), ("tera_def", False), ("tera_gate", False), ("type_lse", False), ("value_detach", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
         if cfg.pop(k, default) != default:
             raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
     if cfg.get("mon_moves", True) is not True:
