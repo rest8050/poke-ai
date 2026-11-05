@@ -71,7 +71,7 @@ def main():
     ap.add_argument("--variants", default=",".join(VARIANTS))
     args = ap.parse_args()
     model = model_from_ckpt(f"checkpoints/supervised_v2_fp_{args.model}.pt").to(T.DEVICE).eval()
-    run_args = SimpleNamespace(accum=1, pg_coef=0.0, teacher_value_mix=0.0)
+    run_args = SimpleNamespace(accum=1)
     for path in args.sets.split(","):
         d, off, groups = load_set(path)
         perm = np.random.default_rng(0).permutation(len(d["target"]))

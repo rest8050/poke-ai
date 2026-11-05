@@ -1,5 +1,5 @@
-"""모델 v8(v7 규칙 + 숨은 특성/도구 기대 임베딩 + 융합층 활성 토큰 입력) self-check: PYTHONPATH=. python tests/test_model_v8.py
-1) 롤아웃 == 학습(forward_sequences), 2) 폭이 다른 field_vec 호환 (v8은 옛 짧은 데이터를 0으로 채움),
+"""모델 v8(token-head: v7 규칙 + 숨은 특성/도구 기대 임베딩 + 토큰 읽기 단일 softmax) self-check: PYTHONPATH=. python tests/test_model_v8.py
+1) 한 턴 추론(forward) == 학습 경로(forward_sequences, 결정마다 독립), 2) 폭이 다른 field_vec 호환 (v8은 옛 짧은 데이터를 0으로 채움),
 3) 효과 열과 새 규칙 입력(특성/스카프 확률)이 출력에 영향, 4) my_pos=False 순열 대칭이 부분 마스크에서도 정확히 성립 (v6는 교체 비트 순서 통로로 깨졌음),
 5) 세트 추정 특성/도구 확률의 형태와 공개 값의 원핫, 6) 체크포인트 왕복,
 7) 기대 임베딩: 상대 쪽 숨겨진 값만 q @ 표로 바뀌고 공개/내 쪽/빈 칸은 원래 임베딩 그대로, 숨겨진 값은 세트 추정 분포에 따라 출력이 달라짐, 8) 융합층이 활성 토큰 2개를 받음"""
@@ -10,7 +10,7 @@ import tempfile
 import torch
 
 from src.core.model import build_model, model_from_ckpt, save_ckpt
-from src.core.model_v8 import G_DIM
+from src.core.model_v8 import CAND_N, G_DIM
 from src.core.tensor_encoder import EFFECT_START, FIELD_DIM, NUM_DIM
 
 V = json.load(open("data/vocab.json"))
@@ -30,7 +30,7 @@ def random_obs(n, gen):
 
 torch.manual_seed(0)
 gen = torch.Generator().manual_seed(0)
-small = {"d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64, "my_pos": False}
+small = {"d_model": 64, "n_layers": 2, "n_heads": 4, "my_pos": False}
 model = build_model({"model": "v8", **small}).eval()
 assert type(model).__name__ == "EntityPokemonNetV8" and model.uses_legal
 lengths = [5, 3]
@@ -45,13 +45,13 @@ mask = torch.cat(masks)
 fs = lambda m, obs_=flat, **kw: m.forward_sequences(obs_, seq_index, time_index, len(lengths), action_mask=mask, **kw)["policy_logits"]
 
 with torch.no_grad():
-    # 1) 롤아웃 == 시퀀스
+    # 1) 한 턴 추론 == 학습 경로
     step = []
     for b, L in enumerate(lengths):
-        hs = None
         for t in range(L):
-            out = model(*[x[t:t + 1] for x in obs[b]], history_state=hs, action_mask=masks[b][t:t + 1], legal_mask=masks[b][t:t + 1])
-            hs = out["history_state"]; step.append(out["policy_logits"][0])
+            out = model(*[x[t:t + 1] for x in obs[b]], action_mask=masks[b][t:t + 1], legal_mask=masks[b][t:t + 1])
+            assert "history_state" not in out
+            step.append(out["policy_logits"][0])
     base = fs(model)
     assert torch.isfinite(base[mask]).all()
     assert torch.allclose(base, torch.stack(step), atol=1e-4)
@@ -106,8 +106,9 @@ with torch.no_grad():
     assert torch.allclose(out_e[:, :6], plain[:, :6]) and torch.allclose(out_e[:, 9:], plain[:, 9:]), "공개/내 쪽 임베딩이 바뀜"
     assert torch.allclose(out_e[:, 6:9], qo[:, :3] @ w[:A], atol=1e-5), "숨겨진 값이 q @ 표가 아님"
     assert not torch.allclose(out_e[:, 6:9], plain[:, 6:9]), "숨겨진 값이 숨김 임베딩 그대로"
-    # 8) 융합층은 CLS + 히스토리 + 요약 + 활성 토큰 2개를 받음
-    assert model.fusion[0].in_features == 3 * model.d + 64 + G_DIM
+    # 8) 헤드/히스토리/가치 모듈이 없고 후보 특징·전역 요약은 토큰 입력으로 들어감
+    assert model.cand_proj.in_features == CAND_N and model.leg_proj.in_features == G_DIM
+    assert not any(k.startswith(("history", "fusion", "type_head", "move_score", "switch_score", "value_head")) for k in model.state_dict())
 
 # 9~12) hist_aux / 다중 γ 가치 / prev_act / pm_fusion / hist_only 검사는 해당 옵션을 제거하면서 삭제 (제거된 옵션 cfg는 build_model이 거부: 아래 검사)
 for bad in ({"hist_aux": True}, {"prev_act": True}, {"loop_n": 4}, {"value_gammas": [0.9]}, {"pair_mon": 16}, {"bench_off": True}, {"mon_moves": "mlp"}):
@@ -120,6 +121,18 @@ for bad in ({"hist_aux": True}, {"prev_act": True}, {"loop_n": 4}, {"value_gamma
 with tempfile.TemporaryDirectory() as td:
     path = os.path.join(td, "m.pt")
     save_ckpt(model, path)
+    # 옛 헤드 구조(cfg에 token_head 없음)의 v8 체크포인트와 v9는 거부
+    import json as _j, shutil
+    old = os.path.join(td, "old.pt"); shutil.copy(path, old)
+    _c = _j.load(open(path + ".cfg.json")); _c.pop("token_head"); _j.dump(_c, open(old + ".cfg.json", "w"))
+    try:
+        model_from_ckpt(old); raise SystemExit("옛 구조 체크포인트가 로드됨")
+    except ValueError as e:
+        assert "옛 헤드 구조" in str(e)
+    try:
+        build_model({"model": "v9"}); raise SystemExit("v9가 통과함")
+    except ValueError:
+        pass
     m2 = model_from_ckpt(path).eval()
     assert type(m2).__name__ == "EntityPokemonNetV8" and m2.cfg == model.cfg
     with torch.no_grad():
