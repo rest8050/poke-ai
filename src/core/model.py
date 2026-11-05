@@ -579,9 +579,9 @@ class DeepPokemonBattleTransformerNet(nn.Module):
             p_probs = F.softmax(p_logits, dim=-1)
             action_idx = torch.argmax(p_probs, dim=-1).item()
             
-            val = res["value"].item()
+            val = res["value"].item() if "value" in res else 0.0      # 가치 헤드가 없는 모델(token_head)은 0
             
-        return action_idx, p_probs, val, res["history_state"]
+        return action_idx, p_probs, val, res.get("history_state")
 
 
 def build_model(cfg: dict) -> nn.Module:

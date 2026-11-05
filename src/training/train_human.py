@@ -188,6 +188,7 @@ def main(args):
             yield from batches(d, lm, starts, lens, split_ids(d)[0], BATCH_SEQ // args.accum, True)
 
     model = build_model(json.loads(args.arch))
+    assert not getattr(model, "token_head", False), "token_head 모델은 가치 헤드/잠재벡터가 없어 이 학습기 미지원 (train_fp_distill.py만)"
     if args.init:      # 다른 체크포인트(예: FP 증류 v8_full)에서 시작: 구조가 같은 가중치만 가져오고 새 모듈은 무작위로 남김
         load_compatible(model, torch.load(args.init, map_location="cpu"))
     model.belief.load_state_dict(torch.load(f"checkpoints/belief_{model.belief.num_dim}.pt", map_location="cpu")["state"])

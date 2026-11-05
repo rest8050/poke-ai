@@ -150,6 +150,7 @@ def main(args):
     start0 = f"{run_dir}/it000.pt"
     model = model_from_ckpt(args.start)
     assert getattr(model, "uses_legal", False), "합법 마스크를 입력으로 쓰는 모델(v6/v8)만 지원"
+    assert not getattr(model, "token_head", False), "token_head 모델은 가치 헤드(크리틱)가 없어 PPO 미지원"
     assert not getattr(model, "prev_act", False), "직전 기술 입력(prev_act) 모델은 미지원: 롤아웃 기록과 PPO 갱신이 prev_move를 담지 않음"
     ref = model_from_ckpt(args.base or args.start)      # KL 앵커이자 arena 비교 기준 (이어 학습할 땐 --base로 원래 시작 모델을 유지)
     save_ckpt(ref, start0)

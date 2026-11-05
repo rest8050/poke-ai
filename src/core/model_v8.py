@@ -73,7 +73,7 @@ class EntityPokemonNetV8(nn.Module):
                  head_width: int = 192, entity_features: bool = True,
                  species_dim: int = 32, belief_hidden: int = 256, belief_species_dropout: float = 0.3,
                  mon_moves: bool = False, pair_glu: int = 0, pair_mode: str = "glu",
-                 forced_legal_zero: bool = False):
+                 forced_legal_zero: bool = False, token_head: bool = False):
         super().__init__()
         self.cfg = dict(model="v8", d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
                         history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
@@ -90,6 +90,9 @@ class EntityPokemonNetV8(nn.Module):
         self.forced_legal_zero = forced_legal_zero    # 합법 기술이 0개(강제 교체)면 "기술 고정"·"잃은 화력" 요약을 0으로. 옛 체크포인트는 꺼진 채(예전 계산) 학습됨
         if forced_legal_zero:         # 켰을 때만 cfg에 기록
             self.cfg["forced_legal_zero"] = True
+        self.token_head = token_head
+        if token_head:                # 정책을 토큰 출력에서 바로 읽음(종류 헤드 없이 22칸 단일 softmax, 히스토리·가치 없음). 켰을 때만 cfg에 기록
+            self.cfg["token_head"] = True
         d = self.d = d_model
         field_dim = FIELD_DIM
         self.n_heads = n_heads
@@ -121,21 +124,27 @@ class EntityPokemonNetV8(nn.Module):
             nn.init.zeros_(lin.bias)
         n_mv = len(json.load(open(vocab_path, encoding="utf-8"))["move"])
         self.n_mv = n_mv
-        self.turn_proj = nn.Linear(3 * d + field_dim, history_dim)
-        self.turn_pos = nn.Embedding(MAX_TURNS, history_dim)
-        hl = nn.TransformerEncoderLayer(history_dim, 4, history_dim * 2, dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
-        self.history_seq = nn.TransformerEncoder(hl, hist_layers, enable_nested_tensor=False)
-        self.history_out = nn.Linear(history_dim, history_dim)
-        fuse_in = history_dim + G_DIM + 3 * d
-        self.fusion =nn.Sequential(nn.Linear(fuse_in, latent_dim * 2), nn.LayerNorm(latent_dim * 2), nn.GELU(), nn.Dropout(0.1),
-                                    nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
-        self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d, head_width), nn.GELU(), nn.Linear(head_width, 2))
-        self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_N + G_DIM + 1, head_width), nn.GELU(), nn.Linear(head_width, 1))
-        self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_N + 2 + G_DIM, head_width), nn.GELU(), nn.Linear(head_width, 2))
-        is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
-        is_switch[8:14] = True
-        self.register_buffer("is_switch", is_switch, persistent=False)
-        self.value_head = nn.Sequential(nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, 1))
+        if token_head:
+            self.cand_proj = nn.Linear(CAND_N, d)                     # 교체 후보 특징 15개 -> 내 포켓몬 토큰 입력 (예전에는 교체 점수 헤드 입력)
+            self.leg_proj = nn.Linear(G_DIM, d)                        # 합법성/효과 전역 요약 -> CLS 토큰 입력 (예전에는 헤드마다 이어 붙임)
+            self.kind_emb = nn.Embedding(3, d)                        # 읽는 행동 종류: 0 기술, 1 테라 기술, 2 교체
+            self.readout = nn.Sequential(nn.Linear(d, head_width), nn.GELU(), nn.Linear(head_width, 1))      # 22칸이 공유하는 점수 읽기
+        else:
+            self.turn_proj = nn.Linear(3 * d + field_dim, history_dim)
+            self.turn_pos = nn.Embedding(MAX_TURNS, history_dim)
+            hl = nn.TransformerEncoderLayer(history_dim, 4, history_dim * 2, dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
+            self.history_seq = nn.TransformerEncoder(hl, hist_layers, enable_nested_tensor=False)
+            self.history_out = nn.Linear(history_dim, history_dim)
+            fuse_in = history_dim + G_DIM + 3 * d
+            self.fusion =nn.Sequential(nn.Linear(fuse_in, latent_dim * 2), nn.LayerNorm(latent_dim * 2), nn.GELU(), nn.Dropout(0.1),
+                                        nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
+            self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d, head_width), nn.GELU(), nn.Linear(head_width, 2))
+            self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_N + G_DIM + 1, head_width), nn.GELU(), nn.Linear(head_width, 1))
+            self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_N + 2 + G_DIM, head_width), nn.GELU(), nn.Linear(head_width, 2))
+            is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
+            is_switch[8:14] = True
+            self.register_buffer("is_switch", is_switch, persistent=False)
+            self.value_head = nn.Sequential(nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, 1))
 
     def _fit_field(self, fv):
         """field_vec 폭을 이 모델이 학습한 폭에 맞춤: 더 넓으면(인코더가 뒤에 열을 추가) 뒤를 버리고, 더 좁으면(옛 데이터) 0으로 채움"""
@@ -295,6 +304,8 @@ class EntityPokemonNetV8(nn.Module):
                        (guess["w"][..., None] * E._emb("move", guess["idx"]).detach()).sum(2)], -1)
         mon = self.mon_proj(mon_in).view(B, 12, d) + base + self.role_emb.weight[0]
         mon = mon + torch.cat([torch.zeros_like(mon[:, :6]), self.hid_proj(g)], 1)
+        if self.token_head:     # 헤드가 따로 받던 교체 후보 특징을 토큰 입력으로 (내 쪽만, 상대 쪽은 0)
+            mon = mon + torch.cat([self.cand_proj(cand.to(mon.dtype)), torch.zeros_like(mon[:, 6:])], 1)
         if self.mon_moves:      # 기술 가방: 양쪽 같은 경로. 내 쪽은 전부 공개라 숨은 항이 0, 상대는 공개되면 실제 임베딩이 들어가고 숨은 칸 기대값은 그만큼 줄어듦
             bag = (raw * revealed[..., None]).sum(1).view(B, 12, -1)
             bag = bag + torch.cat([torch.zeros_like(bag[:, :6]), g[..., -48:].to(bag.dtype)], 1)
@@ -302,6 +313,8 @@ class EntityPokemonNetV8(nn.Module):
         mv = self.move_proj(mv_in).view(B, 12, 4, d) + base[:, :, None] + self.mslot_emb.weight[None, None] * self.pos_gate[None, :, None, None] + self.role_emb.weight[1]
         fld = self.field_proj(field_vec).view(B, 3, d) + self.fld_emb.weight[None] + self.role_emb.weight[2]
         cls = self.cls.expand(B, 1, d) + self.role_emb.weight[3]
+        if self.token_head:
+            cls = cls + self.leg_proj(leg_g.to(cls.dtype))[:, None]
         x = torch.cat([mon, mv.reshape(B, 48, d), fld, cls], 1)
         mon_pad = (num[:, 11] == 0).view(B, 12)
         unrevealed = ~revealed.view(B, 12, 4) & ~mon_pad[:, :, None]
@@ -321,6 +334,18 @@ class EntityPokemonNetV8(nn.Module):
         return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, act_m], "opp_active_mon": out[:, 6:12][ar, opp_act],
                 "active_mv": out[:, 12:60].view(B, 12, 4, d)[:, :6][ar, act_m], "belief_logits": belief_logits, "cand": cand,
                 "field": field_vec, "act_m": act_m, "leg_g": leg_g, "leg_sw": leg[:, 8:14]}
+
+    def _token_heads(self, enc, action_mask=None):
+        """토큰 읽기: 22칸 점수를 같은 readout으로 (기술 4 = 활성의 기술 토큰, 테라 4 = 같은 토큰 + 테라 종류, 교체 6 = 내 벤치 포켓몬 토큰) -> 단일 softmax"""
+        B = enc["my_mon"].size(0)
+        k = self.kind_emb.weight
+        mv_t, sw_t = enc["active_mv"], enc["my_mon"]
+        sc = lambda t, i: self.readout(t + k[i]).squeeze(-1).float()
+        detail = torch.cat([sc(mv_t, 0), sc(mv_t, 1), sc(sw_t, 2), mv_t.new_full((B, 8), -1e9).float()], 1)
+        if action_mask is not None:
+            detail = detail.masked_fill(~action_mask, -1e9)
+        bl = enc["belief_logits"]
+        return {"policy_logits": F.log_softmax(detail, -1), "hid_move": bl["move"], "hid_item": bl["item"], "hid_ability": bl["ability"]}
 
     def _heads(self, enc, history, action_mask=None):
         B = history.size(0)
@@ -356,6 +381,8 @@ class EntityPokemonNetV8(nn.Module):
                 history_state=None, action_mask=None, legal_mask=None):
         enc = self._encode_turn(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec,
                                 legal=legal_mask if legal_mask is not None else action_mask)
+        if self.token_head:
+            return self._token_heads(enc, action_mask)         # 히스토리 없음: history_state는 만들지도 쓰지도 않음
         cur = self._turn_vec(enc).unsqueeze(1)
         seq = cur if history_state is None else torch.cat([history_state.to(cur.dtype), cur], dim=1)
         out = self._heads(enc, self._history(seq)[:, -1], action_mask)
@@ -364,6 +391,8 @@ class EntityPokemonNetV8(nn.Module):
 
     def forward_sequences(self, obs, seq_index, time_index, n_seq, action_mask=None, legal_mask=None):
         enc = self._encode_turn(*obs, legal=legal_mask if legal_mask is not None else action_mask)
+        if self.token_head:
+            return self._token_heads(enc, action_mask)
         tv = self._turn_vec(enc)
         T = int(time_index.max().item()) + 1
         turn_seq = tv.new_zeros(n_seq, T, tv.size(-1))

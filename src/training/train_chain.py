@@ -187,6 +187,7 @@ def main(args):
     arch = json.loads(args.arch)
     assert arch.get("model") == "v9", "--arch의 model은 v9여야 함"
     model = model_from_ckpt(args.init) if args.init else build_model(arch)
+    assert not getattr(model, "token_head", False), "token_head 모델은 가치 헤드/잠재벡터가 없어 이 학습기 미지원 (train_fp_distill.py만)"
     if args.train_only:                                                   # 지정한 모듈 접두사만 학습 (나머지 동결): Q 읽기 재학습 같은 탐침용
         keys = args.train_only.split(",")
         for n, p_ in model.named_parameters():

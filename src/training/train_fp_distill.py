@@ -111,13 +111,16 @@ def run(model, data, offsets, idx, args, train, opt=None):
                 if train and args.hard_weight != 1:        # 중요한 결정(Q* - 최저Q >= HARD_STAKES)의 학습 손실 가중. 평균 가중 1로 정규화해 학습률 효과는 그대로
                     w = torch.where(valid & (gap.max(-1).values >= HARD_STAKES), torch.full_like(w, args.hard_weight), w)
                 reg_arg = gap.gather(-1, logp.argmax(-1, keepdim=True)).squeeze(-1)              # argmax 선택의 손해 (평가/체크포인트 선택용)
-            v = F.mse_loss(out["value"].view(-1), b["value_target"])           # 기록/비교용: 항상 할인된 결과 기준
-            if args.teacher_value_mix == 0:
-                v_loss = v
-            else:
-                tv = b["teacher_value"]
-                v_loss = F.mse_loss(out["value"].view(-1), torch.where(torch.isnan(tv), b["value_target"], args.teacher_value_mix * tv + (1 - args.teacher_value_mix) * b["value_target"]))
-            pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
+            if "value" in out:
+                v = F.mse_loss(out["value"].view(-1), b["value_target"])           # 기록/비교용: 항상 할인된 결과 기준
+                if args.teacher_value_mix == 0:
+                    v_loss = v
+                else:
+                    tv = b["teacher_value"]
+                    v_loss = F.mse_loss(out["value"].view(-1), torch.where(torch.isnan(tv), b["value_target"], args.teacher_value_mix * tv + (1 - args.teacher_value_mix) * b["value_target"]))
+                pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
+            else:                  # 가치 헤드가 없는 모델(token_head): 가치 손실과 가치 기준선이 필요한 pg 손실은 없음
+                v = v_loss = pg = ce.new_zeros(())
             hid = ce.new_zeros(())
             if "hid_move" in out:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
                 hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]}, b, UNK)
