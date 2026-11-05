@@ -84,7 +84,7 @@ class HybridPlayer(RecordingPlayer):
         self._ensure_service(battle)
         tensors = self.encoder.encode_battle(battle)
         mask = tensors[7][0].numpy().astype(bool)
-        idx, probs, value, self.history[tag] = self.model.get_action(*tensors[:7], self.history.get(tag), tensors[7], tensors[8])
+        idx, probs, value, self.history[tag] = self.model.get_action(*tensors[:7], self.history.get(tag), tensors[7], tensors[8], prev_move=self.encoder.prev_move(battle))
         p = probs[0].double().numpy()
         forced = not bool(mask[:8].any())
         rec = self._decide(battle, forced) if tag in self.live else None

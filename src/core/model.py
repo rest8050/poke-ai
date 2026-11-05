@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json
 import os
+import warnings
 
 import numpy as np
 
@@ -559,11 +560,17 @@ class DeepPokemonBattleTransformerNet(nn.Module):
 
     def get_action(self, my_team_cat, my_team_num, my_move_num, 
                    opp_team_cat, opp_team_num, opp_move_num, 
-                   field_vec, history_state=None, action_mask=None, legal_mask=None):
-        """legal_mask: 서버 요청 기반 순수 합법 마스크 (합법성을 입력 특징으로 쓰는 모델(uses_legal)만 받음, action_mask는 로짓 마스킹용)"""
+                   field_vec, history_state=None, action_mask=None, legal_mask=None, prev_move=None):
+        """legal_mask: 서버 요청 기반 순수 합법 마스크 (합법성을 입력 특징으로 쓰는 모델(uses_legal)만 받음, action_mask는 로짓 마스킹용)
+        prev_move: 직전에 쓴 기술 id [B,2] (BattleTensorEncoder.prev_move). 직전 기술을 입력으로 학습한 모델(prev_act)만 받음"""
         self.eval()
         with torch.no_grad():
             kw = {"legal_mask": legal_mask} if getattr(self, "uses_legal", False) else {}
+            if getattr(self, "prev_act", False):
+                if prev_move is None and not getattr(self, "_warned_prev", False):      # 학습 때 쓴 입력이 비면 조용히 성능이 떨어지므로 한 번 알림
+                    self._warned_prev = True
+                    warnings.warn("prev_act 모델인데 prev_move가 없음: 직전 기술을 '없음'으로 둠 (encoder.prev_move(battle)를 넘길 것)")
+                kw["prev_move"] = prev_move
             res = self.forward(my_team_cat, my_team_num, my_move_num,
                                opp_team_cat, opp_team_num, opp_move_num, 
                                field_vec, history_state, action_mask, **kw)
