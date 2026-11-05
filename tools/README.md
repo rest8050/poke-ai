@@ -228,4 +228,4 @@ python tools/fp_fidelity.py compare --a data/dagger/raw/d7 --a2 data/dagger/raw/
 - `data/scenarios/lib.py`: 세트 사전 + `scene()`/`write()` 도우미. 정의 파일 `data/scenarios/<이름>_defs.py`가 `<이름>_in.json`을 씀.
 - `tools/scenario_run.sh <이름> [ckpt ...]`: 정의 -> rec -> FP 300ms 재생 라벨(docker) -> npz -> `tools/scenario_eval.py`(마지막 결정의 교사 분포 대 모델 분포). FP 라벨링은 시간 기반이라 다른 CPU 작업이 없을 때만.
 
-> token-head 브랜치: 가치/히스토리/종류 헤드가 없는 구조라 PPO(7절), 사람 데이터 BC 학습기, 사슬 헤드(v9), 비판자/프로브 도구(critic_gate, td_critic_gate, future_probe, kind_probe, phi_check, hist_ablate, history_diag)는 제거됨. main/ppo-rct-baseline 브랜치에 남아 있다.
+> token-head 브랜치: 가치/히스토리/종류 헤드가 없는 구조라 PPO(7절), 사람 데이터 BC 학습기, 사슬 헤드(v9), 비판자/프로브 도구(critic_gate, td_critic_gate, future_probe, kind_probe, phi_check, hist_ablate, history_diag)는 제거됨. main 브랜치에 남아 있다.

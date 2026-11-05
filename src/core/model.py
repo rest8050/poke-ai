@@ -602,7 +602,7 @@ def build_model(cfg: dict) -> nn.Module:
             cfg.pop(k, None)
         return EntityPokemonNetV8(**cfg)
     if kind == "v9":
-        raise ValueError("v9(사슬 헤드)는 token-head 브랜치에서 제거됨: main/ppo-rct-baseline 브랜치에서 로드")
+        raise ValueError("v9(사슬 헤드)는 token-head 브랜치에서 제거됨: main 브랜치에서 로드")
     if kind == "v6":                                     # 서버 탑재 구조
         from src.core.model_v6 import EntityPokemonNetV6
         return EntityPokemonNetV6(**cfg)
@@ -630,7 +630,7 @@ def model_from_ckpt(path: str, map_location="cpu") -> nn.Module:
         print(f"  ⚠️ {path}에 .cfg.json 없음 → 기본 구조로 생성. 이 체크포인트가 모르는 새 모듈(예: team_cross)은 "
               f"무작위로 남습니다 — 기준/비교 모델로 쓴다면 cfg.json 있는(구조가 맞는) 체크포인트를 쓰세요.")
     if cfg.get("model") == "v8" and not cfg.get("token_head"):
-        raise ValueError(f"{path}는 옛 헤드 구조의 v8 체크포인트: token-head 브랜치에서는 로드할 수 없음 (main/ppo-rct-baseline 브랜치에서 로드)")
+        raise ValueError(f"{path}는 옛 헤드 구조의 v8 체크포인트: token-head 브랜치에서는 로드할 수 없음 (main 브랜치에서 로드)")
     model = build_model(cfg)
     load_compatible(model, torch.load(path, map_location=map_location))
     return model
