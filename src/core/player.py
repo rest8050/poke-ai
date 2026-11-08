@@ -1,4 +1,3 @@
-from src.core.model import DeepPokemonBattleTransformerNet
 from src.core.tensor_encoder import BattleTensorEncoder
 
 try:
@@ -33,9 +32,9 @@ if POKE_ENV_AVAILABLE:
         """
         분리된 BattleTensorEncoder 모듈을 사용하는 스마트 poke-env 플레이어
         """
-        def __init__(self, model: DeepPokemonBattleTransformerNet = None, vocab_path: str = "data/vocab.json", **kwargs):
+        def __init__(self, model, vocab_path: str = "data/vocab.json", **kwargs):
             super().__init__(**kwargs)
-            self.model = model or DeepPokemonBattleTransformerNet(vocab_path=vocab_path)
+            self.model = model
             self.encoder = BattleTensorEncoder(vocab_path=vocab_path)
             # 배틀별 GRU 히스토리 (battle_tag -> Tensor)
             # ponytail: 끝난 배틀도 남음, 장시간 돌리면 battle.finished 기준으로 정리

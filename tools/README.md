@@ -186,17 +186,6 @@ python tools/filter_dagger_hard.py <출력접두사>_b.jsonl <출력접두사>_b
 # 이후는 기존 DAgger와 동일: replay_label.py로 재라벨링 → build_fp_dataset.py
 ```
 
-## 7. 강화학습 미세조정 (PPO, 2026-10-29)
-증류된 정책에서 시작해 자가대전 승패로 개선. 롤아웃(`tools/rl_rollout.py`, 현재 정책 샘플링) → PPO 갱신(`src/training/train_rl.py`) → 체크포인트 저장을 반복하고, `--eval-every`마다 시작 모델과 arena SPRT 대전.
-```bash
-python src/training/train_rl.py --run rl1 --iters 20 --games 2000 --kl 0.1 --lr 3e-5   # Showdown은 없으면 직접 띄움. 출력: checkpoints/rl/rl1/it<k>.pt
-```
-- 이어 학습: `--start <이전 it*.pt> --base <원래 시작 모델>` (KL 앵커와 arena 기준이 원래 시작 모델로 유지됨, 옵티마이저 상태와 과거 상대 목록은 새로 시작)
-- 손실: PPO 클립 + β·KL(현재 ‖ 시작 정책), advantage = 할인된 승패 − V(s_t). 세트 추정은 얼림, v6/v8(합법 마스크 입력)만 지원. 손실 self-check: `PYTHONPATH=. python tests/test_rl.py`
-- 학습 팀은 train_a2/randomset_train3/rare_train3, 평가(arena)는 holdout/rare/randomset 풀. 작업자 일부(`--snap-frac`)는 과거 반복 체크포인트와 대전.
-- 스모크 측정: 240판 약 2.2분(약 110판/분), 갱신 VRAM 최대 4.9GB(`--batch 16`, 긴 판이 많으면 `--batch`를 줄일 것).
-- FP 상대 확인은 별도: `logs/hybrid_eval.sh` 모드 student (`CK=<ckpt>`). FP를 상대로 한 롤아웃은 아직 없음.
-
 ## 8. 사람 데이터 BC와 FP 변환기 (2026-10-30)
 설계와 결과는 `logs/summary_20261030.md`, `logs/human_report.md`, 메모리 `poke-ai-fp-converter`. 한 번 돌리고 끝난 실행 스크립트는 `logs/archive/` (README에 목록).
 
@@ -205,11 +194,7 @@ python src/training/train_rl.py --run rl1 --iters 20 --games 2000 --kl 0.1 --lr 
 # 파싱: Metamon 샤드 0 -> 양쪽 시점 시퀀스 npz (r1400 약 25분/21GB, r1600 약 10분, 이미 있는 조각은 건너뜀)
 PYTHONPATH=. python tools/parse_human.py --shard 0 --min-rating 1400 [--out-dir data/human]
 python tools/parse_diff.py <옛 폴더> <새 폴더> r1600 0 1      # 파서나 규칙을 바꿨을 때 옛 조각과 새 조각의 배열별 차이
-# 학습 (v8, 사람 행동 22칸 NLL): logs/human_<태그>.txt, 시험 결정별 NLL logs/human_<태그>_test.npz
-PYTHONPATH=. python src/training/train_human.py --tag <태그> [--init <ckpt>] [--epochs N] [--lr 1e-3] [--data "data/human/gen9ou_s0_r1400_*.npz"] [--arch '{"model":"v8","my_pos":false}']
-python tools/human_compare.py <태그A> <태그B>     # 판 단위 쌍부트스트랩 (양수 = B가 더 좋음), 시험 판이 같은 것끼리만
 python tools/human_table.py                       # logs/human_*.txt 전체 표
-python tools/human_agree.py                       # FP로 증류한 학생과 사람 행동의 일치
 ```
 태그에 대소문자만 다른 이름을 쓰지 말 것 (윈도우가 같은 파일로 봐서 결과를 덮어씀).
 
@@ -225,11 +210,7 @@ python tools/fp_fidelity.py convert --src data/dagger/raw/d7 --recs rec_fp_h0,re
 python tools/fp_fidelity.py compare --a data/dagger/raw/d7 --a2 data/dagger/raw/d7b --b data/fp_fidelity_<팔> --recs rec_fp_h0,rec_fp_h1 [--worlds 0,1,2,3] [--only-group 사람형]
 ```
   기준선 A2 = 같은 상태의 FP 재라벨(교사 잡음). 지표는 top-1 일치, 평활 KL, argmax/평균 정책 regret, B/A2 비.
-- `tools/critic_gate.py`: FP-Q 비판자 오프라인 관문 (얼린 v8_full latent 위 Q 헤드, `phi_check.py`와 같은 상관 정의). 결과: 정책 자체의 이점(r +0.17)이 비판자보다 강함.
-- `tools/td_critic_gate.py`: 승패만으로 TD 학습한 Q 헤드(K=1 대 K=4 앙상블) 관문, 결과 logs/td_critic_gate.log (실패: 정책 logπ r +0.172 대 TD +0.02~0.06)
 - `tests/test_hindsight.py`: `replay_dataset._hindsight` 회귀 테스트 (합성 로그 + 정답을 아는 판). 이 함수나 파서를 고치면 `PYTHONPATH=. python tests/test_hindsight.py`로 확인.
-- `tools/human_vs_fp.py` (+ `logs/human_vs_fp.sh`): 사람 고수/중위 결정을 FP(300ms)로 재라벨해 사람 행동이 FP 분포/Q에서 어디에 놓이는지 잼. 기준선 = FP 자기 선택(같은 변환 잡음). 결과 `logs/human_vs_fp.txt`, 메모리 `poke-ai-human-vs-fp`.
-- `tools/human_martingale.py`: 사람 행동의 Δ = V_FP(다음 결정) − Q_FP(둔 행동)를 regret 구간별로, 학생 행동 기준선과 비교 (FP가 사람 행동을 과소평가하는지). 결과 `logs/human_martingale.txt`.
 - `tools/future_probe.py`: 동결 프로브 — v8_full 잠재가 t+1/3/6의 생존 수·HP 우위와 승패를 현재 요약/원시 특징 대비 얼마나 담는가 (학생 대 FP300 판, 사전 등록 판정). 결과 `logs/future_probe.txt`.
 - `tools/where_lost.py`: 학생이 FP300에게 지는 판의 진행도별 V 곡선/regret 몫, V 0.4~0.6 결정의 남은 길이별 승률 부족분. 결과 `logs/where_lost.txt`.
 - `tools/lost_cases.py`: 학생이 FP300에게 진 판에서 "실제 수가 크게 틀리고 다음 결정에서 FP 승률이 떨어진" 결정을 진행도 고르게 N개 읽을 수 있게 출력. 결과 `logs/lost_cases.txt`.

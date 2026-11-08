@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 from src.core.belief import STAT_SCALE, SetBelief, build_move_table
 from src.core.matchup import Matchup
-from src.core.model import MAX_TURNS, DeepPokemonBattleTransformerNet, PokemonEmbeddingLayer
+from src.core.model import MAX_TURNS, PokemonEmbeddingLayer, get_action
 from src.core.tensor_encoder import EFFECT_DIM, EFFECT_START, EXT_START, MOVE_NUM_DIM
 
 # 3차원 어텐션 마스크(헤드별 편향)는 추론용 빠른 커널에서 학습 경로와 값이 달라짐(CLS 기준 2e-3) → 학습과 같은 일반 경로만 쓰도록 끔
@@ -297,4 +297,4 @@ class EntityPokemonNetV6(nn.Module):
         turn_seq[seq_index, time_index] = tv
         return self._heads(enc, self._history(turn_seq)[seq_index, time_index], action_mask)
 
-    get_action = DeepPokemonBattleTransformerNet.get_action
+    get_action = get_action

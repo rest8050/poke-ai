@@ -641,7 +641,7 @@ def side_ext(side, mon, ev):
 class BattleTensorEncoder:
     """
     poke-env의 Battle 객체 또는 RCT Mod의 JSON 상태를 
-    DeepPokemonBattleTransformerNet 입력 규격 텐서로 변환하는 전용 엔코더
+    모델 입력 규격 텐서로 변환하는 전용 엔코더
     """
     
     def __init__(self, vocab_path: str = "data/vocab.json", device: str = "cpu"):

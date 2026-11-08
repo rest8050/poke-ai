@@ -3,10 +3,10 @@ import sys
 sys.path.insert(0, ".")
 import numpy as np
 import torch
-from src.core.model import DeepPokemonBattleTransformerNet
+from src.core.model import build_model
 
 torch.manual_seed(0)
-m = DeepPokemonBattleTransformerNet().eval()
+m = build_model({"model": "v8"}).eval()
 assert m.embeddings.has_feat, "data/entity_features.npz 없음 → python tools/build_entity_features.py"
 z = np.load("data/entity_features.npz")
 seen = torch.from_numpy(np.flatnonzero(z["item_seen"] > 0)[:8]); unseen = torch.from_numpy(np.flatnonzero(z["item_seen"] == 0)[:8])

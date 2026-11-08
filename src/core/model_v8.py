@@ -41,7 +41,7 @@ import torch.nn.functional as F
 
 from src.core.belief import STAT_SCALE, SetBelief, build_move_table
 from src.core.matchup_v7 import MatchupV7
-from src.core.model import MAX_TURNS, DeepPokemonBattleTransformerNet, PokemonEmbeddingLayer
+from src.core.model import MAX_TURNS, PokemonEmbeddingLayer, get_action
 from src.core.pair_glu import PairGLU
 from src.core.tensor_encoder import EFFECT_DIM, EFFECT_START, FIELD_DIM, MOVE_NUM_DIM, NUM_DIM
 
@@ -371,4 +371,4 @@ class EntityPokemonNetV8(nn.Module):
         out = self._heads(enc, self._history(turn_seq)[seq_index, time_index], action_mask)
         return out
 
-    get_action = DeepPokemonBattleTransformerNet.get_action
+    get_action = get_action
