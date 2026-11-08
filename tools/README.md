@@ -120,8 +120,6 @@ npz의 `pos`는 그 결정이 배틀의 몇 번째 결정 지점인지이고, �
 ```bash
 # 합법성 범주(기술 4개/2~3개/1개만/교체 봉쇄) + 제약 효과 범주(도발·앵콜 등)별 교사/학생 교체 확률, 종류 KL, 총 KL, AUC와 기준 모델 대비 차이의 판 단위 부트스트랩 95% 구간
 python tools/legal_eval.py --models v6_full,v8_full --base v6_full --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
-# 진입 후 매치업 범주(상대 +2 이상 & 천진 후보, 스텔스록 & 약점/저항 후보): 특징 포켓몬으로의 교체 질량이 교사와 얼마나 같은가 (편향·평균 |오차|)
-python tools/entry_eval.py --models v6_full,v8_full --base v6_full --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
 # 필드/도구/상태 범주(트릭룸, 순풍, 벽, 날씨, 지형, 구애·증폭 도구, 마비)별 KL과 일치율을 나머지와 비교 (학습에 안 쓴 학생 상태 세트만 쓸 것)
 python tools/field_eval.py --models v6_full --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
 # 교사 확신도(최상위 확률)별·교사 선택 종류별 KL/일치 (학생의 격차가 확신하는 결정에 몰려 있는지)
@@ -131,17 +129,10 @@ python tools/entropy_eval.py --models v6_full --sets data/dagger/dg5.npz,data/da
 python tools/regret_eval.py --models v6_full,v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz
 # regret 분해: 학생 regret이 어떤 결정에 몰려 있나 (교사 선택 종류/턴/벤치 수/강제 교체/결정 중요도/교사 확신/드러난 상대 기술 수별 평균 regret과 전체 몫)
 python tools/regret_breakdown.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
-# 기능별 혼동표: 교사 대 학생의 행동 기능(공격/셋업/회복/설치/보호/교체/테라 ...)별 정책 질량, 불일치율, regret 몫, 기능 간 혼동 (자발 결정, 날카로운 결정은 따로). CPU로 됨
-python tools/move_confusion.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
-# 사례 분석: 교사가 확신한 교체/테라를 학생이 맞힌 결정과 놓친 결정을 한 수 앞 규칙 상황(KO 위협, 선공, KO 가능, 벤치 상성 차)으로 비교하고, 규칙 점수와 학생의 교체 판별 AUC를 견줌. CPU로 됨
-python tools/case_mine.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
-# 한 수 앞 규칙 대 학생: 최대 데미지 규칙 기준선과 학생의 기술 일치/regret 비교, 규칙이 확실한 상황(선공 확정 KO, 반감 기술 회피)에 개입했을 때 학생 대비 regret 쌍 비교. CPU로 됨
-python tools/rule_baseline.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
 # 실패 사례 읽기: 학생이 크게 틀린 결정(regret >= 0.15)을 무작위로 N개 뽑아 활성/벤치/필드/교사와 학생의 상위 행동과 Q를 읽을 수 있게 출력. CPU로 됨
 python tools/failure_cases.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz --n 30 --seed 0
 # 교체 이유 분석: 상대 활성의 공개 기술 수별 교체 판별 AUC/regret, 세계(상대 세트 표본)별 교체 이득의 일관성. 세계별 가치는 world_q.py가 원본 결정기록에서 따로 만듦 (d7/d6만 가능)
 python tools/world_q.py --decisions "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --npz data/dagger/d7_ho.npz --out data/dagger/d7_ho_worlds.npz
-python tools/switch_why.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz
 # 쌍 비교: 같은 결정에서 두 모델의 KL/일치/regret 차이를 "규칙이 닿는 결정" 범주(특성, 위협 후보, 스피드 상황)별로 판 단위 부트스트랩 (묶음별 표보다 민감). q가 든 npz만 가능
 python tools/paired_eval.py --a v6_full --b v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
 # 교사 잡음 상한: 같은 상태를 Foul Play가 두 번 라벨링한 결정기록 두 벌의 일치율/KL/regret (학생이 낼 수 있는 값의 기준). 재라벨은 logs/ceiling_run.sh (탐색이 시간 기반이라 다른 CPU 작업 금지)
@@ -211,18 +202,9 @@ python tools/fp_fidelity.py compare --a data/dagger/raw/d7 --a2 data/dagger/raw/
 ```
   기준선 A2 = 같은 상태의 FP 재라벨(교사 잡음). 지표는 top-1 일치, 평활 KL, argmax/평균 정책 regret, B/A2 비.
 - `tests/test_hindsight.py`: `replay_dataset._hindsight` 회귀 테스트 (합성 로그 + 정답을 아는 판). 이 함수나 파서를 고치면 `PYTHONPATH=. python tests/test_hindsight.py`로 확인.
-- `tools/future_probe.py`: 동결 프로브 — v8_full 잠재가 t+1/3/6의 생존 수·HP 우위와 승패를 현재 요약/원시 특징 대비 얼마나 담는가 (학생 대 FP300 판, 사전 등록 판정). 결과 `logs/future_probe.txt`.
-- `tools/where_lost.py`: 학생이 FP300에게 지는 판의 진행도별 V 곡선/regret 몫, V 0.4~0.6 결정의 남은 길이별 승률 부족분. 결과 `logs/where_lost.txt`.
-- `tools/lost_cases.py`: 학생이 FP300에게 진 판에서 "실제 수가 크게 틀리고 다음 결정에서 FP 승률이 떨어진" 결정을 진행도 고르게 N개 읽을 수 있게 출력. 결과 `logs/lost_cases.txt`.
-- `tools/forcing_eval.py`: 앙코르/도발/트집/사슬묶기 사용과 위협(Intimidate) 교체를 학생이 교사만큼 쓰는가 (질량, AUC, 일치, regret 몫). 결과 `logs/forcing_eval.txt`.
-- `tools/decode_eval.py`: 칸 argmax / 종류 우선 디코딩 / 표집 regret 비교 (교체 약점이 디코딩 때문인가) + 위임 곡선 (불확실한 결정 상위 x%를 교사로 바꿀 때 regret 감소). 결과 `logs/decode_eval.txt`.
-- `tools/kind_probe.py`: 기술/교체 종류 결정(type_head)이 후보별 정보를 잃는지 동결 프로브 (type_head 입력 vs + 후보 점수/은닉 풀링 AUC). 결과 `logs/kind_probe.txt`.
-- `tools/equivariance_check.py`: 내/상대 팀 칸 순서를 섞어 정책이 같은지 점검 (내 칸은 정확히 등변이어야 함, 상대 칸은 공개 순서라 의도적으로 민감). 결과 `logs/equivariance_check.txt`.
 - `tools/matchup_check.py` + `tools/sd_damage.js`: 매치업 모듈(MatchupV7)의 최대 난수 데미지를 Showdown `getDamage`(급소 없음, 같은 능력치/랭크/HP/도구/특성/테라/필드 입력)와 대조, 변형(필드 제외/도구 제외)으로 모듈이 안 쓰는 요인을 분리. 결과 `logs/matchup_check.txt`.
 - `tools/gen_matchup_tables.js`: Showdown 데이터에서 `data/matchup_tables.json` 생성 (기술 태그 slicing/punch/sound/contact/bite/pulse/recoil/secondary/바디프레스/속임수/사이코쇼크, 진화 전 종, 종 기본 타입). 매치업 모듈이 읽음.
-- `tools/build_dynamics_data.sh`: 자기 대전 원본 로그를 data/dyn/에 변환 (결정 상태/FP 정책·Q + turn, kind, opp_action, opp_move). 동역학 모델/상대 행동 예측용, 다음 상태는 같은 배틀의 다음 행.
 
 ### 장면 테스트 세트 (docs/scenario_suite_draft.md)
 - `tools/scenario_gen.js`: 양쪽 행동을 스크립트로 고정해 Showdown 시뮬레이터로 위치까지 진행, p1 시점 메시지를 `fp.replay_label`용 rec jsonl로 저장 (rqid를 붙이고 마지막에 가짜 `|win|` 마무리). 마지막 단계 뒤 p1의 결정 요청이 대기 중인 상태가 테스트 장면.
 - `data/scenarios/lib.py`: 세트 사전 + `scene()`/`write()` 도우미. 정의 파일 `data/scenarios/<이름>_defs.py`가 `<이름>_in.json`을 씀.
-- `tools/scenario_run.sh <이름> [ckpt ...]`: 정의 -> rec -> FP 300ms 재생 라벨(docker) -> npz -> `tools/scenario_eval.py`(마지막 결정의 교사 분포 대 모델 분포). FP 라벨링은 시간 기반이라 다른 CPU 작업이 없을 때만.
