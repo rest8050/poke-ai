@@ -188,6 +188,19 @@ def split_ids(data, offsets, val_frac, seed=0):
 def main(args):
     data, offsets, lens, files = load(args.data)
     val, train = split_ids(data, offsets, VAL_FRAC)
+    val_new = None
+    if args.team_split > 0:     # 팀 단위 분리 실험: 팀(종 조합)의 일부를 통째로 뽑아 그 팀만 나오는 시퀀스를 'val_new'(처음 보는 팀)로, 그 팀이 한 번도 안 나오는 시퀀스만 학습으로 씀 (섞인 시퀀스는 버림)
+        first = np.asarray(offsets[:-1])
+        mine = np.sort(np.asarray(data["my_team_cat"][first, :, 10]), axis=1)
+        opp = np.sort(np.asarray(data["opp_team_cat"][first, :, 10]), axis=1)
+        kmine, kopp = [m.tobytes() for m in mine], [o.tobytes() for o in opp]
+        teams = sorted(set(kmine) | set(kopp))
+        random.Random(1).shuffle(teams)
+        held = set(teams[:int(len(teams) * args.team_split)])
+        val_new = [i for i in range(len(first)) if kmine[i] in held and kopp[i] in held]
+        pool = {i for i in range(len(first)) if kmine[i] not in held and kopp[i] not in held}
+        val, train = [i for i in val if i in pool], [i for i in train if i in pool]
+        print(f"팀 단위 분리: 팀 {len(teams)}개 중 {len(held)}개 제외 → 처음 보는 팀 검증 {len(val_new)}판, 학습 풀 {len(pool)}판 (버린 섞인 시퀀스 {len(first) - len(pool) - len(val_new)}판)")
     print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
     arch = json.loads(args.arch)
@@ -229,12 +242,14 @@ def main(args):
         tr = run(model, data, offsets, train, args, train=True, opt=opt)
         va = run(model, data, offsets, val, args, train=False)
         print(f"[에폭 {ep}/{args.epochs}] 학습 {fmt(tr)}\n            검증 {fmt(va)}", flush=True)
+        if val_new:
+            print(f"            처음 보는 팀 검증 {fmt(run(model, data, offsets, val_new, args, train=False))}", flush=True)
         # 최근 최대 3개 평균으로 완만화해서 최저점 판단 (검증셋이 작아 한 에폭 값만으로는 잡음이 큼). 기준은 Q가 있으면 검증 argmax regret, 없으면 소프트 CE
         # (손실 종류와 무관하게 같은 기준으로 비교하기 위해 regret을 씀)
         metric = "regret" if va["reg"] is not None else "CE"
         ce_hist.append(va["reg"] if va["reg"] is not None else va["ce"])
         smoothed = sum(ce_hist[-3:]) / len(ce_hist[-3:])
-        if smoothed < best_ce:
+        if smoothed < best_ce or args.save_last:
             best_ce, best_ep = smoothed, ep
             save_ckpt(model, args.out)
             print(f"  💾 최저점 갱신(완만화 {metric} {smoothed:.4f}) → {args.out}", flush=True)
@@ -251,6 +266,8 @@ if __name__ == "__main__":
     ap.add_argument("--init", default="", help="시작 가중치 체크포인트 (기본: 처음부터)")
     ap.add_argument("--lr", type=float, default=LR, help="피크 학습률 (이어서 학습할 때는 낮게)")
     ap.add_argument("--hard-weight", type=float, default=1.0, help="중요도(Q* - 최저Q) >= 0.3인 결정의 정책 손실 가중 (1=끔). Q가 든 데이터만")
+    ap.add_argument("--save-last", action="store_true", help="검증 최저점 대신 마지막 에폭을 저장 (외우기 테스트용)")
+    ap.add_argument("--team-split", type=float, default=0.0, help="0이 아니면 팀(종 조합) 비율만큼을 통째로 제외해 '처음 보는 팀' 검증을 따로 잰다 (학습 데이터는 그만큼 줄어듦)")
     ap.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (기본 1e-4)")
 
     main(ap.parse_args())

@@ -102,6 +102,9 @@ def main():
         a, b = res[names[0]], res[names[1]]
         m, lo, hi = boot_ci(b - a, battle, rng)
         print(f"\n쌍 비교 {names[1]} - {names[0]} regret 평균 차이 {m:+.4f} [{lo:+.4f},{hi:+.4f}]  (음수 = {names[1]}이 손해가 적음, 둘 다 지원 안인 결정만)")
+        tl = M[:, 4:8].any(1)      # 테라가 합법인 결정만
+        m, lo, hi = boot_ci(np.where(tl, b - a, np.nan), battle, rng)
+        print(f"  테라 합법 결정({int((tl & valid).sum())}개)만: {m:+.4f} [{lo:+.4f},{hi:+.4f}] | 평균 regret {names[0]} {np.nanmean(np.where(tl, a, np.nan)):.4f}, {names[1]} {np.nanmean(np.where(tl, b, np.nan)):.4f}")
 
 
 if __name__ == "__main__":

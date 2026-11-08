@@ -347,6 +347,8 @@ def build(decisions, workers=1):
 
 
 def main(args):
+    global KEEP_RATIO
+    KEEP_RATIO = args.keep_ratio
     seqs, stat, unmatched = build(load_jsonl(args.decisions), WORKERS)
     if not seqs:
         raise SystemExit(f"❌ 만들어진 배틀이 없음: {dict(stat)}")
@@ -383,4 +385,5 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--decisions", required=True, help="Foul Play 결정 JSONL glob")
     ap.add_argument("--out", default="data/fp/fp_data.npz")
+    ap.add_argument("--keep-ratio", type=float, default=KEEP_RATIO, help="목표에서 최고 방문 비율의 이 값 미만인 행동 제거 (기본 0.2)")
     main(ap.parse_args())
