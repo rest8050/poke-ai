@@ -204,7 +204,3 @@ python tools/fp_fidelity.py compare --a data/dagger/raw/d7 --a2 data/dagger/raw/
 - `tests/test_hindsight.py`: `replay_dataset._hindsight` 회귀 테스트 (합성 로그 + 정답을 아는 판). 이 함수나 파서를 고치면 `PYTHONPATH=. python tests/test_hindsight.py`로 확인.
 - `tools/matchup_check.py` + `tools/sd_damage.js`: 매치업 모듈(MatchupV7)의 최대 난수 데미지를 Showdown `getDamage`(급소 없음, 같은 능력치/랭크/HP/도구/특성/테라/필드 입력)와 대조, 변형(필드 제외/도구 제외)으로 모듈이 안 쓰는 요인을 분리. 결과 `logs/matchup_check.txt`.
 - `tools/gen_matchup_tables.js`: Showdown 데이터에서 `data/matchup_tables.json` 생성 (기술 태그 slicing/punch/sound/contact/bite/pulse/recoil/secondary/바디프레스/속임수/사이코쇼크, 진화 전 종, 종 기본 타입). 매치업 모듈이 읽음.
-
-### 장면 테스트 세트 (docs/scenario_suite_draft.md)
-- `tools/scenario_gen.js`: 양쪽 행동을 스크립트로 고정해 Showdown 시뮬레이터로 위치까지 진행, p1 시점 메시지를 `fp.replay_label`용 rec jsonl로 저장 (rqid를 붙이고 마지막에 가짜 `|win|` 마무리). 마지막 단계 뒤 p1의 결정 요청이 대기 중인 상태가 테스트 장면.
-- `data/scenarios/lib.py`: 세트 사전 + `scene()`/`write()` 도우미. 정의 파일 `data/scenarios/<이름>_defs.py`가 `<이름>_in.json`을 씀.
