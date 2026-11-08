@@ -4,7 +4,7 @@ q_mean/q_vis가 든 npz만 쓸 수 있음 (build_fp_dataset 출력. 옛 파일�
 정의: 방문 수 >= --min-vis 인 행동만 믿을 수 있는 Q. 결정마다 Q* = 믿을 수 있는 행동 중 최대 Q (믿을 행동이 2개 미만이면 제외).
   학생 argmax 행동 a의 regret = Q* - Q_a (a가 믿을 수 없는 행동이면 '지원 밖'으로 따로 셈), 평균 정책 regret = 믿을 수 있는 행동 위에서 정책 평균 (지원 밖 질량은 따로)
 Q 추정에는 탐색 잡음이 있어 (방문 N이면 표준오차 ~0.5/sqrt(N)) 작은 regret 차이는 잡음 → 교사 자신의 argmax(탐색 분포 최상위) regret을 기준선으로 같이 출력.
-사용: python tools/regret_eval.py --models v6_full,v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz   (모델 = checkpoints/supervised_v2_fp_<이름>.pt, 또는 체크포인트 경로)"""
+사용: python tools/regret_eval.py --models v8_full,v9 --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz   (모델 = checkpoints/supervised_v2_fp_<이름>.pt, 또는 체크포인트 경로)"""
 import argparse
 import os
 import sys
@@ -45,7 +45,7 @@ def regrets(P, q, rel, qstar, T):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", default="v6_full")
+    ap.add_argument("--models", default="v9")
     ap.add_argument("--sets", required=True)
     ap.add_argument("--min-vis", type=float, default=100, help="이 방문 수 이상인 행동의 Q만 믿음")
     args = ap.parse_args()

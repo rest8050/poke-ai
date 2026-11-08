@@ -10,7 +10,7 @@ import tempfile
 import torch
 
 from src.core.model import build_model, model_from_ckpt, save_ckpt
-from src.core.model_v8 import G_DIM
+from src.core.model import G_DIM
 from src.core.tensor_encoder import EFFECT_START, FIELD_DIM, NUM_DIM
 
 V = json.load(open("data/vocab.json"))

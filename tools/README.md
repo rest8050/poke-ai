@@ -119,14 +119,14 @@ npz의 `pos`는 그 결정이 배틀의 몇 번째 결정 지점인지이고, �
 데이터는 build_fp_dataset이 서버 요청(`|request|`)으로 만든 합법 마스크를 쓰고, 행동 제약 효과 열(field_vec 뒤쪽 14열)도 같이 만든다. 옛 npz(마스크가 규칙 기반, 효과 열 없음)로는 v5/v6의 입력이 비어 있으니 다시 빌드할 것.
 ```bash
 # 합법성 범주(기술 4개/2~3개/1개만/교체 봉쇄) + 제약 효과 범주(도발·앵콜 등)별 교사/학생 교체 확률, 종류 KL, 총 KL, AUC와 기준 모델 대비 차이의 판 단위 부트스트랩 95% 구간
-python tools/legal_eval.py --models v6_full,v8_full --base v6_full --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
+python tools/legal_eval.py --models v8_full,v9 --base v8_full --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
 # 필드/도구/상태 범주(트릭룸, 순풍, 벽, 날씨, 지형, 구애·증폭 도구, 마비)별 KL과 일치율을 나머지와 비교 (학습에 안 쓴 학생 상태 세트만 쓸 것)
-python tools/field_eval.py --models v6_full --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
+python tools/field_eval.py --models v9 --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
 # 교사 확신도(최상위 확률)별·교사 선택 종류별 KL/일치 (학생의 격차가 확신하는 결정에 몰려 있는지)
-python tools/entropy_eval.py --models v6_full --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
+python tools/entropy_eval.py --models v9 --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
 # regret: 학생 argmax가 교사 탐색의 행동별 가치(Q)로 얼마나 손해인가 (일치율은 근소한 차이 선택도 감점이라 가치 손실로 재측정). 교사 argmax 기준선 포함, 2개 모델이면 판 단위 쌍 비교
 # q_mean/q_vis가 든 npz만 가능 (build_fp_dataset이 항상 저장. 옛 홀드아웃은 원본 결정기록으로 재빌드)
-python tools/regret_eval.py --models v6_full,v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz
+python tools/regret_eval.py --models v8_full,v9 --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz
 # regret 분해: 학생 regret이 어떤 결정에 몰려 있나 (교사 선택 종류/턴/벤치 수/강제 교체/결정 중요도/교사 확신/드러난 상대 기술 수별 평균 regret과 전체 몫)
 python tools/regret_breakdown.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
 # 실패 사례 읽기: 학생이 크게 틀린 결정(regret >= 0.15)을 무작위로 N개 뽑아 활성/벤치/필드/교사와 학생의 상위 행동과 Q를 읽을 수 있게 출력. CPU로 됨
@@ -134,7 +134,7 @@ python tools/failure_cases.py --models v8_full --sets data/dagger/d7_ho.npz,data
 # 교체 이유 분석: 상대 활성의 공개 기술 수별 교체 판별 AUC/regret, 세계(상대 세트 표본)별 교체 이득의 일관성. 세계별 가치는 world_q.py가 원본 결정기록에서 따로 만듦 (d7/d6만 가능)
 python tools/world_q.py --decisions "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --npz data/dagger/d7_ho.npz --out data/dagger/d7_ho_worlds.npz
 # 쌍 비교: 같은 결정에서 두 모델의 KL/일치/regret 차이를 "규칙이 닿는 결정" 범주(특성, 위협 후보, 스피드 상황)별로 판 단위 부트스트랩 (묶음별 표보다 민감). q가 든 npz만 가능
-python tools/paired_eval.py --a v6_full --b v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
+python tools/paired_eval.py --a v8_full --b v9 --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
 # 교사 잡음 상한: 같은 상태를 Foul Play가 두 번 라벨링한 결정기록 두 벌의 일치율/KL/regret (학생이 낼 수 있는 값의 기준). 재라벨은 logs/ceiling_run.sh (탐색이 시간 기반이라 다른 CPU 작업 금지)
 python tools/teacher_ceiling.py --a "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --b "data/dagger/raw/d7b/lab_rec_*_h*.jsonl"
 ```

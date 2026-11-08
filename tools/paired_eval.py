@@ -1,7 +1,7 @@
 """쌍 비교: 같은 결정에서 두 모델의 KL / 일치 / regret 차이(B - A)를 "규칙이 닿는 결정" 범주별로 판 단위 부트스트랩으로 잰다.
 범주는 matchup_v7 규칙이 영향을 줄 수 있는 결정 (규칙 특성이 활성에 있음, 위협 교체 후보, 스피드 규칙이 걸리는 상황 등). 결정 간 분산이 사라져서 묶음별 표(ability_eval)보다 훨씬 민감함.
 음수 = B가 더 낮음 (KL/regret은 B가 낫다, 일치는 B가 나쁘다). q_mean/q_vis가 든 npz만 가능 (regret 때문).
-사용: python tools/paired_eval.py --a v6_full --b v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz   (모델 = checkpoints/supervised_v2_fp_<이름>.pt)"""
+사용: python tools/paired_eval.py --a v8_full --b v9 --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz   (모델 = checkpoints/supervised_v2_fp_<이름>.pt)"""
 import argparse
 import json
 import sys

@@ -7,7 +7,7 @@ import tempfile
 import torch
 
 from src.core.model import build_model, model_from_ckpt, save_ckpt
-from src.core.pair_glu import PairGLU
+from src.core.model import PairGLU
 from src.core.tensor_encoder import FIELD_DIM, NUM_DIM
 
 

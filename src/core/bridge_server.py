@@ -33,7 +33,7 @@ from src.core.effectiveness import eff_move
 from src.core.actions import decode_action
 from src.core.tensor_encoder import BattleTensorEncoder
 
-CKPT = os.environ.get("POKEAI_CKPT", "checkpoints/supervised_v2_fp_v6_full.pt")      # 포인터 파일이 없을 때 쓰는 기본값
+CKPT = os.environ.get("POKEAI_CKPT", "checkpoints/supervised_v2_fp_v9.pt")      # 포인터 파일이 없을 때 쓰는 기본값
 POINTER = os.environ.get("POKEAI_POINTER", "checkpoints/CURRENT")                   # 한 줄: 체크포인트 파일 이름(포인터와 같은 폴더) 또는 경로
 RECHECK_SEC = 5.0
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"

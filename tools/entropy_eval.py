@@ -1,7 +1,7 @@
 """교사 확신도별 평가: 학생의 KL/일치가 어디에 몰려 있는가 (교사가 확신하는 결정 vs 아슬아슬한 결정, 교사 선택 종류별).
 교사 최상위 확률 구간으로 나눠 구간별 결정 수, KL, 전체 KL 중 차지하는 몫, 일치율, 학생이 교사 최상위 행동에 준 확률을 낸다 (구간 평균은 판 단위 부트스트랩 95%)
 참고: 교사 자체 재현율(같은 상태를 다시 라벨링해도 같은 선택이 나오는 비율)은 전체 0.77~0.80이고 아슬아슬한 구간일수록 낮아, 그 구간의 낮은 일치는 일부 피할 수 없음
-사용: python tools/entropy_eval.py --models v6_full --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz"""
+사용: python tools/entropy_eval.py --models v9 --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz"""
 import argparse
 import sys
 
@@ -29,7 +29,7 @@ def mean_ci(x, mask, battle, rng, n_boot=1000):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", default="v6_full")
+    ap.add_argument("--models", default="v9")
     ap.add_argument("--sets", required=True)
     args = ap.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")

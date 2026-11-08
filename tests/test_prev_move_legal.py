@@ -5,7 +5,7 @@ import json
 
 import torch
 
-from src.core.model_v8 import LEG_G, EntityPokemonNetV8
+from src.core.model import LEG_G, EntityPokemonNetV8
 from src.core.tensor_encoder import BattleTensorEncoder
 
 V = json.load(open("data/vocab.json", encoding="utf-8"))

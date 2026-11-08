@@ -9,7 +9,7 @@ from src.core.model import build_model, save_ckpt
 
 small = {"d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64, "my_pos": False}
 ck = tempfile.mkdtemp()                       # 진짜 체크포인트 대신 작은 새 모델 둘 (옛 체크포인트는 현재 인코더와 입력 폭이 달라 예열을 못 함)
-save_ckpt(build_model({"model": "v6", **small}).eval(), os.path.join(ck, "supervised_v2_fp_old.pt"))
+save_ckpt(build_model({"model": "v8", **small}).eval(), os.path.join(ck, "supervised_v2_fp_old.pt"))
 save_ckpt(build_model({"model": "v8", **small}).eval(), os.path.join(ck, "supervised_v2_fp_new.pt"))
 tmp = tempfile.mkdtemp()
 ptr = os.path.join(tmp, "CURRENT")
@@ -19,7 +19,7 @@ write = lambda t: open(ptr, "w").write(t + "\n")
 write(os.path.join(ck, "supervised_v2_fp_old.pt"))
 bs.holder.refresh(force=True)
 old_model, old_name = bs.holder.model, bs.holder.name
-assert old_name == "supervised_v2_fp_old.pt" and type(old_model).__name__ == "EntityPokemonNetV6"
+assert old_name == "supervised_v2_fp_old.pt" and type(old_model).__name__ == "EntityPokemonNetV8"
 s_old = bs.Session("p1", bs.holder.model, bs.holder.name)
 
 write(os.path.join(ck, "supervised_v2_fp_new.pt"))

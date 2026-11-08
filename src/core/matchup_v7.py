@@ -1,5 +1,5 @@
-"""매치업 특징 v7 (독립 구현, 상속 없음): matchup.py(v6)에 특성 EXEC 규칙(docs/ability_rules_design_A.md)을 더함. 파라미터 없음, 저장된 관측 텐서만 읽음.
-v6/v4 모델이 matchup.py를 쓰므로 그쪽은 건드리지 않음 (v6 퇴역 시 matchup.py 삭제).
+"""매치업 특징 v7 (독립 구현, 상속 없음): 옛 v6 매치업(matchup.py, 제거됨)에 특성 EXEC 규칙(docs/ability_rules_design_A.md)을 더함. 파라미터 없음, 저장된 관측 텐서만 읽음.
+v6 퇴역으로 matchup.py는 삭제됨.
 
 입력: my_cat/my_num/my_mv/opp_cat/opp_num/opp_mv (tensor_encoder 레이아웃), field_vec, 상대 특성 분포 opp_ab_prob [B,6,A], 상대 구애스카프 확률 opp_item_prob [B,6]
   num: 0 활성, 1 기절, 2 HP비율, 3~7 랭크/6 (공 방 특공 특방 스피드), 8 레벨, 9 테라 활성, 11~16 능력치/255 (내 쪽=실능력치, 상대=종족값), cat: 0 도구, 1 특성, 2~3 타입, 4 상태, 9 테라 타입

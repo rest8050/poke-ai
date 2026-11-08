@@ -1,7 +1,7 @@
 """필드/도구/상태 범주별 평가: 곱셈 보정이 필요한 특수 상황(트릭룸, 순풍, 벽, 날씨, 지형, 구애·증폭 도구, 마비)에서 학생이 교사와 얼마나 다른가.
 지표: 결정마다 KL(교사 || 학생)과 교사 argmax 일치. 범주 평균 - 나머지 평균(차이)을 판(배틀) 단위 부트스트랩 95%로 냄 (양수 = 범주에서 더 나쁨)
 범주는 서로 겹칠 수 있고 게임 단계와 얽히므로(예: 트릭룸은 중후반) 차이는 "특수 상황의 난이도 + 학생의 약점"의 합으로 읽을 것
-사용: python tools/field_eval.py --models v6_full --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz   (모델 = checkpoints/supervised_v2_fp_<이름>.pt, 판단 가능한 결정만 = 합법 행동 2개 이상)"""
+사용: python tools/field_eval.py --models v9 --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz   (모델 = checkpoints/supervised_v2_fp_<이름>.pt, 판단 가능한 결정만 = 합법 행동 2개 이상)"""
 import argparse
 import json
 import sys
@@ -68,7 +68,7 @@ def cat_vs_rest(x, mask, battle, rng, n_boot=2000):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", default="v6_full")
+    ap.add_argument("--models", default="v9")
     ap.add_argument("--sets", required=True)
     args = ap.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")

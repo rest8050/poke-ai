@@ -1,12 +1,11 @@
 """MatchupV7 self-check: PYTHONPATH=. python tests/test_matchup_v7.py
-0) 규칙 표를 중립으로 두면 기존 Matchup(v6) 출력과 같음, 1) 정밀기술 위력 경계, 2) 두꺼운지방/부유 배율, 3) 옹골참 만피 KO, 4) 스피드(날씨 특성/마비/순풍/랭크/스카프/트릭룸),
+1) 정밀기술 위력 경계, 2) 두꺼운지방/부유 배율, 3) 옹골참 만피 KO, 4) 스피드(날씨 특성/마비/순풍/랭크/스카프/트릭룸),
 5) 우선도와 장난꾸러기(악 타입 실패), 6) 상대 특성 확률 기대값, 7) 위협 교체 후보 배율, 8) 재생력 회복량, 9) 상대 기술칸의 선공 기대값"""
 import json
 
 import torch
 import torch.nn.functional as F
 
-from src.core.matchup import Matchup
 from src.core.matchup_v7 import MatchupV7
 from src.core.tensor_encoder import FIELD_DIM, NUM_DIM
 
@@ -63,38 +62,6 @@ def active(**kw):
 def damage(out, o=0, j=0, ch=1):
     return float(out["off"][0, o, j, ch])        # 내 포켓몬 0의 기술 j가 상대 포켓몬 o에게: 채널 1 = 데미지 비율
 
-
-# 0) 중립 회귀: 표를 중립으로 두면 v6 Matchup과 같은 출력
-old = Matchup(entry=True)
-neutral = MatchupV7()
-neutral.is_tech.zero_(); neutral.is_sturdy.zero_(); neutral.is_prank.zero_(); neutral.is_intim.zero_(); neutral.is_regen.zero_()
-neutral.weather_speed.zero_(); neutral.mflag.zero_(); neutral.abf.zero_()                 # 데미지 보정 표(기술 태그/지명 특성)도 중립
-fd = torch.ones(A, neutral.f_def.size(1))
-from src.core.matchup import IMMUNE_ABILITIES
-for name, t in IMMUNE_ABILITIES.items():
-    fd[AB[name], TY[t]] = 0.0
-neutral.f_def.copy_(fd)
-g = torch.Generator().manual_seed(0)
-n = 4
-mc, oc = torch.randint(1, 8, (n, 6, 11), generator=g), torch.randint(1, 8, (n, 6, 11), generator=g)
-mc[..., 0] = oc[..., 0] = 0
-mc[..., 4] = oc[..., 4] = 0                                    # 상태이상/도구 없음 (마비, 스카프 규칙이 안 켜지게)
-mn, on = torch.rand(n, 6, NUM_DIM, generator=g), torch.rand(n, 6, NUM_DIM, generator=g)
-mn[:, :, 0] = on[:, :, 0] = 0; mn[:, 0, 0] = 1; on[:, 1, 0] = 1; mn[:, :, 1] = on[:, :, 1] = 0
-mn[..., 9] = on[..., 9] = 0                                    # 테라 없음 (테라 자속 2배/위력 60 하한은 11)에서 따로 검사)
-mm, om = torch.rand(n, 6, 4, 46, generator=g), torch.rand(n, 6, 4, 46, generator=g)
-om[:, 4:] = 0
-mm[..., 10] = om[..., 10] = 0                                  # v6 Matchup에는 다단히트 계수가 없으므로 그 칸(효과 특징[2])은 0으로 맞춤 (10번 항목에서 따로 검사)
-fv = torch.zeros(n, FIELD_DIM)
-fv[:, 28] = 1.0; fv[:, 29] = 1 / 3                              # 내 쪽 스텔스록 + 압정 1겹 (진입 피해 같이 확인)
-mult = torch.rand(n, 6, 6, generator=g) * 0.4 + 0.8
-with torch.no_grad():
-    o6 = old(mc, mn, mm, oc, on, om, mult, entry=old.entry_frac(mc, mn, fv))
-    o7 = neutral(mc, mn, mm, oc, on, om, fv, F.one_hot(oc[..., 1], A).float(), torch.zeros(n, 6), mult)
-for k in ("def", "off", "spd_my", "spd_opp"):
-    assert torch.allclose(o6[k], o7[k], atol=1e-6), (k, (o6[k] - o7[k]).abs().max())
-assert torch.allclose(old.entry_frac(mc, mn, fv), o7["entry_frac"])
-assert (o7["entry_opp"] == 1).all() and (o7["exit_heal"] == 0).all()
 
 # 공통 상황: 내 활성이 물리 공격기(위력 bp)로 상대 활성을 때림. 능력치는 데미지가 상한에 안 닿게 낮게
 def hit(bp, my_ab=None, opp_ab=None, mtype="normal", opp_types=("grass",), opp_hp=1.0, kind="phys"):

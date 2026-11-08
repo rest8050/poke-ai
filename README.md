@@ -28,7 +28,7 @@ v8은 2%p 재확인 대국에서 52.0%(3,048판)까지 두고 결론 전에 멈�
 ## 폴더 구조
 
 ```
-src/core/       모델(model_v8 학습 기본, model_v6 서버 탑재), 인코더, 손계산 매치업, 세트 추정, 브리지 서버
+src/core/       모델(model.py: v8 엔티티 토큰 모델), 인코더, 손계산 매치업, 세트 추정, 브리지 서버
 src/training/   데이터셋 빌드, 증류 학습, 세트 추정 사전학습, 강화학습(PPO)
 tools/          데이터 수집, 평가, 진단 도구 (명령어 모음: tools/README.md)
 docs/           설계 문서와 실험 전에 정한 판정 기준
@@ -54,8 +54,8 @@ python src/training/train_fp_distill.py --data "data/fp_selfplay/ms300/fp_data*.
 # 3. 평가: 새 모델과 기준 모델의 SPRT 대전
 python tools/arena.py new <기준> --delta 0.03
 
-# 4. 배포 묶음 만들기 (서버 코드는 현재 v6 구조)
-bash deploy/build_package.sh v6_full
+# 4. 배포 묶음 만들기 (2026-11-08부터 서버 배포는 보류. v6 구조는 제거됨)
+bash deploy/build_package.sh <체크포인트 이름>
 ```
 
 ## 평가 체계
