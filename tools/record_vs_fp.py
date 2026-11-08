@@ -11,7 +11,7 @@ sys.path.insert(0, ROOT)
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 
 from src.core.model import model_from_ckpt
-from src.core.team_pool import RandomPoolTeambuilder
+from team_pool import RandomPoolTeambuilder
 from tools.record_games import RecordingPlayer, team_signature
 
 

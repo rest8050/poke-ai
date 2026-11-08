@@ -1,5 +1,5 @@
 """직전 기술 입력과 합법성 요약 self-check: PYTHONPATH=. python tests/test_prev_move_legal.py
-- encoder.prev_move: reveals.py가 기록한 양쪽 마지막 사용 기술 -> 기술 어휘 번호 [1,2], 기록이 없으면 0
+- encoder.prev_move: events.py가 기록한 양쪽 마지막 사용 기술 -> 기술 어휘 번호 [1,2], 기록이 없으면 0
 - v8 _legal_summary(forced_zero): 합법 기술이 0개(강제 교체)일 때만 고정·잃은 화력 칸이 0, 기술이 있는 결정은 예전과 같음"""
 import json
 

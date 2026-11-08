@@ -18,7 +18,7 @@ import torch.nn.functional as F
 sys.path.insert(0, ".")
 from poke_env.data import GenData
 
-from src.core.belief import STAT_SCALE, SetBelief
+from src.core.model import STAT_SCALE, SetBelief
 from src.core.tensor_encoder import NUM_DIM, VocabManager
 
 TRAIN_POOLS = [("metamon", "data/team_pool_metamon.json", 0.5), ("randomset", "data/team_pool_randomset_train3.json", 0.2),

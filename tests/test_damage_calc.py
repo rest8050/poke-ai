@@ -2,7 +2,7 @@
 능력치 공식(실제 게임 값), Matchup과 같은 피해 근사(자속/상성/면역/화상/테라/날씨/도구 배율), 진단의 사건 평가(피해 비율, KO, 제외 사유)"""
 import math
 
-from src.core.damage_calc import calc_stats, damage, item_stat_mult, stage_mult, standard_stats, supported
+from src.core.rules import calc_stats, damage, item_stat_mult, stage_mult, standard_stats, supported
 from tools.damage_residual_report import evaluate
 
 CHART = {"ground": {"fire": 2.0, "flying": 0.0, "steel": 2.0, "grass": 0.5}, "water": {"fire": 2.0, "grass": 0.5}}

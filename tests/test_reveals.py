@@ -1,10 +1,10 @@
-"""reveals.py self-check (가짜 전투 객체로 규칙 하나씩): PYTHONPATH=. python tests/test_reveals.py
+"""events.py self-check (가짜 전투 객체로 규칙 하나씩): PYTHONPATH=. python tests/test_reveals.py
 공개 (item:/ability:/폴터가이스트), 돌격 부츠 추론, 구애 스카프 추론과 취소, 재생력 추론, 마지막 행동/등장 후 쓴 기술, 합성 휘발성(unburden, 충전, 반동), 수면 나이"""
 from types import SimpleNamespace as NS
 
 from poke_env.battle import PokemonType, SideCondition
 
-from src.core.reveals import RevealTracker
+from src.core.events import RevealTracker
 
 
 def mon(species, hp=1.0, abilities=(), ability=None, item="unknown_item", status=None, spe=100, types=("NORMAL",)):

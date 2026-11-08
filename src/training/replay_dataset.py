@@ -20,7 +20,7 @@ from poke_env.battle import Battle, Move, Pokemon, PokemonType
 from poke_env.data import GenData
 from poke_env.stats import compute_raw_stats
 
-from src.core.battle_eval import potential
+from src.core.rules import potential
 from src.core.tensor_encoder import BattleTensorEncoder
 
 OBS_KEYS = ["my_team_cat", "my_team_num", "my_move_num", "opp_team_cat", "opp_team_num", "opp_move_num", "field_vec"]

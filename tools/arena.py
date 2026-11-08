@@ -53,7 +53,7 @@ async def worker(a):
     import json
     from src.core.model import model_from_ckpt
     from src.evaluation.logging_player import LoggingPlayer
-    from src.core.team_pool import RandomPoolTeambuilder
+    from team_pool import RandomPoolTeambuilder
 
     pool_name, pool_path = a.pool.split("=", 1)
     exports = [t["export"] for t in json.load(open(pool_path, encoding="utf-8-sig"))["teams"]]

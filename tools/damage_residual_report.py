@@ -17,7 +17,7 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, ".")
-from src.core.damage_calc import calc_stats, damage, item_stat_mult, standard_stats, supported, type_eff
+from src.core.rules import calc_stats, damage, item_stat_mult, standard_stats, supported, type_eff
 from src.training.battle_events import find_set
 
 MIN_OBS = 0.03

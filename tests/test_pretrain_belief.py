@@ -4,7 +4,7 @@
 import torch
 
 from poke_env.data import GenData
-from src.core.belief import SetBelief
+from src.core.model import SetBelief
 from src.core.tensor_encoder import VocabManager
 from src.training.pretrain_belief import belief_loss, make_batch, parse_team, to_arrays
 

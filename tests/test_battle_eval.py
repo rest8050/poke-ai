@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from poke_env.battle import Effect, Move, Pokemon, SideCondition, Status
 
-from src.core.battle_eval import SHAPING_SCALE, TERMS, UNSEEN_MON, evaluate, potential, terms
+from src.core.rules import SHAPING_SCALE, TERMS, UNSEEN_MON, evaluate, potential, terms
 
 
 def mon(species, active=False, item="leftovers", moves=(), hp=1.0, ability=None):

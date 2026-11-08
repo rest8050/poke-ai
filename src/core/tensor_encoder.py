@@ -339,7 +339,7 @@ def move_effect_features(move_id: str) -> Tuple[float, ...]:
 
 def defender_ability(mon: Any) -> Optional[str]:
     """상성 판단용 방어측 특성: 공개됐거나 후보가 1개일 때만. 미공개면 ""(타입 상성만) — 이름 기반 세트 추정은 쓰지 않음"""
-    from src.core.effectiveness import ability as known_ability
+    from src.core.rules import ability as known_ability
     return known_ability(mon) or ""
 
 
@@ -416,7 +416,7 @@ def move_effectiveness(battle: Any, move: Any, defender: Any, def_ability: Optio
     """
     if defender is None or not (getattr(move, "base_power", 0) or 0):
         return 0.25
-    from src.core.effectiveness import eff_move
+    from src.core.rules import eff_move
     move_type = effective_move_type(battle, move)
     return min(4.0, eff_move(battle, move_type, defender, def_ability)) / 4.0
 
@@ -584,7 +584,7 @@ def _sp(pkmn):
 
 
 def mon_ext(side, pkmn, is_active, battle, ev):
-    """포켓몬별 추가 수치 MON_EXT개 (MON_EXT 설명 참고). 값은 reveals.py의 추적기와 poke-env 상태에서 옴"""
+    """포켓몬별 추가 수치 MON_EXT개 (MON_EXT 설명 참고). 값은 events.py의 추적기와 poke-env 상태에서 옴"""
     v = [0.0] * MON_EXT
     status = extract_enum_str(getattr(pkmn, "status", None))
     rev = ev.rev if ev else None
@@ -663,7 +663,7 @@ class BattleTensorEncoder:
         field_vec = np.zeros((1, FIELD_DIM), dtype=np.float32)
         action_mask = np.zeros((1, 22), dtype=bool)
         legal_mask = np.zeros((1, 22), dtype=bool)     # 서버 요청이 알려 준 순수 합법성 (모델 입력 특징용). action_mask = 여기에 휴리스틱 가지치기를 더한 것 (로짓 마스킹 전용)
-        ev = battle.__dict__.get("_ev")  # 턴 사건/상대 증거/도구·특성 추적 (events.py, reveals.py가 parse_message에서 채움)
+        ev = battle.__dict__.get("_ev")  # 턴 사건/상대 증거/도구·특성 추적 (events.py, events.py가 parse_message에서 채움)
 
         if not hasattr(battle, "team") or not battle.team:
             return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask)
@@ -841,7 +841,7 @@ class BattleTensorEncoder:
             moves_dict = getattr(pkmn, "moves", {}) or {}
             item_name = getattr(pkmn, "item", None)
             ability_name = getattr(pkmn, "ability", None)
-            if ev is not None:      # poke-env가 모르는 공개/추론된 도구와 특성 (Foul Play의 추적 규칙, reveals.py)
+            if ev is not None:      # poke-env가 모르는 공개/추론된 도구와 특성 (Foul Play의 추적 규칙, events.py)
                 if item_name == "unknown_item":
                     item_name = ev.rev.known_item("opp", _sp(pkmn)) or item_name
                 if not ability_name:
@@ -1070,7 +1070,7 @@ class BattleTensorEncoder:
 
     def prev_move(self, battle: Any) -> torch.Tensor:
         """직전에 쓴 기술 id [1,2] (내, 상대; 0 = 아직 없음). 직전 기술을 입력으로 쓰는 모델(prev_act)의 실전 입력.
-        reveals.py가 기록한 양쪽의 마지막 사용 기술(다른 기술이 부른 기술 제외)이라 학습(train_human.last_moves: 이전 결정들까지 마지막으로 쓴 기술)과 같은 뜻"""
+        events.py가 기록한 양쪽의 마지막 사용 기술(다른 기술이 부른 기술 제외)이라 학습(train_human.last_moves: 이전 결정들까지 마지막으로 쓴 기술)과 같은 뜻"""
         ev = battle.__dict__.get("_ev")
         last = ev.rev.last_move_sp if ev is not None else {}
         ids = [self.vocab_mgr.get_id("move", last[side][1]) if last.get(side) else 0 for side in ("me", "opp")]

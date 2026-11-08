@@ -10,7 +10,7 @@ Foul Play(탐색 봇) 대전 기록 → 증류 학습 데이터 (train_fp_distil
   → 실시간 인코더와 같은 완전한 내 팀 정보. 결정 지점(턴 시작/기절 후 교체)마다 Foul Play의 탐색 분포를 22칸 행동 분포로 변환
 출력 npz: OBS_KEYS + action_mask + target(22) + value_target, teacher_value(탐색이 본 이 쪽 승률 0~1, 결정마다), lens(배틀별 길이), outcome
 
-재생 중 reveals.py 추적기가 예외를 내면 그 배틀은 이후 상태가 어긋나므로 버리고 통계에 세며, 버려진 배틀이 1%를 넘으면 빌드를 실패시킴
+재생 중 events.py 추적기가 예외를 내면 그 배틀은 이후 상태가 어긋나므로 버리고 통계에 세며, 버려진 배틀이 1%를 넘으면 빌드를 실패시킴
 
 사용: python src/training/build_fp_dataset.py --decisions "data/fp_selfplay/ms050/dec_*.jsonl" --out data/fp_selfplay/ms050/fp_data.npz
 """
@@ -235,7 +235,7 @@ def _states(task):
 
 
 def _replay_counted(task):
-    """replay_states + 이 배틀 재생 중 reveals.py 추적기가 낸 예외 수 (워커 프로세스 안에서 재야 하므로 결과에 같이 돌려줌)"""
+    """replay_states + 이 배틀 재생 중 events.py 추적기가 낸 예외 수 (워커 프로세스 안에서 재야 하므로 결과에 같이 돌려줌)"""
     before = sum(events.REV_ERRORS.values())
     states = replay_states(*task)
     return states, sum(events.REV_ERRORS.values()) - before
@@ -351,7 +351,7 @@ def main(args):
     if not seqs:
         raise SystemExit(f"❌ 만들어진 배틀이 없음: {dict(stat)}")
     if stat["배틀 제외(추적기 예외)"] > MAX_TRACKER_FAIL * (len(seqs) + stat["배틀 제외(추적기 예외)"]):
-        raise SystemExit(f"❌ reveals.py 추적기 예외로 버린 배틀이 {stat['배틀 제외(추적기 예외)']}개(전체의 {MAX_TRACKER_FAIL:.0%} 초과): src/core/reveals.py 확인 {dict(stat)}")
+        raise SystemExit(f"❌ events.py 추적기 예외로 버린 배틀이 {stat['배틀 제외(추적기 예외)']}개(전체의 {MAX_TRACKER_FAIL:.0%} 초과): src/core/events.py 확인 {dict(stat)}")
     data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken", "q_mean", "q_vis", "turn", "kind", "opp_action", "opp_move", "pos"]}
     data["lens"] = np.array([len(s["action_mask"]) for s in seqs])
     data["outcome"] = np.array([s["outcome"] for s in seqs], np.float32)
@@ -359,7 +359,7 @@ def main(args):
     np.savez_compressed(args.out, **data)
     ent = -(data["target"] * np.log(np.clip(data["target"], 1e-9, 1))).sum(-1)
     print(f"✅ {len(seqs)}판 / 결정 {int(data['lens'].sum())}개 → {args.out}")
-    print(f"   reveals.py 추적기 예외로 버린 배틀 {stat['배틀 제외(추적기 예외)']}개")
+    print(f"   events.py 추적기 예외로 버린 배틀 {stat['배틀 제외(추적기 예외)']}개")
     print(f"   Foul Play 승률(이 데이터) {np.mean(data['outcome'] > 0):.3f} | 교사 분포 평균 엔트로피 {ent.mean():.3f} | 최상위 행동 평균 확률 {data['target'].max(-1).mean():.3f}")
     print("   ", dict(stat))
     n_pts = stat["결정 지점(재생 상태)"] or 1

@@ -49,7 +49,7 @@ async def worker(a):
     from poke_env.concurrency import POKE_LOOP
     from src.core.model import model_from_ckpt
     from src.evaluation.logging_player import LoggingPlayer
-    from src.core.team_pool import RandomPoolTeambuilder
+    from team_pool import RandomPoolTeambuilder
 
     teams = json.load(open(a.cands, encoding="utf-8"))["teams"][a.idx::a.workers]
     opp = [t["export"] for t in json.load(open(OPP_POOL, encoding="utf-8-sig"))["teams"]]

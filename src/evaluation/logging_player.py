@@ -4,7 +4,7 @@ from collections import defaultdict
 
 import torch
 
-from src.core.actions import decode_action
+from src.core.player import decode_action
 from src.core.player import SmartPokemonPlayer
 
 
