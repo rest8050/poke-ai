@@ -13,7 +13,6 @@ from collections import defaultdict
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, ROOT)
-import torch
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.teambuilder import Teambuilder
 

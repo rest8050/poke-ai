@@ -74,7 +74,6 @@ intim = (ab == INTIM) & alive & sw_ok & (np.arange(6)[None] != ma[:, None])     
 has = intim.any(1) & valid
 tm = (T[:, 8:14] * intim).sum(1); sm = (P[:, 8:14] * intim).sum(1)
 print(f"벤치에 위협 포켓몬 있는 결정 {int(has.sum())} ({has.mean():.1%}) | 그 포켓몬으로 교체: 교사 질량 평균 {tm[has].mean():.3f} 학생 {sm[has].mean():.3f} | AUC(학생 질량 -> 교사 >= 0.5) {L.auc(sm[has], tm[has] >= 0.5):.3f}")
-conf_i = has & (tm >= 0.5)
 tgt_is_i = np.zeros(n, bool)
 sw_t = (a_t >= 8) & (a_t < 14)
 tgt_is_i[sw_t] = (ab[ar, (a_t - 8).clip(0, 5)] == INTIM)[sw_t]

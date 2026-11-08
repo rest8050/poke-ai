@@ -39,10 +39,7 @@ def load_compatible(model: nn.Module, state: dict):
     - 입력 열만 늘어난 2D weight(끝에 새 피처를 붙인 Linear)는 기존 열 복사 + 새 열 0
       → 새 피처가 처음엔 무시되어 기존 정책이 그대로 유지되고, 학습하며 점차 사용
     return: (확장된 키, 버려진 키)
-    체크포인트에 깊은 헤드 키(move_deep.*)가 있으면 모델에도 자동으로 켬 (안 켜면 그 가중치가 조용히 버려져 성능만 떨어짐)
     """
-    if hasattr(model, "enable_deep_heads") and any(k.startswith("move_deep.") for k in state):
-        model.enable_deep_heads()
     own = model.state_dict()
     expanded, skipped = [], []
     for k, v in state.items():
@@ -173,29 +170,6 @@ class PokemonEmbeddingLayer(nn.Module):
         
         cat_features = torch.cat([sp_emb, it_emb, ab_emb, t1_emb, t2_emb, st_emb, mv_emb_flat], dim=-1)
         return cat_features # [B, 360]
-
-
-class ResHead(nn.Module):
-    """
-    기존 얕은 점수 헤드의 출력에 더하는 깊은 잔차 가지 (LayerNorm + 잔차 블록).
-    마지막 층을 0으로 초기화해서 시작 시 출력이 0 → 기존 체크포인트의 동작이 그대로 유지되고, 학습하며 점차 기여함.
-    """
-    def __init__(self, in_dim: int, out_dim: int, width: int = 256, blocks: int = 1):
-        super().__init__()
-        self.inp = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, width), nn.GELU())
-        self.blocks = nn.ModuleList([
-            nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, width))
-            for _ in range(blocks)
-        ])
-        self.out = nn.Linear(width, out_dim)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
-
-    def forward(self, x):
-        h = self.inp(x)
-        for block in self.blocks:
-            h = h + block(h)
-        return self.out(h)
 
 
 def get_action(self, my_team_cat, my_team_num, my_move_num, 

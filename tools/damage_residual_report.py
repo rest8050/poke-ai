@@ -13,7 +13,6 @@ import argparse
 import gzip
 import json
 import math
-import os
 import sys
 from collections import Counter, defaultdict
 

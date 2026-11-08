@@ -19,7 +19,6 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, ".")
 sys.path.insert(0, "tools")
 from legal_eval import OBS                                           # noqa: E402
-from regret_eval import boot_ci                                      # noqa: E402
 from src.core.model import model_from_ckpt                           # noqa: E402
 
 KS = (1, 3, 6)

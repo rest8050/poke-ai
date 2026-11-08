@@ -14,7 +14,7 @@ import torch
 sys.path.insert(0, ".")
 sys.path.insert(0, "tools")
 import legal_eval as L
-from regret_eval import boot_ci, regrets
+from regret_eval import boot_ci
 from src.core.model import model_from_ckpt
 
 
