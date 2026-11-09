@@ -102,6 +102,11 @@ def main():
         a, b = res[names[0]], res[names[1]]
         m, lo, hi = boot_ci(b - a, battle, rng)
         print(f"\n쌍 비교 {names[1]} - {names[0]} regret 평균 차이 {m:+.4f} [{lo:+.4f},{hi:+.4f}]  (음수 = {names[1]}이 손해가 적음, 둘 다 지원 안인 결정만)")
+        tk = np.where(T.argmax(1) < 4, 0, np.where(T.argmax(1) < 8, 1, 2))      # 교사 선택 종류별 쌍 비교
+        for k, (kn, _) in enumerate(KINDS):
+            d = np.where(tk == k, b - a, np.nan)
+            m, lo, hi = boot_ci(d, battle, rng)
+            print(f"  쌍 비교 [{kn}] 결정 {int((~np.isnan(d)).sum())} 차이 {m:+.4f} [{lo:+.4f},{hi:+.4f}]")
 
 
 if __name__ == "__main__":
