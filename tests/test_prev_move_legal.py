@@ -1,35 +1,8 @@
-"""직전 기술 입력과 합법성 요약 self-check: PYTHONPATH=. python tests/test_prev_move_legal.py
-- encoder.prev_move: events.py가 기록한 양쪽 마지막 사용 기술 -> 기술 어휘 번호 [1,2], 기록이 없으면 0
+"""합법성 요약 self-check: PYTHONPATH=. python tests/test_prev_move_legal.py
 - v8 _legal_summary(forced_zero): 합법 기술이 0개(강제 교체)일 때만 고정·잃은 화력 칸이 0, 기술이 있는 결정은 예전과 같음"""
-import json
-
 import torch
 
 from src.core.model import LEG_G, EntityPokemonNetV8
-from src.core.tensor_encoder import BattleTensorEncoder
-
-V = json.load(open("data/vocab.json", encoding="utf-8"))
-
-
-class _Rev:
-    last_move_sp = {"me": ("garchomp", "earthquake"), "opp": None}
-
-
-class _Ev:
-    rev = _Rev()
-
-
-class _Battle:
-    pass
-
-
-def test_encoder_prev_move():
-    enc = BattleTensorEncoder(vocab_path="data/vocab.json")
-    b = _Battle()
-    b.__dict__["_ev"] = _Ev()
-    assert enc.prev_move(b).tolist() == [[V["move"]["earthquake"], 0]]
-    assert enc.prev_move(_Battle()).tolist() == [[0, 0]]          # 추적기가 없으면 둘 다 "없음"
-
 
 def test_legal_summary_forced_zero():
     leg = torch.zeros(2, 22)
@@ -48,6 +21,5 @@ def test_legal_summary_forced_zero():
 
 
 if __name__ == "__main__":
-    test_encoder_prev_move()
     test_legal_summary_forced_zero()
     print("ok")

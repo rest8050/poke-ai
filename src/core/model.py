@@ -1,16 +1,4 @@
-"""정책/가치 네트워크 (엔티티 토큰 모델 v8; v6 구조는 퇴역해 제거됨) = v7(= v6 + 특성 EXEC 규칙 + 합법 요약 슬롯 순서 통로 제거) + 숨은 특성/도구 기대 임베딩 + 융합층의 활성 토큰 직접 입력.
-v7 대비 바뀐 점 (나머지는 v7과 같음):
-A) 상대 쪽 숨겨진(공개 안 된) 특성/도구는 고정된 "숨김" 임베딩 대신 세트 추정 분포의 기대 임베딩 q @ 임베딩 표를 포켓몬 토큰에 넣음. 공개된 값/내 쪽/빈 칸은 원래 임베딩 그대로
-   (표는 학습용 난수 novel_p/id_dropout 없이 embed.weight + proj(feat)로 결정론적으로 만들고, q는 detach라서 기울기는 임베딩 표로만 감)
-D) 융합층 입력에 내 활성 / 상대 활성 포켓몬 토큰을 CLS와 함께 직접 넣음 (기술/교체 판단이 CLS 하나로만 전달받던 정보를 직접 봄): 융합 입력 d + history + G_DIM -> + 2d
-H) 종류 헤드(기술/교체)의 은닉 폭을 옛 고정값 64에서 head_width(기본 192)로: 행동 점수 헤드와 같은 폭
-v6 대비 바뀐 점 (v7, 나머지는 v6와 같음):
-1) 매치업을 MatchupV7로: 정밀기술/두꺼운지방/옹골참, 부유류 면역을 상대 특성 확률(세트 추정) 기대값으로, 스피드 규칙(랭크·마비·스카프·순풍·날씨 특성·트릭룸)과 장난꾸러기 우선도로
-   만든 선공 기대값 fm을 기술 토큰(양쪽)에, 위협 후보의 상대 능력 배율 entry_opp 3개를 교체 후보 특징에, 재생력 회복량 exit_heal을 전역 요약에 추가
-2) 합법 요약에서 교체 6칸 비트를 뺌 (슬롯 순서대로 들어가 my_pos=False의 순열 대칭을 깨던 통로. 슬롯별 교체 가능 여부는 포켓몬 토큰의 플래그가 이미 줌): LEG_G 25 -> 19
-상대 특성 분포는 세트 추정(ability) 로짓에서 빈칸/<unk>/숨김을 뺀 softmax, 공개된 것은 원핫. 상대 스카프 확률도 세트 추정(item)에서.
-arch: {"model": "v8", "my_pos": false}
-"""
+"""정책/가치 네트워크 (엔티티 토큰 모델 v8). arch: {"model": "v8", "my_pos": false}. 변경 이력은 git log 참조."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -299,7 +287,6 @@ def _mx(x):           # [..., 4(기술), 4(채널)] 중 앞 3채널(배율, 데�
 
 class EntityPokemonNetV8(nn.Module):
     ACTION_DIM = 22
-    uses_legal = True
 
     def __init__(self, vocab_path: str = "data/vocab.json", my_pos: bool = True, d_model: int = 256, n_layers: int = 6, n_heads: int = 8,
                  ff_mult: int = 4, dropout: float = 0.0, history_dim: int = 256, hist_layers: int = 2, latent_dim: int = 256,
@@ -352,8 +339,6 @@ class EntityPokemonNetV8(nn.Module):
         for lin in list(self.bias_def) + list(self.bias_off) + list(self.bias_hid):
             nn.init.normal_(lin.weight, std=0.5)
             nn.init.zeros_(lin.bias)
-        n_mv = len(json.load(open(vocab_path, encoding="utf-8"))["move"])
-        self.n_mv = n_mv
         self.turn_proj = nn.Linear(3 * d + field_dim, history_dim)
         self.turn_pos = nn.Embedding(MAX_TURNS, history_dim)
         hl = nn.TransformerEncoderLayer(history_dim, 4, history_dim * 2, dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
@@ -594,7 +579,6 @@ class EntityPokemonNetV8(nn.Module):
         type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr, lg], -1))
         if action_mask is not None:
             detail = detail.masked_fill(~action_mask, -1e9)
-        if action_mask is not None:
             no_move = ~(action_mask & ~self.is_switch).any(dim=1)
             no_switch = ~(action_mask & self.is_switch).any(dim=1)
             type_logits = type_logits.masked_fill(torch.stack([no_move, no_switch], dim=1), -1e9)
@@ -634,20 +618,13 @@ class EntityPokemonNetV8(nn.Module):
 
     def get_action(self, my_team_cat, my_team_num, my_move_num, 
                    opp_team_cat, opp_team_num, opp_move_num, 
-                   field_vec, history_state=None, action_mask=None, legal_mask=None, prev_move=None):
-        """legal_mask: 서버 요청 기반 순수 합법 마스크 (합법성을 입력 특징으로 쓰는 모델(uses_legal)만 받음, action_mask는 로짓 마스킹용)
-        prev_move: 직전에 쓴 기술 id [B,2] (BattleTensorEncoder.prev_move). 직전 기술을 입력으로 학습한 모델(prev_act)만 받음"""
+                   field_vec, history_state=None, action_mask=None, legal_mask=None):
+        """legal_mask: 서버 요청 기반 순수 합법 마스크 (입력 특징용), action_mask는 로짓 마스킹용"""
         self.eval()
         with torch.no_grad():
-            kw = {"legal_mask": legal_mask} if getattr(self, "uses_legal", False) else {}
-            if getattr(self, "prev_act", False):
-                if prev_move is None and not getattr(self, "_warned_prev", False):      # 학습 때 쓴 입력이 비면 조용히 성능이 떨어지므로 한 번 알림
-                    self._warned_prev = True
-                    warnings.warn("prev_act 모델인데 prev_move가 없음: 직전 기술을 '없음'으로 둠 (encoder.prev_move(battle)를 넘길 것)")
-                kw["prev_move"] = prev_move
             res = self.forward(my_team_cat, my_team_num, my_move_num,
                                opp_team_cat, opp_team_num, opp_move_num, 
-                               field_vec, history_state, action_mask, **kw)
+                               field_vec, history_state, action_mask, legal_mask)
         
             p_logits = res["policy_logits"]
             p_probs = F.softmax(p_logits, dim=-1)
@@ -661,14 +638,6 @@ class EntityPokemonNetV8(nn.Module):
 def build_model(cfg: dict) -> nn.Module:
     """구조 인자로 모델 생성: model 키가 v8인 엔티티 토큰 모델."""
     cfg = dict(cfg)
-    for k, default in (("history_mode", "flat"), ("fusion_pair", False), ("fusion_res", False), ("switch_skip", False),
-                       ("hist_aux", False), ("prev_act", False), ("pm_fusion", False), ("hist_only", False), ("loop_n", 0), ("loop_layers", 2),
-                       ("value_gammas", []), ("value_bins", 51), ("pair_scope", "all"), ("pair_feat", False), ("pair_mon", 0), ("bench_off", False),
-                       ("tera_feat", False), ("tera_def", False), ("tera_gate", False), ("type_lse", False), ("value_detach", False)):  # 제거된 실험 옵션: 기본값이던 체크포인트만 로드 가능
-        if cfg.pop(k, default) != default:
-            raise ValueError(f"제거된 옵션 {k}를 쓰는 체크포인트는 더 이상 로드할 수 없음")
-    if cfg.get("mon_moves", True) is not True:
-        raise ValueError('제거된 옵션 mon_moves="mlp"를 쓰는 체크포인트는 더 이상 로드할 수 없음')
     kind = cfg.pop("model", None)
     if kind == "v8":
         return EntityPokemonNetV8(**cfg)

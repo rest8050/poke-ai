@@ -32,7 +32,7 @@ torch.manual_seed(0)
 gen = torch.Generator().manual_seed(0)
 small = {"d_model": 64, "n_layers": 2, "n_heads": 4, "history_dim": 64, "latent_dim": 64, "my_pos": False}
 model = build_model({"model": "v8", **small}).eval()
-assert type(model).__name__ == "EntityPokemonNetV8" and model.uses_legal
+assert type(model).__name__ == "EntityPokemonNetV8"
 lengths = [5, 3]
 obs = [random_obs(L, gen) for L in lengths]
 masks = []
@@ -108,13 +108,6 @@ with torch.no_grad():
     assert not torch.allclose(out_e[:, 6:9], plain[:, 6:9]), "숨겨진 값이 숨김 임베딩 그대로"
     # 8) 융합층은 CLS + 히스토리 + 요약 + 활성 토큰 2개를 받음
     assert model.fusion[0].in_features == 3 * model.d + 64 + G_DIM
-
-# 9~12) hist_aux / 다중 γ 가치 / prev_act / pm_fusion / hist_only 검사는 해당 옵션을 제거하면서 삭제 (제거된 옵션 cfg는 build_model이 거부: 아래 검사)
-for bad in ({"hist_aux": True}, {"prev_act": True}, {"loop_n": 4}, {"value_gammas": [0.9]}, {"pair_mon": 16}, {"bench_off": True}, {"mon_moves": "mlp"}):
-    try:
-        build_model({"model": "v8", **small, **bad}); raise SystemExit(f"제거된 옵션이 통과함: {bad}")
-    except ValueError:
-        pass
 
 # 6) 체크포인트 왕복
 with tempfile.TemporaryDirectory() as td:

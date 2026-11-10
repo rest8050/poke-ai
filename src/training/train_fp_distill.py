@@ -224,7 +224,7 @@ def main(args):
     arch = json.loads(args.arch)
     model = build_model(arch)
     need = getattr(model, "field_proj", None) and model.field_proj[0].in_features
-    if getattr(model, "uses_legal", False) and data["field_vec"].shape[1] < need:        # v6는 효과 열이 든 새 데이터가 필요 (옛 데이터는 조용히 0으로 채워져 효과 입력이 비게 됨)
+    if data["field_vec"].shape[1] < need:        # v6는 효과 열이 든 새 데이터가 필요 (옛 데이터는 조용히 0으로 채워져 효과 입력이 비게 됨)
         raise SystemExit(f"❌ 데이터의 field_vec이 {data['field_vec'].shape[1]}칸인데 {arch['model']}는 {need}칸이 필요: src/training/build_fp_dataset.py로 데이터를 다시 만들 것")
     print(f"모델 {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M 구조 {arch}")
     belief_params = [p for n, p in model.named_parameters() if n.startswith("belief.")]
