@@ -79,6 +79,12 @@ def true_sets(data, offsets):
     return out, ok
 
 
+def _scarf_id(_c=[]):
+    if not _c:
+        _c.append(json.load(open("data/vocab.json", encoding="utf-8"))["item"]["choicescarf"])
+    return _c[0]
+
+
 def hidden_loss(logits: dict, b: dict, unk: dict):
     """logits: {"move": [N,6,Vm], "item": [N,6,Vi], "ability": [N,6,Va]} -> (손실 합, 통계 dict)"""
     cat = b["opp_team_cat"].long()
@@ -124,7 +130,10 @@ def hidden_loss(logits: dict, b: dict, unk: dict):
             stats["stat_mae"] = err.abs().mean().item() * STAT_SCALE
         if "spe" in logits and ok[..., 5].any():                                     # 스피드 세트 구간: 실제 스피드에 가장 가까운 구간(로그 거리)이 정답
             tgt = (torch.log(speed_bucket_ratio(base[..., 5])) - torch.log(ratio[..., 5:6].clamp_min(1e-3))).abs().argmin(-1)
-            lg = logits["spe"].float()[ok[..., 5]]
+            lg = logits["spe"].float()
+            if lg.dim() == 4:                                                        # [N,6,2,K]: 실제 도구가 스카프면 1행, 아니면 0행의 분포를 학습
+                lg = torch.where((last[..., 0] == _scarf_id())[..., None], lg[..., 1, :], lg[..., 0, :])
+            lg = lg[ok[..., 5]]
             total = total + F.cross_entropy(lg, tgt[ok[..., 5]])
             stats["spe_acc"], stats["spe_n"] = (lg.argmax(-1) == tgt[ok[..., 5]]).float().mean().item(), int(ok[..., 5].sum())
     return total, stats

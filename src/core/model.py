@@ -223,7 +223,13 @@ class SetBelief(nn.Module):
         self.item = nn.Linear(hidden, vv["item"]["<unk>"] + 2)
         self.ability = nn.Linear(hidden, vv["ability"]["<unk>"] + 2)
         self.stat = nn.Linear(hidden, 6)
-        self.spe = nn.Linear(hidden, SPE_BUCKETS)                    # 스피드 세트 구간 로짓 (matchup_v7.speed_bucket_ratio 순서). 정답은 배틀 데이터의 상대 실제 스피드 (hidden_labels)
+        # 스피드 세트 구간 로짓 [2, SPE_BUCKETS] (matchup_v7.speed_bucket_ratio 순서): 0행 = 스카프가 아닐 때, 1행 = 스카프일 때의 구간 분포 (도구와 스피드 보정이 묶여 있음)
+        # 정답은 배틀 데이터의 상대 실제 스피드와 실제 도구 (hidden_labels)
+        self.spe = nn.Linear(hidden, 2 * SPE_BUCKETS)
+        # 팀 문맥: 같은 팀 6마리의 중간 표현끼리 어텐션 한 층 (순서 무관). 출력 투영을 0으로 시작해 처음에는 한 마리씩 따로 보던 예전 계산과 같고, 옛 체크포인트도 그대로 동작
+        self.team = nn.TransformerEncoderLayer(hidden, 4, hidden * 2, dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
+        self.team_out = nn.Linear(hidden, hidden)
+        nn.init.zeros_(self.team_out.weight); nn.init.zeros_(self.team_out.bias)
         self.register_buffer("spe_on", torch.zeros(()))              # 1 = spe 헤드를 학습함 (학습기가 켬). 0인 옛 체크포인트는 예전처럼 stat의 스피드 배율 하나로 계산
 
     def forward(self, opp_cat, opp_num):
@@ -240,7 +246,9 @@ class SetBelief(nn.Module):
                        self.ability_emb(cat[..., 1].clamp(0, self.ability_emb.num_embeddings - 1)),
                        moves, valid.sum(-1, keepdim=True).float() / 4.0, opp_num[..., :11], opp_num[..., 18:self.num_dim]], -1)
         h = self.net(x)
-        return {"move": self.move(h), "item": self.item(h), "ability": self.ability(h), "stat": self.stat(h), "spe": self.spe(h)}
+        pad = opp_num[..., 11] == 0                                  # 빈 슬롯은 팀 문맥에서 제외 (전부 빈 줄은 그대로 둠: 어텐션이 NaN이 되지 않게)
+        h = h + self.team_out(self.team(h, src_key_padding_mask=pad & ~pad.all(-1, keepdim=True)))
+        return {"move": self.move(h), "item": self.item(h), "ability": self.ability(h), "stat": self.stat(h), "spe": self.spe(h).unflatten(-1, (2, SPE_BUCKETS))}
 
 
 # 3차원 어텐션 마스크(헤드별 편향)는 추론용 빠른 커널에서 학습 경로와 값이 달라짐(CLS 기준 2e-3) → 학습과 같은 일반 경로만 쓰도록 끔
@@ -256,6 +264,8 @@ LEG_G = 8 + 6 + 3 + 2    # 합법 비트 8(기술 4 + 테라 4) + 플래그 6 + 
 MON_X = 7 + 2 + 6 + 1    # 포켓몬 토큰 추가 수치: 매치업 요약 7 + 숨은 기술 위협 2 + 상대 능력치 예측 6 + 진입 피해 비율 1
 CAND_N = 9 + 2 + 1 + 3   # 교체 후보 특징: 요약 9 + 상대 활성의 숨은 기술 위협 2 + 진입 피해 비율 1 + 위협 효과 3
 G_DIM = LEG_G + EFFECT_DIM + 1   # 전역 요약: 합법성 요약 + 양쪽 활성의 효과 열 + 재생력 회복량
+MON_X2 = 4 + 4          # 포켓몬 토큰/교체 후보 추가 수치 (입력 맨 끝에 붙음): 숨은 도구 최악 경우 4 (_matchup_feats) + 1대1 승부 4 (_race)
+MV_X2 = 2               # 기술 토큰 추가 수치 (입력 맨 끝): 숨은 도구 최악 경우의 데미지/KO 차이
 
 
 class PairGLU(nn.Module):
@@ -324,8 +334,9 @@ class EntityPokemonNetV8(nn.Module):
         self.register_buffer("move_table", build_move_table(vocab_path), persistent=False)
         self.unk_move = nn.Parameter(torch.zeros(d))                        # 미공개 기술 칸 표시
         self.hid_proj = nn.Linear(1 + MOVE_NUM_DIM + 48, d)                 # 후보 기술 혼합(확률 합, 수치, 임베딩) -> 상대 포켓몬 토큰
-        self.mon_proj = nn.Sequential(nn.Linear(BASE_IN + MON_X + 1 + 1, d), nn.LayerNorm(d))      # + 공개된 기술 수 + 교체 가능 플래그
-        self.move_proj = nn.Sequential(nn.Linear(142 + MV_EXTRA + 1, d), nn.LayerNorm(d))          # + 사용 가능 플래그
+        # 새 입력 열(MON_X2, MV_X2)은 맨 끝에 붙임: 옛 체크포인트는 load_compatible이 그 열을 0으로 채워 예전과 같은 출력
+        self.mon_proj = nn.Sequential(nn.Linear(BASE_IN + MON_X + 1 + 1 + MON_X2, d), nn.LayerNorm(d))      # + 공개된 기술 수 + 교체 가능 플래그 + 최악 경우/승부
+        self.move_proj = nn.Sequential(nn.Linear(142 + MV_EXTRA + 1 + MV_X2, d), nn.LayerNorm(d))          # + 사용 가능 플래그 + 최악 경우
         self.field_proj = nn.Sequential(nn.Linear(field_dim, d), nn.GELU(), nn.Linear(d, 3 * d))
         self.cls = nn.Parameter(torch.zeros(1, 1, d))
         self.role_emb, self.side_emb, self.slot_emb = nn.Embedding(4, d), nn.Embedding(2, d), nn.Embedding(6, d)
@@ -350,7 +361,7 @@ class EntityPokemonNetV8(nn.Module):
         self.fusion =nn.Sequential(nn.Linear(fuse_in, latent_dim * 2), nn.LayerNorm(latent_dim * 2), nn.GELU(), nn.Dropout(0.1),
                                     nn.Linear(latent_dim * 2, latent_dim), nn.LayerNorm(latent_dim), nn.GELU())
         self.move_score = nn.Sequential(nn.Linear(latent_dim + 2 * d, head_width), nn.GELU(), nn.Linear(head_width, 2))
-        self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_N + G_DIM + 1, head_width), nn.GELU(), nn.Linear(head_width, 1))
+        self.switch_score = nn.Sequential(nn.Linear(latent_dim + d + CAND_N + G_DIM + 1 + MON_X2, head_width), nn.GELU(), nn.Linear(head_width, 1))
         self.type_head = nn.Sequential(nn.Linear(latent_dim + CAND_N + 2 + G_DIM, head_width), nn.GELU(), nn.Linear(head_width, 2))
         is_switch = torch.zeros(self.ACTION_DIM, dtype=torch.bool)
         is_switch[8:14] = True
@@ -475,7 +486,55 @@ class EntityPokemonNetV8(nn.Module):
         cand = torch.cat([_mx(def_opp_act), _mx(off_vs_opp_act), M["spd_my"][..., None], bench_thr, h_my], -1)         # [B,6,11]
         mon_extra = torch.cat([mon_extra, torch.cat([ent, torch.zeros_like(ent)], 1)[..., None]], -1)      # 진입 피해 비율 (상대 쪽 0)
         cand = torch.cat([cand, ent[..., None], entry_opp], -1)                                                         # [B,6,15]
-        return D, O, H, mon_extra, mv_extra, cand, ar, act_m, M["exit_heal"]
+        # ---- 숨은 도구의 최악 경우: 기대 배율(D, O)과 따로, 그럴듯한(확률 >= PLAUSIBLE) 도구를 들었다고 치고 한 번 더 계산해 차이만 입력 ----
+        # 상대 공격: 구애머리띠/구애안경(물리/특수라 안 겹침), 생명의구슬은 구애가 그럴듯하지 않을 때만. 상대 방어: 돌격조끼/진화의휘석/기합의띠
+        # ponytail: 능력치 배분(mult)과 숨은 기술 후보(Dp)는 최악 경우를 따로 보지 않음. 필요해지면 같은 방식으로 추가
+        with torch.no_grad():
+            hi = (p_item >= PLAUSIBLE).float()
+            att_hi = torch.cat([hi[..., :2], hi[..., 2:3] * (1 - hi[..., :2].amax(-1, keepdim=True)), p_item[..., 3:]], -1)
+            def_hi = torch.cat([p_item[..., :3], torch.maximum(p_item[..., 3:6], hi[..., 3:6]), p_item[..., 6:]], -1)
+            mt, q_my = self.matchup, self.matchup._onehot(my_cat)
+            D_hi = mt._pair(opp_cat, opp_num, opp_mv, False, q_opp, my_cat, my_num, True, q_my, att_mult=mult, entry=ent, cand_f=(entry_opp[..., 0], entry_opp[..., 1]),
+                            mid=opp_cat[..., 5:9], field=field_vec, att_item_p=att_hi)
+            O_lo = mt._pair(my_cat, my_num, my_mv, True, q_my, opp_cat, opp_num, False, q_opp, def_mult=mult, entry=mt.entry_frac(opp_cat, opp_num, field_vec, 40, p_item),
+                            mid=my_cat[..., 5:9], field=field_vec, def_item_p=def_hi)
+            dD = (D_hi - D)[..., 1:3].clamp_min(0).view(B, 6, 6, 4, 2)                # [B,내 i,상대 o,기술,(데미지, KO)] 내가 더 맞을 수 있는 양
+            dO = (O - O_lo)[..., 1:3].clamp_min(0).view(B, 6, 6, 4, 2)                # [B,상대 o,내 i,기술,(데미지, KO)] 내 공격이 덜 들어갈 수 있는 양
+            mv2 = torch.cat([dO[ar, act_o], dD[ar, act_m]], 1)                         # [B,12,4,2] 내 기술 -> 상대 활성 / 상대 공개 기술 -> 내 활성
+            risk = torch.cat([torch.cat([dD[ar, :, act_o].amax(-2), dO[ar, act_o].amax(-2)], -1),
+                              torch.cat([dD[ar, act_m].amax(-2), dO[ar, :, act_m].amax(-2)], -1)], 1)      # [B,12,4]
+            # ---- 1대1 승부 (여러 턴): 서로 가장 센 기술만 계속 쓴다고 칠 때 누가 먼저 쓰러뜨리나. 내 i 대 상대 활성, 내 활성 대 상대 o ----
+            hp_m, hp_o = my_num[..., 2], opp_num[..., 2]
+            best = off_vs_opp_act[..., 1].argmax(-1, keepdim=True)                     # 내 i의 가장 센 기술
+            first_i = (M["fm_my"].gather(-1, best)[..., 0] + 1) / 2                    # 그 기술로 내가 먼저 움직일 확률
+            first_o = 0.5 - 0.5 * torch.tanh(20 * M["spd_opp"])                        # 상대 o보다 내 활성이 빠를 확률 근사 (spd_opp > 0 = 상대가 빠름)
+            take_i = torch.maximum(def_opp_act[..., 1].amax(-1), h_my[..., 1]) * 1.5   # 상대 활성이 내 i에게 주는 최대 피해 (최대 HP 비율, 숨은 기술 후보 포함)
+            take_a = torch.maximum(thr_on_my_act[..., 1].amax(-1), h_opp[..., 1]) * 1.5
+            race = torch.cat([self._race(off_vs_opp_act[..., 1].amax(-1) * 1.5, take_i, hp_m, hp_o[ar, act_o][:, None], first_i, ent, mine_enters=True),
+                              self._race(my_act_on_opp[..., 1].amax(-1) * 1.5, take_a, hp_m[ar, act_m][:, None], hp_o, first_o, 0.0, mine_enters=False)], 1)
+            alive = torch.cat([(my_num[..., 11] > 0) & (my_num[..., 1] < 0.5), (opp_num[..., 11] > 0) & (opp_num[..., 1] < 0.5)], 1)
+            race[..., 1] = race[..., 1] * torch.cat([my_num[..., 0] < 0.5, torch.ones_like(alive[:, 6:])], 1)      # 내 활성은 '교체로 들어와서'가 해당 없음 -> 0
+            mon2 = torch.cat([risk, race], -1) * alive[..., None]                       # [B,12,MON_X2]
+        return D, O, H, mon_extra, mv_extra, cand, ar, act_m, M["exit_heal"], (mon2, mv2)
+
+    @staticmethod
+    def _race(give, take, hp_me, hp_opp, p_first, entry, mine_enters):
+        """1대1 승부 [.., 4]: (지금 맞붙을 때 승패, 교체로 들어와서 맞붙을 때 승패, 내가 쓰러뜨리는 데 걸리는 턴/6, 내가 쓰러지는 데 걸리는 턴/6). 승패는 +1 내가 먼저 잡음 ~ -1 내가 먼저 잡힘.
+        give/take = 한 턴에 주는/받는 피해(최대 HP 비율), hp = 지금 HP 비율, p_first = 내가 먼저 움직일 확률, entry = 들어올 때 장판 피해 비율.
+        mine_enters: True면 '교체'는 내 포켓몬이 들어오며 한 대 맞고 시작, False면 상대 포켓몬이 들어오며 한 대 맞고 시작.
+        ponytail: 회복기/랭크업/교체/선공기 전환/난수는 안 봄 (가장 센 기술 반복). 그런 흐름은 본체가 배움"""
+        def turns(hp, d):
+            return torch.where(hp <= 0, torch.zeros_like(hp * d), torch.ceil(hp / d.clamp_min(1e-3)).clamp(1, 6))
+
+        def result(t_me, t_op):
+            r = (t_me < t_op).float() - (t_me > t_op).float() + (t_me == t_op).float() * (2 * p_first - 1)
+            return r * ((t_me < 6) | (t_op < 6)).float()                                # 둘 다 6턴 안에 못 잡으면 0
+        t_me, t_op = turns(hp_opp + 0 * give, give), turns(hp_me + 0 * take, take)
+        if mine_enters:
+            sw = result(t_me, turns(hp_me - entry - take, take))                        # 들어오면서 장판 + 한 대
+        else:
+            sw = result(turns(hp_opp - give, give), t_op)
+        return torch.stack([result(t_me, t_op), sw, t_me / 6, t_op / 6], -1)
 
     def _encode_turn(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec, legal=None):
         field_vec = self._fit_field(field_vec)
@@ -492,7 +551,7 @@ class EntityPokemonNetV8(nn.Module):
         q_opp, q_item = self._prob(opp_team_cat[..., 1], belief_logits["ability"], ab_allow), self._prob(opp_team_cat[..., 0], belief_logits["item"])
         p_scarf = q_item[..., self.matchup.scarf]
         p_order = q_item[..., self.matchup.order_items]      # [B,6,4] 상대의 선제공격손톱/후공열매/뒤처지는꼬리/만복향로 확률
-        p_spe = torch.softmax(belief_logits["spe"].detach().float(), -1) if self.belief.spe_on > 0 else None      # [B,6,5] 상대 스피드 세트 구간 확률
+        p_spe = torch.softmax(belief_logits["spe"].detach().float(), -1) if self.belief.spe_on > 0 else None      # [B,6,2,5] 상대 스피드 세트 구간 확률 (스카프 아님/스카프)
         p_item = q_item[..., self.matchup.prob_items]      # [B,6,7] 상대의 구애머리띠/안경/생명의구슬/돌격조끼/진화의휘석/기합의띠/두꺼운부츠 확률 -> 데미지 계산의 기대 배율 (숨은 도구에만 쓰임)
         parts = [E.species_proj(num[:, 11:18]), self._expected_emb("item", cat[:, 0], q_item, B), self._expected_emb("ability", cat[:, 1], q_opp, B),
                  E.type_embed(cat[:, 2]), E.type_embed(cat[:, 3]), E.status_embed(cat[:, 4]), E.type_embed(cat[:, 9]), num[:, :11], num[:, 18:]]
@@ -502,7 +561,7 @@ class EntityPokemonNetV8(nn.Module):
         stat = belief_logits["stat"].detach().float()
         mult = torch.exp(STAT_SCALE * stat).clamp(*MULT_RANGE)
         guess = self._top_guess(belief_logits, opp_team_cat, opp_move_num, opp_team_num)
-        D, O, H, mon_extra, mv_extra, cand, ar, act_m, exit_heal = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
+        D, O, H, mon_extra, mv_extra, cand, ar, act_m, exit_heal, (mon2, mv2) = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
                                                                              opp_move_num, guess, mult, stat, field_vec, q_opp, p_scarf, p_item, p_spe, p_order)
         opp_act = opp_team_num[:, :, 0].argmax(1)
         # ---- 합법성: 토큰 플래그 + 요약 ----
@@ -516,8 +575,8 @@ class EntityPokemonNetV8(nn.Module):
         off_act = O.view(B, 6, 6, 4, 4)[ar, opp_act][ar, act_m]                                      # [B,4,4] 내 활성의 기술 4칸이 상대 활성에게
         n_rev_act = (my_move_num[ar, act_m].abs().sum(-1) > 0).sum(-1).float()
         leg_g = torch.cat([self._legal_summary(leg, off_act, n_rev_act, self.forced_legal_zero), field_vec[:, EFFECT_START:EFFECT_START + EFFECT_DIM], exit_heal[:, None]], -1)      # 합법성 요약 + 양쪽 활성의 효과 열 + 재생력 회복량
-        mon_in = torch.cat(parts + [mon_extra.reshape(B * 12, MON_X), n_rev, mon_flag.reshape(B * 12, 1)], -1)
-        mv_in = torch.cat([E.move_encoder(raw, mvn), raw, mvn, mv_extra.reshape(B * 12, 4, MV_EXTRA), mv_flag.reshape(B * 12, 4, 1)], -1)
+        mon_in = torch.cat(parts + [mon_extra.reshape(B * 12, MON_X), n_rev, mon_flag.reshape(B * 12, 1), mon2.reshape(B * 12, MON_X2)], -1)
+        mv_in = torch.cat([E.move_encoder(raw, mvn), raw, mvn, mv_extra.reshape(B * 12, 4, MV_EXTRA), mv_flag.reshape(B * 12, 4, 1), mv2.reshape(B * 12, 4, MV_X2)], -1)
         side = torch.arange(12, device=dev) // 6
         slot = torch.arange(12, device=dev) % 6
         active = (num[:, 0] > 0.5).long().view(B, 12)
@@ -551,7 +610,7 @@ class EntityPokemonNetV8(nn.Module):
         my_mon = out[:, :6]
         return {"cls": out[:, 63], "my_mon": my_mon, "active_mon": my_mon[ar, act_m], "opp_active_mon": out[:, 6:12][ar, opp_act],
                 "active_mv": out[:, 12:60].view(B, 12, 4, d)[:, :6][ar, act_m], "belief_logits": belief_logits, "cand": cand,
-                "field": field_vec, "act_m": act_m, "leg_g": leg_g, "leg_sw": leg[:, 8:14]}
+                "field": field_vec, "act_m": act_m, "leg_g": leg_g, "leg_sw": leg[:, 8:14], "cand2": mon2[:, :6]}
 
     def _heads(self, enc, history, action_mask=None):
         B = history.size(0)
@@ -564,7 +623,7 @@ class EntityPokemonNetV8(nn.Module):
         min_thr = torch.where(ok, cand[..., 7], torch.full_like(cand[..., 7], 9.0)).amin(1, keepdim=True)
         min_thr = torch.where(ok.any(1, keepdim=True), min_thr, torch.zeros_like(min_thr))
         mv_in = torch.cat([latent[:, None].expand(-1, 4, -1), enc["active_mv"], enc["active_mon"][:, None].expand(-1, 4, -1)], -1)
-        sw_in = torch.cat([latent[:, None].expand(-1, 6, -1), enc["my_mon"], cand, lg[:, None].expand(-1, 6, -1), enc["leg_sw"][..., None].to(lg.dtype)], -1)
+        sw_in = torch.cat([latent[:, None].expand(-1, 6, -1), enc["my_mon"], cand, lg[:, None].expand(-1, 6, -1), enc["leg_sw"][..., None].to(lg.dtype), enc["cand2"].to(lg.dtype)], -1)
         mv, sw = self.move_score(mv_in), self.switch_score(sw_in).squeeze(-1)
         detail = torch.cat([mv[..., 0], mv[..., 1], sw, latent.new_full((B, 8), -1e9)], 1)
         type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr, lg], -1))

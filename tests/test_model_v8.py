@@ -108,6 +108,14 @@ with torch.no_grad():
     gz = model._top_guess({"move": torch.zeros(1, 6, Vm)}, oc1, torch.zeros(1, 6, 4, flat[5].size(-1)), on1)
     assert Mx.sp_mv[zap][gz["idx"][0, 0]].all() and not Mx.sp_mv[zap, V_["move"]["spore"]], "썬더의 후보는 썬더가 배우는 기술만"
     assert not Mx.sp_mv[V_["species"]["smeargle"]].any() and abs(float(gz["w"][0, 1, 0]) - 4 / (Vm - 3)) < 1e-4, "루브도는 제한 없음"
+    # 1대1 승부: 내가 2턴, 상대가 3턴이면 이김(+1). 턴 수가 같으면 선공 확률로. 교체로 들어오면 한 대 맞고 시작
+    T_ = torch.tensor
+    rc = model._race(T_([0.6, 0.4, 0.4]), T_([0.4, 0.4, 0.6]), T_([1.0, 1.0, 1.0]), T_([1.0, 1.0, 1.0]), T_([0.5, 0.8, 0.5]), T_([0.0, 0.0, 0.25]), True)
+    assert rc[0, 0] == 1.0 and abs(float(rc[1, 0]) - 0.6) < 1e-6 and rc[2, 0] == -1.0, rc
+    assert abs(float(rc[0, 2]) - 2 / 6) < 1e-6 and abs(float(rc[0, 3]) - 3 / 6) < 1e-6
+    assert abs(float(rc[0, 1]) - 0.0) < 1e-6 and rc[2, 1] == -1.0, "교체: 0.6 남아 2턴 대 2턴(선공 반반) / 장판 0.25 + 한 대 0.6 = 0.15 남아 1턴"
+    rc = model._race(T_([0.5]), T_([0.3]), T_([1.0]), T_([1.0]), T_([0.5]), 0.0, False)
+    assert rc[0, 1] == 1.0, "상대가 들어오며 한 대 맞으면 1턴 대 4턴"
     qi = model._prob(opp_cat[..., 0], bl["item"])
     ps = qi[..., model.matchup.scarf]
     assert torch.allclose(qi.sum(-1), torch.ones(len(mask), 6), atol=1e-5) and ps.shape == (len(mask), 6) and ((ps >= 0) & (ps <= 1)).all()

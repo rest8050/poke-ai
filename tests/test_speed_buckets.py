@@ -64,4 +64,21 @@ lg["spe"][..., 4] = 5.0
 lg["spe"][:, 1] = torch.tensor([0, 0, 5.0, 0, 0])
 _, st = hidden_loss(lg, b, UNK)
 assert st["spe_n"] == 12 and st["spe_acc"] == 1.0, st
+# 스카프 유무별 구간 분포: 스카프가 아니면 무보정(236), 스카프면 풀보정+성격(328.9 x 1.5). 내 스피드 300 -> 스카프 확률 0.3만큼만 뒤짐
+def run2(p_scarf):
+    mc, mn, mm = team(me(300), True)
+    oc, on, om = team([active()], False)
+    oc[0, 0, 0] = HID
+    sp2 = torch.tensor([[0, 0, 1.0, 0, 0], [0, 0, 0, 0, 1.0]]).view(1, 1, 2, 5).expand(1, 6, 2, 5)
+    with torch.no_grad():
+        return float(M(mc, mn, mm, oc, on, om, torch.zeros(1, FIELD_DIM), F.one_hot(oc[..., 1], A).float(), torch.full((1, 6), p_scarf), opp_spe_p=sp2)["fm_my"][0, 0, 0])
+assert near(run2(0.0), 1.0) and near(run2(1.0), -1.0) and near(run2(0.3), 0.7 - 0.3), "스카프 유무에 따라 다른 구간 분포"
+lg2 = {**lg, "spe": torch.zeros(2, 6, 2, 5)}
+lg2["spe"][:, :, 0, 4], lg2["spe"][:, :, 1, 0] = 5.0, 5.0          # 스카프 아님 행은 구간 4, 스카프 행은 구간 0을 예측
+lg2["spe"][:, 1, 0] = torch.tensor([0, 0, 5.0, 0, 0])
+_, st = hidden_loss(lg2, b, UNK)
+assert st["spe_acc"] == 1.0, "실제 도구가 스카프가 아니면 0행으로 채점"
+true[0, 0, 0] = IT["choicescarf"]
+_, st = hidden_loss(lg2, {**b, "true_set": true}, UNK)
+assert abs(st["spe_acc"] - 10 / 12) < 1e-6, "스카프인 포켓몬(슬롯 0)은 1행(구간 0 예측)으로 채점돼 틀림"
 print("speed buckets OK")

@@ -426,7 +426,12 @@ class MatchupV7(nn.Module):
         # 상대 조합 8개: (날씨 특성, 스카프, 장난꾸러기) 있음/없음, 조합마다 스피드 세트 구간 K개 -> 8K개 (조합이 바깥, 구간이 안쪽 순서)
         pu = torch.stack([pw_opp, p_scarf, torch.einsum("bia,a->bi", q_opp, self.is_prank)], -1)         # [B,6,3] 상대 각 마리의 불확실 요인 확률
         wgt = torch.prod(torch.where(self.combo_bits[None, None] > 0.5, pu[:, :, None, :], 1 - pu[:, :, None, :]), -1)   # [B,6,8]
-        wgt = (wgt[..., None] * p_k[:, :, None, :]).flatten(2)                                              # [B,6,8K]
+        if p_k.dim() == 4:                                                           # [B,6,2,K] 스카프가 아닐 때/스카프일 때의 구간 분포 -> 조합의 스카프 비트로 고름
+            p_c = p_k[:, :, self.combo_bits[:, 1].long()]                            # [B,6,8,K]
+            p_k = p_k[:, :, 0] * (1 - p_scarf[..., None]) + p_k[:, :, 1] * p_scarf[..., None]      # 합친 분포 (출력용 기대 스피드)
+        else:
+            p_c = p_k[:, :, None, :]
+        wgt = (wgt[..., None] * p_c).flatten(2)                                                             # [B,6,8K]
         bits = self.combo_bits.repeat_interleave(K, 0)                               # [8K,3]
         spe_opp_c = spe_opp[..., None] * (1.0 + bits[:, 0]) * (1.0 + 0.5 * bits[:, 1]) * ratio.repeat(1, 1, 8)     # [B,6,8K]
         spe_opp = spe_opp * (ratio * p_k).sum(-1)                                    # 구간 기대 스피드 (출력용)

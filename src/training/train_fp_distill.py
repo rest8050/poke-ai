@@ -33,7 +33,7 @@ from src.training.replay_dataset import OBS_KEYS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 UNK = vocab_sizes()
-BELIEF_FT_LR_MULT = 0.1   # 사전학습된 세트 추정의 미세조정 학습률 배율 (배틀 상황 입력만 새로 배우면 됨)
+BELIEF_FT_LR_MULT = 1.0   # 세트 추정의 학습률 배율. 예전 0.1은 '드러난 것만' 라벨의 편향을 막으려던 값: 이제 정답이 상대 실제 세트라 본체와 같은 학습률로 배틀 상황 입력/팀 문맥/스피드 구간을 배움 (본체 손실과는 기울기가 끊겨 있어 서로 영향 없음)
 LR = 1e-3                 # 피크 학습률. 스윕(코사인, 학생 상태 홀드아웃 CE): 1e-3 1.5005 / 2e-3 1.4906 / 3e-3 1.4958 / 4e-3 1.5034 (표준 레시피는 1e-3)
 BATCH_BATTLES, VALUE_COEF, VAL_FRAC = 32, 0.25, 0.1
 WARMUP_FRAC, LR_MIN_RATIO = 0.05, 0.05   # 학습률: 웜업(0 → lr) 후 코사인 감쇠(lr → lr x LR_MIN_RATIO). 높은 학습률에서 첫 에폭에 정책이 무너지는 충격을 웜업이, 마지막 지점의 흔들림을 감쇠가 줄임
@@ -255,7 +255,7 @@ def main(args):
         if not os.path.exists(pre):
             raise SystemExit(f"❌ {pre} 없음: 이 모델의 세트 추정 입력 폭({model.belief.num_dim})에 맞춰 python src/training/pretrain_belief.py 로 먼저 사전학습할 것")
         miss = model.belief.load_state_dict(torch.load(pre, map_location="cpu")["state"], strict=False)
-        assert not miss.unexpected_keys and all(k.startswith("spe") for k in miss.missing_keys), miss      # 스피드 구간 헤드(spe)는 사전학습에 없음: 배틀 데이터의 실제 세트 라벨로 여기서 처음 배움
+        assert not miss.unexpected_keys and all(k.startswith(("spe", "team")) for k in miss.missing_keys), miss      # 스피드 구간 헤드(spe)는 사전학습에 없음: 배틀 데이터의 실제 세트 라벨로 여기서 처음 배움
         model.belief.spe_on.fill_(1.0)       # 이 학습으로 나온 체크포인트는 스피드를 구간 확률로 계산
         print(f"  세트 추정 사전학습 가중치 로드: {pre} (학습률 x{BELIEF_FT_LR_MULT}로 미세조정)")
     if args.init:      # 이미 학습한 체크포인트(예: v8_full)에서 이어서 학습 (세트 추정 포함 모든 가중치를 덮어씀). 구조(--arch)는 체크포인트와 같아야 함
