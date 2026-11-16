@@ -104,10 +104,12 @@ def hidden_loss(logits: dict, b: dict, unk: dict):
         top4 = lp.topk(4, -1).indices                                              # 상위 4개 안에 정답이 있는 비율
         stats["move_top4"] = ((fut[..., :, None] == top4[..., None, :]).any(-1) & valid).sum().item() / n.item()
     stats["move_n"] = int(n)
-    # 도구/특성: 지금은 숨겨졌고(숨김 id = unk+1) 나중에 드러난 경우
+    # 도구/특성: 지금은 숨겨졌고(숨김 id = unk+1) 정답을 아는 경우. 실제 세트가 없는 판은 뺌: '나중에 드러난 것'만 정답으로 쓰면
+    # 잘 드러나는 도구/특성(구애 도구, 등장 알림 특성) 쪽으로 치우침. b에 true_ok가 아예 없으면(실제 세트를 안 쓰는 호출) 예전처럼 드러난 것으로 학습
+    has_true = b["true_ok"][b["seq_index"]][:, None] if "true_set" in b else True
     for key, col in (("item", 0), ("ability", 1)):
         c, f = cat[..., col], last[..., col]
-        ok = (c == unk[key] + 1) & (f >= 1) & (f < unk[key]) & same
+        ok = (c == unk[key] + 1) & (f >= 1) & (f < unk[key]) & same & has_true
         m = ok.sum()
         if m > 0:
             lpk = F.log_softmax(logits[key].float(), -1)
