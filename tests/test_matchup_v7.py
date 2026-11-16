@@ -29,6 +29,7 @@ def team(mons, mine):
         cat[0, i, 4] = ST[m["status"]] if m.get("status") else 0
         num[0, i, 0] = 1.0 if m.get("active") else 0.0
         num[0, i, 2] = m.get("hp", 1.0)
+        num[0, i, 1] = 1.0 if m.get("fainted") else 0.0
         s = m.get("stats", (100, 100, 100, 100, 100, 100))
         num[0, i, 11:17] = torch.tensor([x / 255.0 for x in s])
         for k, v in (m.get("stage") or {}).items():                                              # 랭크 칸: 3 공, 4 방, 5 특공, 6 특방, 7 스피드 (랭크/6)

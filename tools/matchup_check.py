@@ -44,7 +44,7 @@ def mon(cat, num, mine):
     st = num[11:17] * 255.0
     stats = list(st) if mine else [2 * st[0] + 204] + [2 * s + 99 for s in st[1:]]
     s_name = INV["status"].get(int(cat[4]), "")
-    return {"species": sp, "ability": INV["ability"].get(ab, "") if ab != UNK["ability"] else None, "item": INV["item"].get(it, "") if it != UNK["item"] else "",
+    return {"species": sp, "ability": INV["ability"].get(ab, "") if ab != UNK["ability"] else None, "item": INV["item"].get(it, "leftovers" if it == UNK["item"] + 1 else "") if it != UNK["item"] else "",      # 숨은 도구(unk+1)는 '무언가 들고 있음'(데미지와 무관한 먹다남은음식)으로: 탁쳐서떨구기 x1.5
             "status": s_name if s_name in STATUS else "", "boosts": [float(x) * 6 for x in num[3:8]], "stats": [float(x) for x in stats], "hp": float(num[2]),
             "tera": TYPE(cat[9]) if num[9] > 0.5 else None, "types": [TYPE(cat[2]), TYPE(cat[3])]}
 

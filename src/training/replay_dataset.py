@@ -79,7 +79,10 @@ def _hindsight(lines, side):
 def _preview_mon(details, info):
     mon = Pokemon(details=details, gen=9)
     mon._max_hp = mon._current_hp = 100
-    d = info.get(_norm(details.split(",")[0]))
+    key = _norm(details.split(",")[0])
+    d = info.get(key)
+    if d is None and "-*" in details:      # 팀 프리뷰가 폼을 숨긴 종 (Greninja-*): 팀 파일에는 폼 이름(greninjabond)으로 적혀 있을 수 있음. 한 팀에 같은 종은 하나라 접두사로 찾음
+        d = next((v for k, v in info.items() if k.startswith(key)), None)
     if d:
         for mid in d["moves"]:
             try:

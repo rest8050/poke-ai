@@ -37,3 +37,11 @@ loss, st = hidden_loss(lg, b, UNK)
 assert st["item_n"] == 24 and st["ability_n"] == 24 and st["move_n"] == 96, st       # A, B 두 시점 x 2결정 x 6마리 (C는 팀을 못 찾아 빠짐)
 assert st["item_acc"] == 1.0 and st["stat_mae"] < 1e-4, st
 print("true sets OK")
+
+# 팀 프리뷰가 폼을 숨긴 내 포켓몬 (Greninja-*): 팀 파일의 폼 이름(greninjabond)으로도 세트를 찾아야 함
+from src.training.replay_dataset import _preview_mon
+_info = {"greninjabond": {"moves": ["surf"], "item": "lifeorb", "ability": "battlebond", "tera": None}, "greattusk": {"moves": ["earthquake"], "item": None, "ability": None, "tera": None}}
+_m = _preview_mon("Greninja-*, M", _info)
+assert list(_m.moves) == ["surf"] and _m.item == "lifeorb" and _m.ability == "battlebond", (_m.moves, _m.item)
+assert not _preview_mon("Urshifu-*", _info).moves, "팀에 없는 종은 그대로 비어 있음"
+print("preview form OK")

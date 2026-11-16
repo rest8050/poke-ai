@@ -564,6 +564,10 @@ TRAP_ALIASES = {"bind", "wrap", "firespin", "magmastorm", "sandtomb", "whirlpool
 SIDE_EXT = len(EFFECT_NAMES) + 4
 EXT_START = EFFECT_START + EFFECT_DIM
 FIELD_DIM = EXT_START + 2 * SIDE_EXT
+# 저장된 관측값의 뜻이 바뀔 때마다 올릴 것 (칸 수가 같아도). build_fp_dataset.py가 npz에 enc_version으로 저장하고 train_fp_distill.py가 섞인 버전을 거부함.
+# 0 = 표시 없는 옛 파일, 1 = 도구 배율(구애/생명의구슬/조끼/휘석)을 능력치에 미리 곱하지 않음 (2026-11-16)
+# 2 = 메가자리를 메가진화로 표시하던 것 수정, 기술 수치의 선공권 칸 비움, events.py의 스피드 구간/피해 잔차가 내 쪽 실제 능력치·도구 기준 (2026-11-17)
+ENC_VERSION = 2
 
 
 def active_effect_vec(mon: Any) -> List[float]:
@@ -701,7 +705,7 @@ class BattleTensorEncoder:
             dyna_turns = (getattr(battle, "dynamax_turns_left", None) or 3) if is_dyna else 0
 
             clean_species = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "species", "")))
-            is_mega = clean_species.endswith("mega") or clean_species.endswith("megax") or clean_species.endswith("megay")
+            is_mega = clean_species != "yanmega" and clean_species.endswith(("mega", "megax", "megay"))      # 메가자리(yanmega)는 이름만 mega로 끝남
 
             if is_dyna:
                 gimmick_state = min(1.0, max(0.33, float(dyna_turns) / 3.0))
@@ -737,7 +741,7 @@ class BattleTensorEncoder:
                     my_m_num[0, i, m_idx, :7] = extract_move_features(move, battle)
                     my_m_num[0, i, m_idx, 7] = move_effectiveness(battle, move, opp_active_mon, opp_active_ability)
                     my_m_num[0, i, m_idx, 8:8 + MOVE_EFFECT_DIM] = move_effect_features(move_id)
-                    my_m_num[0, i, m_idx, 8 + MOVE_EFFECT_DIM] = priority_speed_edge(battle, move, pkmn, opp_active_mon)
+                    my_m_num[0, i, m_idx, 8 + MOVE_EFFECT_DIM] = 0.0      # 선공권 칸은 비움: matchup_v7의 fm_my/fm_opp가 랭크/마비/도구까지 넣어 계산함 (priority_speed_edge는 종족값 비교라 서로 어긋났음)
             for m_idx in range(min(4, len(moves_dict)), 4):  # 아직 안 드러난 기술 자리
                 my_cat[0, i, 5 + m_idx] = self.vocab_mgr.slot_id("move", None, True)
             my_num[0, i, BASE_NUM + SLOT_DIM:] = mon_ext("me", pkmn, is_active, battle, ev)
@@ -808,7 +812,7 @@ class BattleTensorEncoder:
             dyna_turns = (getattr(battle, "opponent_dynamax_turns_left", None) or 3) if is_dyna else 0
 
             clean_species = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "species", "")))
-            is_mega = clean_species.endswith("mega") or clean_species.endswith("megax") or clean_species.endswith("megay")
+            is_mega = clean_species != "yanmega" and clean_species.endswith(("mega", "megax", "megay"))      # 메가자리(yanmega)는 이름만 mega로 끝남
 
             if is_dyna:
                 gimmick_state = min(1.0, max(0.33, float(dyna_turns) / 3.0))
@@ -846,7 +850,7 @@ class BattleTensorEncoder:
                     opp_m_num[0, i, m_idx, :7] = extract_move_features(move, battle)
                     opp_m_num[0, i, m_idx, 7] = move_effectiveness(battle, move, active_pkmn, my_active_ability)
                     opp_m_num[0, i, m_idx, 8:8 + MOVE_EFFECT_DIM] = move_effect_features(move_id)
-                    opp_m_num[0, i, m_idx, 8 + MOVE_EFFECT_DIM] = priority_speed_edge(battle, move, pkmn, active_pkmn)
+                    opp_m_num[0, i, m_idx, 8 + MOVE_EFFECT_DIM] = 0.0
             for m_idx in range(min(4, len(moves_dict)), 4):  # 아직 안 드러난 기술 자리
                 opp_cat[0, i, 5 + m_idx] = self.vocab_mgr.slot_id("move", None, True)
 

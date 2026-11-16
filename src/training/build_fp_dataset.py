@@ -9,6 +9,8 @@ Foul Play(탐색 봇) 대전 기록 → 증류 학습 데이터 (train_fp_distil
   프로토콜을 Foul Play 쪽 시점으로 재생하되, 내 팀 정보는 사후 추정이 아니라 Foul Play가 실제로 쓴 팀(start 레코드)으로 채움
   → 실시간 인코더와 같은 완전한 내 팀 정보. 결정 지점(턴 시작/기절 후 교체)마다 Foul Play의 탐색 분포를 22칸 행동 분포로 변환
 출력 npz: OBS_KEYS + action_mask + target(22) + value_target, teacher_value(탐색이 본 이 쪽 승률 0~1, 결정마다), lens(배틀별 길이), outcome
+  배틀별: game(같은 판의 양쪽 시점이 같은 번호, 이 파일 안에서만 유일), opp_true [6,17](상대 팀의 실제 세트: 반대편 시점 첫 턴의 my_team_cat 11칸 + 실제 능력치 hp..spe),
+  opp_true_ok(반대편 기록이 입력에 있었는가), enc_version(인코더 버전, tensor_encoder.ENC_VERSION)
 
 재생 중 events.py 추적기가 예외를 내면 그 배틀은 이후 상태가 어긋나므로 버리고 통계에 세며, 버려진 배틀이 1%를 넘으면 빌드를 실패시킴
 
@@ -34,6 +36,7 @@ import numpy as np
 from poke_env.battle import Battle
 
 import src.core.events as events
+from src.core.tensor_encoder import ENC_VERSION
 from src.training.replay_dataset import MOVE_ID, OBS_KEYS, _LOGGER, _capture, _norm, _opp_actions, _preview_mon, legal_from_request
 
 GAMMA = 0.995
@@ -260,7 +263,8 @@ def build(decisions, workers=1):
     stat = Counter()
     unmatched = defaultdict(lambda: [0, None])       # 22칸에 못 넣은 옵션 이름 -> [횟수, 첫 사례 (태그, 턴)]
     out, jobs = [], []
-    for (_src, tag), d in by_tag.items():
+    for key, d in by_tag.items():
+        tag = key[1]
         # 자기 컨테이너의 프로토콜을 우선 (자기 쪽 서버 요청 |request|가 들어 있어 순수 합법 마스크를 만들 수 있음), 없으면 같은 태그의 다른 컨테이너 기록
         protocol = d["protocol"]["lines"] if "protocol" in d else prot_by_tag.get(tag)
         if not protocol or "start" not in d or "end" not in d or d["end"]["winner"] is None:
@@ -273,13 +277,16 @@ def build(decisions, workers=1):
             continue
         lines = [l.split("|") for l in protocol if l.startswith("|") and l != "|"]
         opp_map = _opp_actions([x for x in lines if len(x) > 1], "p2" if side == "p1" else "p1")        # 턴 -> (상대 선택 0 기술/1 교체/2 테라+기술/-1 행동 못 함, 기술)
-        jobs.append((d, user, (protocol, side, user, d["start"]["team"]), opp_map))
+        jobs.append((d, user, (protocol, side, user, d["start"]["team"]), opp_map, key))
     if workers > 1:  # 배틀별 재생은 서로 독립 → 프로세스 풀
         with mp.get_context("spawn").Pool(workers) as pool:
             all_states = pool.map(_replay_counted, [j[2] for j in jobs], chunksize=4)
     else:
         all_states = [_replay_counted(j[2]) for j in jobs]
-    for (d, user, _, opp_map), (states, n_err) in zip(jobs, all_states):
+    # 각 시점의 첫 턴 내 팀 [6,17] = my_team_cat 11칸 + 실제 능력치 hp..spe -> 반대편 시점의 '상대 실제 세트' (hidden_labels.true_sets와 같은 형식)
+    own = {j[4]: np.concatenate([st[0][0]["obs"][0], np.round(st[0][0]["obs"][1][:, 11:17] * 255)], -1).astype(np.int16) for j, (st, _) in zip(jobs, all_states) if st}
+    game = {t: i for i, t in enumerate(dict.fromkeys(k[1] for k in by_tag))}
+    for (d, user, _, opp_map, bkey), (states, n_err) in zip(jobs, all_states):      # bkey = (파일, 태그)
         if states is None:
             stat["배틀 제외(재생 실패)"] += 1
             continue
@@ -341,6 +348,10 @@ def build(decisions, workers=1):
         # 히스토리 위치: 이 배틀의 결정 지점 중 몇 번째인가. 라벨이 없어 빠진 결정 지점(매칭 실패, 기록 없음)이 있어도 실전과 같은 번호가 됨
         seq["pos"] = np.array([x["pos"] for x in rows], np.int16)
         seq["outcome"] = outcome
+        other = [v for k, v in own.items() if k[1] == bkey[1] and k[0] != bkey[0]]      # 같은 태그의 다른 컨테이너 기록 = 반대편 시점
+        seq["game"], seq["opp_true_ok"] = game[bkey[1]], len(other) == 1
+        seq["opp_true"] = other[0] if len(other) == 1 else np.zeros((6, 17), np.int16)
+        stat["상대 실제 세트 있음"] += len(other) == 1
         out.append(seq)
         stat["배틀 사용"] += 1
     return out, stat, unmatched
@@ -355,6 +366,8 @@ def main(args):
     data = {k: np.concatenate([s[k] for s in seqs]) for k in OBS_KEYS + ["action_mask", "target", "value_target", "teacher_value", "action_taken", "q_mean", "q_vis", "turn", "kind", "opp_action", "opp_move", "pos"]}
     data["lens"] = np.array([len(s["action_mask"]) for s in seqs])
     data["outcome"] = np.array([s["outcome"] for s in seqs], np.float32)
+    data["game"], data["opp_true_ok"] = np.array([s["game"] for s in seqs], np.int32), np.array([s["opp_true_ok"] for s in seqs], bool)
+    data["opp_true"], data["enc_version"] = np.stack([s["opp_true"] for s in seqs]), np.int16(ENC_VERSION)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     np.savez_compressed(args.out, **data)
     ent = -(data["target"] * np.log(np.clip(data["target"], 1e-9, 1))).sum(-1)

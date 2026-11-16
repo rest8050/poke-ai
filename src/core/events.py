@@ -6,7 +6,7 @@ battle.parse_message를 한 번 감싸서 리플레이 재생 / 실전 / Foul Pl
 - 상대 슬롯별 증거 (SLOT_DIM=8, 상대 팀 수치 뒤에 붙음):
     공격 잔차 / 방어 잔차 = log(관측 피해 / 표준 세트 예상 피해)의 평균 → 구애/생명의구슬/노력치/내구 도구 단서
     속도 구간 [하한, 상한] = 행동 순서에서 얻은 "표준 대비 속도 배율" 범위 → 스카프/속도 노력치 단서
-표준 세트 가정(공격 노력치 252, 방어/HP 84, 성격 보정 없음)은 양쪽 모두 같은 함수라서 학습/실전이 같음.
+상대 쪽은 표준 세트 가정(공격/스피드 노력치 252, 방어/HP 84, 성격 보정 없음), 내 쪽은 실제 능력치와 도구 (아는 값이라 잔차/구간에 섞이지 않게).
 
 ponytail: 날씨/벽/특성/아이템 보정과 다단히트/고정 피해기는 예상 피해에서 제외(잔차에 섞임 → 신경망이 분포로 학습).
 """
@@ -26,7 +26,7 @@ from poke_env.battle import Field, Move, MoveCategory, SideCondition, Status, We
 # - 상대 슬롯별 증거 (SLOT_DIM=8, 상대 팀 수치 뒤에 붙음):
 #     공격 잔차 / 방어 잔차 = log(관측 피해 / 표준 세트 예상 피해)의 평균 → 구애/생명의구슬/노력치/내구 도구 단서
 #     속도 구간 [하한, 상한] = 행동 순서에서 얻은 "표준 대비 속도 배율" 범위 → 스카프/속도 노력치 단서
-# 표준 세트 가정(공격 노력치 252, 방어/HP 84, 성격 보정 없음)은 양쪽 모두 같은 함수라서 학습/실전이 같음.
+# 상대 쪽은 표준 세트 가정(공격/스피드 노력치 252, 방어/HP 84, 성격 보정 없음), 내 쪽은 실제 능력치와 도구 (아는 값이라 잔차/구간에 섞이지 않게).
 #
 # ponytail: 날씨/벽/특성/아이템 보정과 다단히트/고정 피해기는 예상 피해에서 제외(잔차에 섞임 → 신경망이 분포로 학습).
 TURN_DIM, SLOT_DIM = 10, 8
@@ -56,8 +56,14 @@ def _mon(battle, side):
     return battle.active_pokemon if side == battle.player_role else battle.opponent_active_pokemon
 
 
-def expected_frac(A, D, mv, crit):
-    """표준 세트 가정의 예상 피해 (방어자 최대 HP 대비 비율). 못 구하면 None"""
+def _own(mon, k, mine):
+    """내 포켓몬의 실제 능력치 (모르면 None)"""
+    return (getattr(mon, "stats", None) or {}).get(k) if mine else None
+
+
+def expected_frac(A, D, mv, crit, a_mine=False, d_mine=False):
+    """예상 피해 (방어자 최대 HP 대비 비율). 못 구하면 None. 상대 쪽은 표준 세트 가정, 내 쪽(a_mine/d_mine)은 실제 능력치와 도구(구애머리띠/안경, 생명의구슬, 돌격조끼, 진화의휘석)
+    -> 잔차에 내 노력치/도구가 섞이지 않고 상대 쪽의 차이만 남음"""
     if mv.id in _SKIP or not mv.base_power or mv.damage or mv.n_hit != (1, 1) or mv.category not in (MoveCategory.PHYSICAL, MoveCategory.SPECIAL):
         return None
     phys = mv.category == MoveCategory.PHYSICAL
@@ -68,11 +74,16 @@ def expected_frac(A, D, mv, crit):
     if crit:
         ab, db = max(0, ab), min(0, db)
     lvl = A.level or 100
-    a = _stat(A.base_stats[ak], lvl, 252) * _boost(ab)
-    d = _stat(D.base_stats[dk], D.level or 100, 84) * _boost(db)
-    hp = ((2 * D.base_stats["hp"] + 31 + 21) * (D.level or 100)) // 100 + (D.level or 100) + 10
+    a = (_own(A, ak, a_mine) or _stat(A.base_stats[ak], lvl, 252)) * _boost(ab)
+    d = (_own(D, dk, d_mine) or _stat(D.base_stats[dk], D.level or 100, 84)) * _boost(db)
+    hp = _own(D, "hp", d_mine) or ((2 * D.base_stats["hp"] + 31 + 21) * (D.level or 100)) // 100 + (D.level or 100) + 10
+    a_item, d_item = _n(A.item or "") if a_mine else "", _n(D.item or "") if d_mine else ""
+    if a_item == ("choiceband" if phys else "choicespecs"):
+        a *= 1.5
+    if (d_item == "assaultvest" and not phys) or d_item == "eviolite":
+        d *= 1.5
     dmg = ((2 * lvl // 5 + 2) * mv.base_power * a / d) / 50 + 2
-    mod = 0.925 * (1.5 if crit else 1.0) * (1.5 if mv.type in A.types else 1.0) * D.damage_multiplier(mv)
+    mod = 0.925 * (1.5 if crit else 1.0) * (1.5 if mv.type in A.types else 1.0) * D.damage_multiplier(mv) * (1.3 if a_item == "lifeorb" else 1.0)
     if A.status == Status.BRN and phys:
         mod *= 0.5
     return dmg * mod / hp if mod > 0 else None
@@ -83,10 +94,13 @@ class EventTracker:
         self.last = [0.0] * TURN_DIM
         self.slot = {}  # 상대 종 → {atk:[n,sum], defn:[n,sum], lo, hi}
         self.rev = RevealTracker()   # 도구/특성 공개와 추론, 마지막 사용 기술 등 (events.py)
+        self.turn_first = {}
         self._reset_turn()
 
     def _reset_turn(self):
-        self.moves = []  # (side, 준비된 속도 추정, 우선도, 트릭룸)
+        self.moves = []  # (side, 유효 속도, 우선도, 트릭룸, 종, 우선도가 바뀔 수 있는가)
+        self.snap = {}  # 이 턴 첫 기술이 나온 시점의 양쪽 활성 (종, 유효 속도): 행동 순서는 이때의 속도로 정해짐
+        self.jump = False  # 이 턴에 속도와 무관하게 순서를 바꾸는 발동이 있었음 (선제공격손톱, 퀵드로, 후공열매)
         self.moved = {"me": 0.0, "opp": 0.0}
         self.dealt = {"me": 0.0, "opp": 0.0}
         self.crit = {"me": 0.0, "opp": 0.0}
@@ -116,14 +130,15 @@ class EventTracker:
         first = {}
         for m in self.moves:
             first.setdefault(m[0], m)
+        self.turn_first = first          # 이 턴 각 쪽의 첫 행동 (기술을 쓴 시점의 속도 포함): 스카프 추론(RevealTracker._check_scarf)이 읽음
         order, inf = 0.0, 0.0
-        if "me" in first and "opp" in first and first["me"][2] == first["opp"][2]:
+        if "me" in first and "opp" in first and first["me"][2] == first["opp"][2] and not (first["me"][5] or first["opp"][5] or self.jump):      # 같은 우선도이고 우선도를 바꾸는 특성/기술(장난꾸러기 등)이 없을 때만
             inf = 1.0
             me_first = self.moves.index(first["me"]) < self.moves.index(first["opp"])
             order = 1.0 if me_first else -1.0
             tr = first["me"][3]
             faster_opp_moved_first = (not me_first) != tr  # 트릭룸이면 느린 쪽이 먼저
-            r = math.log(first["me"][1] / first["opp"][1])  # 표준 속도 대비 내 속도 / 상대 속도
+            r = math.log(first["me"][1] / first["opp"][1])  # 내 실제 속도 / 상대 표준 속도 = 상대의 '표준 대비 속도 배율'(노력치/성격/스카프/날씨 특성)의 경계
             s = self._s(first["opp"][4])
             if faster_opp_moved_first:
                 s["lo"] = r if s["lo"] is None else max(s["lo"], r)
@@ -144,13 +159,28 @@ class EventTracker:
                 float(s["hi"] is not None), c(s["hi"] or 0.0)]
 
 
+_WEATHER_SPEED = {"swiftswim": Weather.RAINDANCE, "chlorophyll": Weather.SUNNYDAY, "sandrush": Weather.SANDSTORM, "slushrush": Weather.SNOWSCAPE}
+
+
 def _speed(battle, side, mon):
-    """표준 세트 가정의 유효 속도 (능력 단계, 마비, 순풍 반영)"""
-    v = _stat(mon.base_stats["spe"], mon.level or 100, 84) * _boost(mon.boosts.get("spe", 0))
+    """유효 속도 (능력 단계, 마비, 순풍, 고대활성/쿼크차지 반영). 내 쪽은 실제 능력치에 스카프/날씨 특성까지(아는 값),
+    상대는 매치업과 같은 표준 가정(252노력치 무보정, 2b+99)이고 스카프/날씨 특성은 안 넣음 -> 행동 순서가 주는 구간은 상대의 그 배율들에 대한 증거"""
+    mine = side == "me"
+    v = (_own(mon, "spe", mine) or _stat(mon.base_stats["spe"], mon.level or 100, 252)) * _boost(mon.boosts.get("spe", 0)) * RevealTracker._pq_speed(mon)
     if mon.status == Status.PAR:
         v *= 0.5
-    conds = battle.side_conditions if side == "me" else battle.opponent_side_conditions
+    if mine and _n(mon.item or "") == "choicescarf":
+        v *= 1.5
+    if mine and _WEATHER_SPEED.get(_n(mon.ability or "")) in (battle.weather or {}):
+        v *= 2.0
+    conds = battle.side_conditions if mine else battle.opponent_side_conditions
     return v * (2.0 if SideCondition.TAILWIND in conds else 1.0)
+
+
+def _order_jump(parts):
+    """같은 우선도 안에서 속도와 무관하게 먼저 움직이게 하는 발동 줄인가: |-activate|..|item: Quick Claw, |-activate|..|ability: Quick Draw, |-enditem|..|Custap Berry"""
+    kind, rest = (parts[1] if len(parts) > 1 else ""), " ".join(parts[3:])
+    return (kind == "-activate" and ("Quick Claw" in rest or "Quick Draw" in rest)) or (kind == "-enditem" and "Custap Berry" in rest)
 
 
 def _hook(orig):
@@ -171,12 +201,18 @@ def _hook(orig):
         if ev is None:
             return
         try:
+            if _order_jump(split_message):
+                ev.jump = True
             if kind == "move" and not tags:
                 side = "me" if split_message[2][:2] == self.player_role else "opp"
                 mon = _mon(self, split_message[2][:2])
                 mv = Move(_n(split_message[3]), gen=9)
                 ev.moved[side] = 1.0
-                ev.moves.append((side, _speed(self, side, mon), mv.priority, Field.TRICK_ROOM in self.fields, _n(mon.species)))
+                if not ev.moves:      # 턴의 첫 기술: 양쪽 속도를 지금 기록 (나중에 움직이는 쪽이 맞고 나서 속도가 변해도(깨어진갑옷, 마비, 얼다바람) 순서는 이 시점 기준)
+                    ev.snap = {s_: (_n(m_.species), _speed(self, s_, m_)) for s_, m_ in (("me", self.active_pokemon), ("opp", self.opponent_active_pokemon)) if m_ is not None}
+                snap = ev.snap.get(side)
+                ev.moves.append((side, snap[1] if snap and snap[0] == _n(mon.species) else _speed(self, side, mon), mv.priority, Field.TRICK_ROOM in self.fields, _n(mon.species),
+                                 RevealTracker._can_priority_modified(self, mon, mv.id)))
                 ev.attack = {"side": side, "A": mon, "mv": mv, "D": None, "n": 0, "lost": 0.0, "ko": False, "crit": False, "exp": None}
             elif kind == "-crit" and ev.attack:
                 ev.attack["crit"] = True
@@ -188,7 +224,7 @@ def _hook(orig):
                 a = ev.attack
                 a["D"], a["n"] = t, a["n"] + 1
                 if a["n"] == 1:  # 부스트 등이 바뀌기 전인 지금 예상 피해를 계산
-                    a["exp"] = expected_frac(a["A"], t, a["mv"], a["crit"])
+                    a["exp"] = expected_frac(a["A"], t, a["mv"], a["crit"], a["side"] == "me", a["side"] == "opp")
                 lost = max(0.0, pre - t.current_hp_fraction)
                 a["lost"] += lost
                 a["ko"] = a["ko"] or t.current_hp_fraction <= 0
@@ -386,8 +422,8 @@ class RevealTracker:
             self._set_item(battle, ident0, parts[4])
         for p in parts[3:]:
             m = _ABIL.match(p)
-            if m and kind != "-ability":
-                self._set_ability(battle, of or ident0, m.group(1).strip())
+            if m and kind != "-ability":      # -heal(저수/축전/건조피부/흙먹기)의 [of]는 기술을 쓴 쪽이지 특성 주인이 아님: 주인은 회복한 쪽(ident0)
+                self._set_ability(battle, ident0 if kind == "-heal" and ident0 else of or ident0, m.group(1).strip())
             m = _ITEM.match(p)
             if m and "[consumed]" not in parts and kind != "-enditem":
                 self._set_item(battle, of or ident0, m.group(1).strip())
@@ -516,8 +552,8 @@ class RevealTracker:
 
     # ---- 구애 스카프 추론 (Foul Play check_choicescarf): 같은 우선도, 상대가 먼저인데 최대 속도 가정으로도 내가 더 빠름
     def _check_scarf(self, battle, lines):
-        if any(l.startswith("|switch|") or l.startswith("|cant|") or (l.startswith("|-activate|") and l.endswith("confusion")) for l in lines):
-            return
+        if any(l.startswith("|switch|") or l.startswith("|cant|") or (l.startswith("|-activate|") and l.endswith("confusion")) or _order_jump(l.split("|")) for l in lines):
+            return                                         # 선제공격손톱/퀵드로/후공열매로 먼저 움직인 턴은 스카프 근거가 아님
         moves = [l.split("|") for l in lines if l.startswith("|move|")]
         if len(moves) != 2 or self._side(battle, moves[0][2]) != "opp" or self._side(battle, moves[1][2]) != "me":
             return
@@ -537,18 +573,14 @@ class RevealTracker:
             return
         if _n(me.ability or "") == "unburden" and me.item in (None, ""):
             return
-        tr = Field.TRICK_ROOM in battle.fields
-        base, lvl = opp.base_stats["spe"], opp.level or 100
-        if tr:
-            stat = int((((2 * base + 31) * lvl) // 100 + 5) * 0.9)           # 느린 쪽이 먼저: 최소 속도 가정 (성격 보정 -, 노력치 0)
-        else:
-            stat = int((((2 * base + 31 + 63) * lvl) // 100 + 5) * 1.1)      # 최대 속도 가정 (성격 보정 +, 노력치 252)
-        opp_eff = stat * _boost(opp.boosts.get("spe", 0)) * (0.5 if opp.status == Status.PAR else 1.0) \
-            * (2.0 if SideCondition.TAILWIND in battle.opponent_side_conditions else 1.0) * self._pq_speed(opp)
-        my_stat = (me.stats or {}).get("spe") or me.base_stats["spe"]
-        me_eff = my_stat * _boost(me.boosts.get("spe", 0)) * (0.5 if me.status == Status.PAR else 1.0) \
-            * (2.0 if SideCondition.TAILWIND in battle.side_conditions else 1.0) * (1.5 if me.item == "choicescarf" else 1.0) * self._pq_speed(me)
-        if (opp_eff > me_eff) if tr else (me_eff > opp_eff):
+        # 속도는 각자 기술을 쓴 시점의 값 (EventTracker.moves): 턴이 끝난 뒤의 상태로 비교하면 그 턴에 생긴 랭크 변화/마비/순풍 때문에 잘못 추론함 (실제 세트와 대조: 스카프로 보인 것의 42~49%만 진짜였음)
+        first = getattr(battle.__dict__.get("_ev"), "turn_first", {})
+        fo, fm = first.get("opp"), first.get("me")
+        if not fo or not fm or fo[4] != sp or fm[4] != _n(me.species) or fo[3] or fm[3]:
+            return                                         # 트릭룸에서는 추론하지 않음: 스카프는 빨라지는 도구라 '느린 쪽이 먼저'인 판에서는 근거가 못 됨
+        if not (me.stats or {}).get("spe"):
+            return                                         # 내 실제 스피드를 모르면(관전 리플레이) 비교 불가
+        if fm[1] > fo[1] * 1.1:                            # 상대가 최대 속도(풀보정 + 성격, 표준 2b+99의 1.1배)여도 내가 더 빠른데 상대가 먼저 움직임
             self.item["opp"][sp] = "choicescarf"
             self.inferred["opp"][sp] = True
 
@@ -564,7 +596,7 @@ class RevealTracker:
             status = Move(move_id, gen=9).category == MoveCategory.STATUS
         except Exception:
             status = False
-        return "prankster" in abil or (move_id == "grassyglide" and Field.GRASSY_TERRAIN in battle.fields) or (status and "myceliummight" in abil)
+        return "prankster" in abil or "stall" in abil or (move_id == "grassyglide" and Field.GRASSY_TERRAIN in battle.fields) or (status and "myceliummight" in abil)
 
     @staticmethod
     def _can_speed_modified(battle, mon):

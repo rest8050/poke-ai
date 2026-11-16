@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from src.core.matchup_v7 import speed_bucket_ratio
 from src.core.model import STAT_SCALE
 
 
@@ -121,4 +122,9 @@ def hidden_loss(logits: dict, b: dict, unk: dict):
             err = (logits["stat"].float() - torch.log(ratio.clamp_min(1e-3)) / STAT_SCALE)[ok]
             total = total + 0.5 * (err ** 2).mean()                                # 0.5 = pretrain_belief.STAT_COEF
             stats["stat_mae"] = err.abs().mean().item() * STAT_SCALE
+        if "spe" in logits and ok[..., 5].any():                                     # 스피드 세트 구간: 실제 스피드에 가장 가까운 구간(로그 거리)이 정답
+            tgt = (torch.log(speed_bucket_ratio(base[..., 5])) - torch.log(ratio[..., 5:6].clamp_min(1e-3))).abs().argmin(-1)
+            lg = logits["spe"].float()[ok[..., 5]]
+            total = total + F.cross_entropy(lg, tgt[ok[..., 5]])
+            stats["spe_acc"], stats["spe_n"] = (lg.argmax(-1) == tgt[ok[..., 5]]).float().mean().item(), int(ok[..., 5].sum())
     return total, stats

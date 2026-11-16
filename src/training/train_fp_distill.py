@@ -27,7 +27,7 @@ import torch.nn.functional as F
 
 from src.core.model import build_model, load_compatible, save_ckpt
 from src.evaluation.holdout import decision_pos
-from src.core.tensor_encoder import MOVE_NUM_DIM
+from src.core.tensor_encoder import ENC_VERSION, MOVE_NUM_DIM
 from src.training.hidden_labels import hidden_loss, true_sets, vocab_sizes
 from src.training.replay_dataset import OBS_KEYS
 
@@ -97,7 +97,7 @@ def q_terms(b):
 
 def run(model, data, offsets, idx, args, train, opt=None):
     model.train(bool(train))  # 학습 중에는 드롭아웃을 켬(융합층 0.1, 직전 기술 임베딩 0.3, 세트 추정 종 0.3. 트렁크는 기본 0.0). 검증은 항상 끔
-    tot = dict(ce=0.0, v=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, reg=0.0, reg_n=0)
+    tot = dict(ce=0.0, v=0.0, pg=0.0, hid=0.0, hid_top4=0.0, hid_nb=0, agree=0, n=0, reg=0.0, reg_n=0, spe=0.0, spe_n=0)
     for bi, b in enumerate(make_batches(data, offsets, idx, BATCH_BATTLES // args.accum, train)):
         b = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in b.items()}
         with torch.set_grad_enabled(train):
@@ -124,7 +124,8 @@ def run(model, data, offsets, idx, args, train, opt=None):
             pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
             hid = ce.new_zeros(())
             if "hid_move" in out:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
-                hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"], "stat": out["hid_stat"]}, b, UNK)
+                hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"], "stat": out["hid_stat"], "spe": out["hid_spe"]}, b, UNK)
+                tot["spe"] += hs.get("spe_acc", 0.0) * hs.get("spe_n", 0); tot["spe_n"] += hs.get("spe_n", 0)
                 tot["hid_top4"] += hs.get("move_top4", 0.0) * hs["move_n"]; tot["hid_nb"] += hs["move_n"]
             loss = (w * ce_i).sum() / w.sum() + args.value_coef * v_loss + args.pg_coef * pg + HIDDEN_COEF * hid
             if train and args.cost_weight and "q_mean" in b:   # 비용 민감 항: 학생 정책의 기대 regret Σπ(a)·gap(a). 동점 행동으로 새는 확률은 벌점 ~0, 해로운 행동만 벌점
@@ -147,11 +148,11 @@ def run(model, data, offsets, idx, args, train, opt=None):
         if "q_mean" in b:
             tot["reg"] += (reg_arg * valid).sum().item(); tot["reg_n"] += valid.sum().item()
     n = max(1, tot["n"])
-    return {"reg": tot["reg"] / tot["reg_n"] if tot["reg_n"] else None, "ce": tot["ce"] / n, "v": tot["v"] / n, "pg": tot["pg"] / n, "hid": tot["hid"] / n, "hid_top4": tot["hid_top4"] / max(1, tot["hid_nb"]), "agree": tot["agree"] / n, "n": tot["n"]}
+    return {"spe": tot["spe"] / max(1, tot["spe_n"]), "reg": tot["reg"] / tot["reg_n"] if tot["reg_n"] else None, "ce": tot["ce"] / n, "v": tot["v"] / n, "pg": tot["pg"] / n, "hid": tot["hid"] / n, "hid_top4": tot["hid_top4"] / max(1, tot["hid_nb"]), "agree": tot["agree"] / n, "n": tot["n"]}
 
 
 def fmt(r):
-    return (f"소프트CE {r['ce']:.4f} | 탐색 선택과 일치 {r['agree']:.3f} | V {r['v']:.3f} | PG {r['pg']:.4f}" + (f" | regret {r['reg']:.4f}" if r["reg"] is not None else "") + (f" | 숨김정보 {r['hid']:.3f}(기술 상위4 적중 {r['hid_top4']:.2f})" if r["hid"] else ""))
+    return (f"소프트CE {r['ce']:.4f} | 탐색 선택과 일치 {r['agree']:.3f} | V {r['v']:.3f} | PG {r['pg']:.4f}" + (f" | regret {r['reg']:.4f}" if r["reg"] is not None else "") + (f" | 숨김정보 {r['hid']:.3f}(기술 상위4 적중 {r['hid_top4']:.2f}, 스피드 구간 적중 {r['spe']:.2f})" if r["hid"] else ""))
 
 
 def load(pattern):
@@ -159,6 +160,11 @@ def load(pattern):
     if not files:
         raise SystemExit(f"❌ 데이터 파일 없음: {pattern}")
     parts = [np.load(f) for f in files]
+    ver = {f: int(p["enc_version"]) if "enc_version" in p.files else 0 for f, p in zip(files, parts)}     # 0 = 표시 없는 옛 파일
+    if len(set(ver.values())) > 1:      # 인코더 버전이 다르면 같은 칸의 뜻이 다름 (tensor_encoder.ENC_VERSION) -> 오류 없이 틀린 입력이 섞이므로 막음
+        raise SystemExit("❌ 인코더 버전이 다른 npz가 섞임 (원본 결정기록으로 build_fp_dataset.py를 다시 돌려 맞출 것): " + ", ".join(f"v{v} {sum(x == v for x in ver.values())}개" for v in sorted(set(ver.values()))))
+    if set(ver.values()) != {ENC_VERSION}:
+        print(f"⚠️ 데이터의 인코더 버전 {set(ver.values())} != 현재 인코더 {ENC_VERSION}: 이 데이터로 학습한 모델은 실전/새 평가 세트와 입력 뜻이 다를 수 있음")
     data = {}
     total = int(sum(int(p["lens"].sum()) for p in parts))
     for k in KEYS + (Q_KEYS if all(k in p.files for p in parts for k in Q_KEYS) else []):
@@ -196,6 +202,9 @@ def load(pattern):
     # 히스토리 위치 (build_fp_dataset의 pos: 배틀 안에서 몇 번째 결정 지점인가). 옛 파일은 배틀마다 0,1,2,... (예전과 같음)
     data["pos"] = np.concatenate([decision_pos(p, p["lens"]) for p in parts]).astype(np.int32)
     lens = np.concatenate([p["lens"] for p in parts])
+    # 상대 팀의 실제 세트 (build_fp_dataset의 opp_true). 없는 파일/판은 main에서 hidden_labels.true_sets의 추정으로 채움
+    st = [(p["opp_true"], p["opp_true_ok"]) if "opp_true" in p.files else (np.zeros((len(p["lens"]), 6, 17), np.int16), np.zeros(len(p["lens"]), bool)) for p in parts]
+    data["true_set"], data["true_ok"] = (np.concatenate(x) for x in zip(*st))
     return data, np.concatenate([[0], np.cumsum(lens)]), lens, files
 
 
@@ -224,8 +233,12 @@ def main(args):
     data, offsets, lens, files = load(args.data)
     if args.teacher_value_mix > 0 and "teacher_value" not in data:
         raise SystemExit("❌ --teacher-value-mix에는 교사 가치(teacher_value)가 든 npz가 하나는 있어야 함 (build_fp_dataset.py로 만든 새 형식)")
-    data["true_set"], data["true_ok"] = true_sets(data, offsets)
-    print(f"상대 실제 세트를 찾은 판 {data['true_ok'].mean():.3f} (나머지는 배틀에서 드러난 것만 정답)")
+    stored = float(data["true_ok"].mean())
+    if stored < 1:      # 저장된 실제 세트가 없는 판은 반대편 시퀀스를 추정해서 찾음
+        ts, ok = true_sets(data, offsets)
+        m = ~data["true_ok"]
+        data["true_set"][m], data["true_ok"][m] = ts[m], ok[m]
+    print(f"상대 실제 세트: 저장된 판 {stored:.3f}, 추정 포함 {data['true_ok'].mean():.3f} (나머지는 배틀에서 드러난 것만 정답)")
     val, train = split_ids(data, offsets, VAL_FRAC)
     print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
@@ -241,7 +254,9 @@ def main(args):
         pre = f"checkpoints/belief_{model.belief.num_dim}.pt"
         if not os.path.exists(pre):
             raise SystemExit(f"❌ {pre} 없음: 이 모델의 세트 추정 입력 폭({model.belief.num_dim})에 맞춰 python src/training/pretrain_belief.py 로 먼저 사전학습할 것")
-        model.belief.load_state_dict(torch.load(pre, map_location="cpu")["state"])
+        miss = model.belief.load_state_dict(torch.load(pre, map_location="cpu")["state"], strict=False)
+        assert not miss.unexpected_keys and all(k.startswith("spe") for k in miss.missing_keys), miss      # 스피드 구간 헤드(spe)는 사전학습에 없음: 배틀 데이터의 실제 세트 라벨로 여기서 처음 배움
+        model.belief.spe_on.fill_(1.0)       # 이 학습으로 나온 체크포인트는 스피드를 구간 확률로 계산
         print(f"  세트 추정 사전학습 가중치 로드: {pre} (학습률 x{BELIEF_FT_LR_MULT}로 미세조정)")
     if args.init:      # 이미 학습한 체크포인트(예: v8_full)에서 이어서 학습 (세트 추정 포함 모든 가중치를 덮어씀). 구조(--arch)는 체크포인트와 같아야 함
         load_compatible(model, torch.load(args.init, map_location="cpu"))

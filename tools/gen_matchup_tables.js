@@ -19,5 +19,15 @@ for (const id of Object.keys(V.move)) {
 const nfe = Object.keys(V.species).filter(id => { const s = Dex.species.get(id); return s.exists && s.nfe; });
 const types = {};
 for (const id of Object.keys(V.species)) { const s = Dex.species.get(id); if (s.exists) types[id] = s.types.map(t => t.toLowerCase()); }
-fs.writeFileSync(path.join(__dirname, '..', 'data', 'matchup_tables.json'), JSON.stringify({moves, nfe, types}));
+const learnset = {};       // 종이 9세대에서 배울 수 있는 기술 (진화 전 포함). 스케치를 배우는 종(루브도)은 뺌 = 제한 없음
+for (const id of Object.keys(V.species)) {
+  const s = Dex.species.get(id);
+  if (!s.exists) continue;
+  const mv = new Set();
+  for (const ls of Dex.species.getFullLearnset(s.id)) for (const [m, src] of Object.entries(ls.learnset || {})) if (src.some(x => x.startsWith('9')) && m in V.move) mv.add(m);
+  if (mv.size && !mv.has('sketch')) learnset[id] = [...mv];
+}
+const abilities = {};      // 종이 가질 수 있는 특성 (세트 추정이 못 가지는 특성에 확률을 주지 않게 가림)
+for (const id of Object.keys(V.species)) { const s = Dex.species.get(id); if (s.exists) abilities[id] = Object.values(s.abilities).map(a => Dex.abilities.get(a).id); }
+fs.writeFileSync(path.join(__dirname, '..', 'data', 'matchup_tables.json'), JSON.stringify({moves, nfe, types, abilities, learnset}));
 console.log(Object.keys(moves).length, 'moves tagged,', nfe.length, 'nfe species');

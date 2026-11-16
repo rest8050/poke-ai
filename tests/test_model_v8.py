@@ -91,6 +91,23 @@ with torch.no_grad():
     qh = model._prob(hid[..., 1], bl["ability"])
     assert (qh[..., 0] == 0).all() and (qh[..., A - 2:] == 0).all(), "특수 칸에 확률이 샘"
     assert torch.equal(q.argmax(-1), opp_cat[..., 1]), "공개된 특성이 원핫이 아님"
+    # 숨은 특성 후보 제한: 종이 가질 수 있는 특성만, 등장한 포켓몬은 등장 알림 특성 제외
+    V_, Mx = json.load(open("data/vocab.json", encoding="utf-8")), model.matchup
+    zap, AB_ = V_["species"]["zapdos"], V_["ability"]
+    allow = Mx.sp_ab[torch.full((1, 6), zap)]
+    qz = model._prob(torch.full((1, 6), A - 1), torch.zeros(1, 6, A), allow)
+    assert abs(float(qz[0, 0, AB_["pressure"]]) - 0.5) < 1e-6 and abs(float(qz[0, 0, AB_["static"]]) - 0.5) < 1e-6, "썬더: 프레셔/정전기만"
+    qz = model._prob(torch.full((1, 6), A - 1), torch.zeros(1, 6, A), allow & ~Mx.ab_announce)
+    assert float(qz[0, 0, AB_["static"]]) == 1.0, "등장했는데 프레셔 알림이 없었으면 정전기"
+    qz = model._prob(torch.full((1, 6), A - 1), torch.zeros(1, 6, A), torch.zeros(1, 6, A, dtype=torch.bool))
+    assert abs(float(qz.sum()) - 6) < 1e-4 and float(qz.max()) < 0.1, "후보 표가 비면 제한하지 않음"
+    # 숨은 기술 후보: 종이 배울 수 있는 기술만 (스케치를 배우는 루브도는 제한 없음)
+    oc1 = torch.zeros(1, 6, 11, dtype=torch.long); oc1[..., 10] = zap; oc1[0, 1, 10] = V_["species"]["smeargle"]
+    on1 = torch.zeros(1, 6, flat[4].size(-1)); on1[..., 11] = 0.4
+    Vm = model.belief.move.out_features
+    gz = model._top_guess({"move": torch.zeros(1, 6, Vm)}, oc1, torch.zeros(1, 6, 4, flat[5].size(-1)), on1)
+    assert Mx.sp_mv[zap][gz["idx"][0, 0]].all() and not Mx.sp_mv[zap, V_["move"]["spore"]], "썬더의 후보는 썬더가 배우는 기술만"
+    assert not Mx.sp_mv[V_["species"]["smeargle"]].any() and abs(float(gz["w"][0, 1, 0]) - 4 / (Vm - 3)) < 1e-4, "루브도는 제한 없음"
     qi = model._prob(opp_cat[..., 0], bl["item"])
     ps = qi[..., model.matchup.scarf]
     assert torch.allclose(qi.sum(-1), torch.ones(len(mask), 6), atol=1e-5) and ps.shape == (len(mask), 6) and ((ps >= 0) & (ps <= 1)).all()

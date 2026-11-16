@@ -25,6 +25,12 @@ def feed(rev, b, *lines):
 r, b = RevealTracker(), battle(mon("garchomp"), mon("heatran"))
 feed(r, b, "|-heal|p2a: Heatran|50/100|[from] item: Leftovers", "|-activate|p2a: Heatran|ability: Flash Fire")
 assert r.known_item("opp", "heatran") == "leftovers" and r.known_ability("opp", "heatran") == "flashfire"
+# 흡수 특성 회복: [of]는 기술을 쓴 쪽. 특성 주인은 회복한 쪽 (내 저수가 발동했다고 상대에게 저수를 붙이면 안 됨)
+r2, b2 = RevealTracker(), battle(mon("vaporeon"), mon("toxapex"))
+feed(r2, b2, "|-heal|p1a: Vaporeon|100/100|[from] ability: Water Absorb|[of] p2a: Toxapex")
+assert r2.known_ability("opp", "toxapex") is None and r2.known_ability("me", "vaporeon") == "waterabsorb"
+feed(r2, b2, "|-damage|p1a: Vaporeon|80/100|[from] ability: Rough Skin|[of] p2a: Toxapex")
+assert r2.known_ability("opp", "toxapex") == "roughskin", "접촉 피해 특성은 [of]가 주인"
 feed(r, b, "|-activate|p2a: Heatran|move: Poltergeist|Life Orb")
 assert r.known_item("opp", "heatran") == "lifeorb"
 feed(r, b, "|-damage|p1a: Garchomp|90/100|[from] item: Rocky Helmet|[of] p2a: Heatran")        # [of] 가 주인
@@ -42,15 +48,27 @@ feed(r, b, "|switch|p2a: Rillaboom|Rillaboom, M|100/100", "|-damage|p2a: Rillabo
 assert r.known_item("opp", "rillaboom") is None and "rillaboom" in r.impossible_boots
 
 # 3) 구애 스카프: 같은 우선도, 상대가 먼저 움직였는데 최대 속도 가정으로도 내(spe 300)가 더 빠르면 스카프. 서로 다른 기술을 쓰면 취소
+# 속도는 기술을 쓴 시점의 값(EventTracker.turn_first: 쪽 -> (쪽, 속도, 우선도, 트릭룸, 종, 우선도 변경 가능))으로 비교: 상대는 표준 2b+99
+first = lambda me_spe, opp_spe, tr=False: NS(turn_first={"me": ("me", me_spe, 0, tr, "garchomp", False), "opp": ("opp", opp_spe, 0, tr, "slowpoke", False)})
 slow = mon("slowpoke", spe=15)
 r, b = RevealTracker(), battle(mon("garchomp", spe=300), slow)
+b._ev = first(300, 129)
 feed(r, b, "|move|p2a: Slowpoke|Tackle|p1a: Garchomp", "|move|p1a: Garchomp|Tackle|p2a: Slowpoke", "|turn|2")
 assert r.known_item("opp", "slowpoke") == "choicescarf"
 feed(r, b, "|move|p2a: Slowpoke|Surf|p1a: Garchomp")
 assert r.known_item("opp", "slowpoke") is None and r.can_choice["slowpoke"] is False
 r, b = RevealTracker(), battle(mon("garchomp", spe=100), mon("slowpoke", spe=100))                # 내가 더 빠르지 않으면 추론 안 함
+b._ev = first(100, 299)
 feed(r, b, "|move|p2a: Slowpoke|Tackle|p1a: Garchomp", "|move|p1a: Garchomp|Tackle|p2a: Slowpoke", "|turn|2")
 assert r.known_item("opp", "slowpoke") is None
+for ev, why in ((first(140, 129), "상대가 최대 속도(129 x 1.1)면 더 빠를 수 있음"), (first(300, 129, tr=True), "트릭룸에서는 추론 안 함"),
+                (first(135, 129), "턴이 끝난 뒤 내 속도가 올랐어도(아래 boosts) 기술을 쓴 시점의 135로는 근거 부족")):
+    me = mon("garchomp", spe=150)
+    me.boosts = {"spe": 2}
+    r, b = RevealTracker(), battle(me, mon("slowpoke", spe=15))
+    b._ev = ev
+    feed(r, b, "|move|p2a: Slowpoke|Tackle|p1a: Garchomp", "|move|p1a: Garchomp|Tackle|p2a: Slowpoke", "|turn|2")
+    assert r.known_item("opp", "slowpoke") is None, why
 
 # 4) 재생력: 나갔다 들어왔더니 HP가 회복돼 있고 가능한 특성에 재생력이 있으면
 reg = mon("slowking", hp=0.5, abilities=["Oblivious", "Regenerator"])

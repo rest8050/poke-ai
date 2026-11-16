@@ -8,7 +8,7 @@ import warnings
 
 import numpy as np
 
-from src.core.matchup_v7 import MatchupV7
+from src.core.matchup_v7 import SPE_BUCKETS, MatchupV7
 from src.core.tensor_encoder import EFFECT_DIM, EFFECT_START, FIELD_DIM, MOVE_EFFECT_DIM, MOVE_NUM_DIM, NUM_DIM, extract_move_features, move_effect_features, _move_obj
 
 
@@ -223,6 +223,8 @@ class SetBelief(nn.Module):
         self.item = nn.Linear(hidden, vv["item"]["<unk>"] + 2)
         self.ability = nn.Linear(hidden, vv["ability"]["<unk>"] + 2)
         self.stat = nn.Linear(hidden, 6)
+        self.spe = nn.Linear(hidden, SPE_BUCKETS)                    # 스피드 세트 구간 로짓 (matchup_v7.speed_bucket_ratio 순서). 정답은 배틀 데이터의 상대 실제 스피드 (hidden_labels)
+        self.register_buffer("spe_on", torch.zeros(()))              # 1 = spe 헤드를 학습함 (학습기가 켬). 0인 옛 체크포인트는 예전처럼 stat의 스피드 배율 하나로 계산
 
     def forward(self, opp_cat, opp_num):
         cat = opp_cat.long()
@@ -238,7 +240,7 @@ class SetBelief(nn.Module):
                        self.ability_emb(cat[..., 1].clamp(0, self.ability_emb.num_embeddings - 1)),
                        moves, valid.sum(-1, keepdim=True).float() / 4.0, opp_num[..., :11], opp_num[..., 18:self.num_dim]], -1)
         h = self.net(x)
-        return {"move": self.move(h), "item": self.item(h), "ability": self.ability(h), "stat": self.stat(h)}
+        return {"move": self.move(h), "item": self.item(h), "ability": self.ability(h), "stat": self.stat(h), "spe": self.spe(h)}
 
 
 # 3차원 어텐션 마스크(헤드별 편향)는 추론용 빠른 커널에서 학습 경로와 값이 달라짐(CLS 기준 2e-3) → 학습과 같은 일반 경로만 쓰도록 끔
@@ -247,7 +249,7 @@ torch.backends.mha.set_fastpath_enabled(False)
 N_TOK = 64            # 포켓몬 12 + 기술 48 + 필드 3 + CLS 1
 MV_EXTRA = 4            # 기술 토큰 추가 수치: 배율, 데미지, KO + 선공 기대값 fm
 BASE_IN = 177 + NUM_DIM         # 포켓몬 토큰 기본 입력 차원 (종족값 투영 64 + 도구/특성/타입/상태/테라 임베딩 + 배틀 수치 + 이벤트 증거)
-K_GUESS = 12          # 마리당 후보 기술 수 (숨은 기술 재현율: 상위 4 0.73 / 상위 8 0.94 / 상위 12 0.98)
+K_GUESS = 12          # 마리당 후보 기술 수 (숨은 기술 재현율, 나중에 드러난 기술 기준: 상위 4 0.73 / 8 0.94 / 12 0.98. 실제 세트 기준(v9, 활성, 습득 기술 표 적용): 0.70 / 0.91 / 0.97)
 PLAUSIBLE = 0.15      # 이 이상의 세트 포함 확률이면 "그럴듯한" 후보
 MULT_RANGE = (0.6, 1.25)
 LEG_G = 8 + 6 + 3 + 2    # 합법 비트 8(기술 4 + 테라 4) + 플래그 6 + 사용 가능한 기술만의 공격 요약 3 + 고정으로 잃은 화력 2
@@ -397,7 +399,8 @@ class EntityPokemonNetV8(nn.Module):
             known.scatter_(2, torch.where((cur >= 1) & (cur < unk), cur, torch.zeros_like(cur)).clamp(0, V - 1), True)
             bad = torch.zeros(V, dtype=torch.bool, device=lg.device)
             bad[0], bad[unk:] = True, True
-            prob = torch.softmax(lg.masked_fill(known | bad, -1e4), -1)
+            can = self.matchup.sp_mv[opp_cat[..., 10].clamp(0, self.matchup.sp_mv.size(0) - 1)]          # 종이 배울 수 있는 기술만 후보 (표가 빈 종은 제한 없음)
+            prob = torch.softmax(lg.masked_fill(known | bad | (~can & can.any(-1, keepdim=True)), -1e4), -1)
             present = opp_num[..., 11] > 0
             n_unrev = ((opp_mv.abs().sum(-1) == 0) & present[..., None]).sum(-1, keepdim=True).float()      # [B,6,1]
             topv, idx = prob.topk(K_GUESS, -1)
@@ -421,13 +424,16 @@ class EntityPokemonNetV8(nn.Module):
         return torch.cat([leg[:, :8], torch.stack([n_normal / 4.0, n_attack / 4.0, n_sw / 5.0, leg[:, 4:8].amax(1), one_move, lock], -1), legal_off, lost], -1)
 
     @staticmethod
-    def _prob(ids, logits):
-        """상대 특성/도구 분포 [B,6,V]: 공개된 값은 원핫, 아니면 세트 추정 softmax (빈칸/<unk>/숨김 제외). ids [B,6], logits [B,6,V] (V = <unk>+2)"""
+    def _prob(ids, logits, allow=None):
+        """상대 특성/도구 분포 [B,6,V]: 공개된 값은 원핫, 아니면 세트 추정 softmax (빈칸/<unk>/숨김 제외). ids [B,6], logits [B,6,V] (V = <unk>+2)
+        allow [B,6,V] bool: 숨은 값의 후보를 이것으로 제한 (한 칸도 True가 없는 줄은 제한하지 않음)"""
         lg = logits.detach().float().clone()
         unk = lg.size(-1) - 2
         lg[..., 0] = -1e9
         lg[..., unk:] = -1e9
-        known = (ids >= 1) & (ids < unk)
+        if allow is not None:
+            lg = lg.masked_fill(~allow & allow.any(-1, keepdim=True), -1e9)
+        known = (ids >= 0) & (ids < unk)                    # 0 = 없다고 확인됨(소모/탁쳐서떨구기)도 확정: 원핫(0)이라 어떤 도구 확률도 0 (예전에는 추정 확률이 남아 스카프 확률이 붙었음)
         return torch.where(known[..., None], F.one_hot(ids.clamp(0, lg.size(-1) - 1), lg.size(-1)).float(), torch.softmax(lg, -1))
 
     def _expected_emb(self, kind, ids, q, B):
@@ -442,11 +448,11 @@ class EntityPokemonNetV8(nn.Module):
         expected = (q @ w[: q.size(-1)].to(q.dtype)).to(e.dtype)
         return torch.cat([e[:, :6], torch.where(hidden, expected, e[:, 6:])], 1).view(B * 12, -1)
 
-    def _matchup_feats(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, guess, mult, stat, field_vec, q_opp, p_scarf, p_item):
+    def _matchup_feats(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, guess, mult, stat, field_vec, q_opp, p_scarf, p_item, p_spe=None, p_order=None):
         B, K = my_cat.size(0), K_GUESS
         ar = torch.arange(B, device=my_cat.device)
         with torch.no_grad():
-            M = self.matchup(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, field_vec, q_opp, p_scarf, mult, opp_item_p=p_item)
+            M = self.matchup(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, field_vec, q_opp, p_scarf, mult, opp_item_p=p_item, opp_spe_p=p_spe, opp_order_p=p_order)
             D, O, ent, entry_opp = M["def"], M["off"], M["entry_frac"], M["entry_opp"]    # 공개된 기술만 [B,6,24,4]
             Dp = self.matchup._pair(opp_cat, opp_num, guess["pseudo"], False, q_opp, my_cat, my_num, True, self.matchup._onehot(my_cat),
                                     att_mult=mult, entry=ent, cand_f=(entry_opp[..., 0], entry_opp[..., 1]), mid=guess["idx"], field=field_vec, att_item_p=p_item)     # [B,6(내),6K,4]
@@ -479,9 +485,15 @@ class EntityPokemonNetV8(nn.Module):
         mvn = torch.cat([my_move_num, opp_move_num], 1).reshape(B * 12, 4, -1)
         E = self.embeddings
         belief_logits = self.belief(opp_team_cat, opp_team_num)
-        q_opp, q_item = self._prob(opp_team_cat[..., 1], belief_logits["ability"]), self._prob(opp_team_cat[..., 0], belief_logits["item"])
+        # 숨은 특성의 후보: 종이 가질 수 있는 특성만, 이미 등장한 포켓몬(수치 18번 '프리뷰로만 보임'이 0)은 등장 알림 특성 제외 (알림이 떴다면 공개됐을 것)
+        # ponytail: 화학변화가스가 깔린 동안 등장해 알림이 막힌 경우는 구분하지 않음. 문제가 되면 추적기에서 따로 표시
+        M_ = self.matchup
+        ab_allow = M_.sp_ab[opp_team_cat[..., 10].clamp(0, M_.sp_ab.size(0) - 1)] & ~(M_.ab_announce & (opp_team_num[..., 18:19] < 0.5))
+        q_opp, q_item = self._prob(opp_team_cat[..., 1], belief_logits["ability"], ab_allow), self._prob(opp_team_cat[..., 0], belief_logits["item"])
         p_scarf = q_item[..., self.matchup.scarf]
-        p_item = q_item[..., self.matchup.item4]      # [B,6,4] 상대의 구애머리띠/안경/생명의구슬/돌격조끼 확률 -> 데미지 계산의 기대 배율 (숨은 도구에만 쓰임)
+        p_order = q_item[..., self.matchup.order_items]      # [B,6,4] 상대의 선제공격손톱/후공열매/뒤처지는꼬리/만복향로 확률
+        p_spe = torch.softmax(belief_logits["spe"].detach().float(), -1) if self.belief.spe_on > 0 else None      # [B,6,5] 상대 스피드 세트 구간 확률
+        p_item = q_item[..., self.matchup.prob_items]      # [B,6,7] 상대의 구애머리띠/안경/생명의구슬/돌격조끼/진화의휘석/기합의띠/두꺼운부츠 확률 -> 데미지 계산의 기대 배율 (숨은 도구에만 쓰임)
         parts = [E.species_proj(num[:, 11:18]), self._expected_emb("item", cat[:, 0], q_item, B), self._expected_emb("ability", cat[:, 1], q_opp, B),
                  E.type_embed(cat[:, 2]), E.type_embed(cat[:, 3]), E.status_embed(cat[:, 4]), E.type_embed(cat[:, 9]), num[:, :11], num[:, 18:]]
         raw = E._emb("move", cat[:, 5:9])
@@ -491,7 +503,7 @@ class EntityPokemonNetV8(nn.Module):
         mult = torch.exp(STAT_SCALE * stat).clamp(*MULT_RANGE)
         guess = self._top_guess(belief_logits, opp_team_cat, opp_move_num, opp_team_num)
         D, O, H, mon_extra, mv_extra, cand, ar, act_m, exit_heal = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
-                                                                             opp_move_num, guess, mult, stat, field_vec, q_opp, p_scarf, p_item)
+                                                                             opp_move_num, guess, mult, stat, field_vec, q_opp, p_scarf, p_item, p_spe, p_order)
         opp_act = opp_team_num[:, :, 0].argmax(1)
         # ---- 합법성: 토큰 플래그 + 요약 ----
         leg = torch.ones(B, 22, device=dev) if legal is None else legal.float()
@@ -567,7 +579,7 @@ class EntityPokemonNetV8(nn.Module):
         policy_logits = torch.where(self.is_switch, lp_type[:, 1:2] + lp_switch, lp_type[:, 0:1] + lp_move)
         bl = enc["belief_logits"]
         out = {"policy_logits": policy_logits, "latent": latent, "value": self.value_head(latent),
-               "hid_move": bl["move"], "hid_item": bl["item"], "hid_ability": bl["ability"], "hid_stat": bl["stat"]}
+               "hid_move": bl["move"], "hid_item": bl["item"], "hid_ability": bl["ability"], "hid_stat": bl["stat"], "hid_spe": bl["spe"]}
         return out
 
     def forward(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec,
