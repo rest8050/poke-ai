@@ -36,6 +36,9 @@ lg["item"][..., 7] = 5.0; lg["stat"][..., 3] = np.log(236 / 299) / STAT_SCALE; l
 loss, st = hidden_loss(lg, b, UNK)
 assert st["item_n"] == 24 and st["ability_n"] == 24 and st["move_n"] == 96, st       # A, B 두 시점 x 2결정 x 6마리 (C는 팀을 못 찾아 빠짐)
 assert st["item_acc"] == 1.0 and st["stat_mae"] < 1e-4, st
+c2 = b["opp_team_cat"].clone(); c2[5, 0, 0] = 7                                          # C(실제 세트 없음)의 도구가 마지막 턴에 드러남
+assert hidden_loss(lg, {"opp_team_cat": c2, "opp_team_num": b["opp_team_num"], "seq_index": b["seq_index"]}, UNK)[1]["item_n"] == 1, "실제 세트를 안 쓰면 드러난 것이 정답"
+assert hidden_loss(lg, {**b, "opp_team_cat": c2}, UNK)[1]["item_n"] == 24, "실제 세트가 없는 판은 도구/특성 손실에서 빠짐"
 print("true sets OK")
 
 # 팀 프리뷰가 폼을 숨긴 내 포켓몬 (Greninja-*): 팀 파일의 폼 이름(greninjabond)으로도 세트를 찾아야 함
