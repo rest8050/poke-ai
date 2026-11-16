@@ -6,8 +6,11 @@
 필요 입력: b["opp_team_cat"] [N,6,11](0 도구, 1 특성, 5~8 기술, 10 종), b["seq_index"] [N] (결정이 배틀 순서대로 이어 붙어 있음)"""
 import json
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+
+from src.core.model import STAT_SCALE
 
 
 def vocab_sizes(path="data/vocab.json"):
@@ -48,11 +51,40 @@ def align_last(cat, last):
     return last.gather(1, j[..., None].expand(-1, -1, last.size(-1))), match.any(-1)
 
 
+def true_sets(data, offsets):
+    """시퀀스마다 상대 팀의 실제 세트 -> ([G,6,17] int16 (종 순서로 정렬), 찾았는가 [G] bool). 열 0~10 = 같은 판의 반대편 시퀀스 첫 결정의 my_team_cat, 11~16 = 실제 능력치 hp..spe.
+    반대편 후보 = 내 팀/상대 팀 종 6마리가 서로 뒤바뀌고 승패가 반대인 시퀀스 (상대 종은 마지막 결정 기준) 중, 내가 본 상대의 공개 기술이 전부 그 팀 기술에 들어 있는 것.
+    같은 두 팀의 다른 판도 후보에 들어오지만 팀이 같으면 세트도 같음 -> 후보들의 첫 결정이 전부 같을 때만 씀.
+    ponytail: 못 찾는 경우(프리뷰 이름만 남은 폼 'urshifu', 세트에 없는 기술이 드러남(흉내/발버둥), 로드한 데이터에 반대편이 없음)는 예전 라벨(배틀에서 드러난 것)로 남음"""
+    first, last = np.asarray(offsets[:-1]), np.asarray(offsets[1:]) - 1
+    my = np.concatenate([np.asarray(data["my_team_cat"][first]).astype(np.int16),
+                         np.round(np.asarray(data["my_team_num"][first][..., 11:17], dtype=np.float32) * 255).astype(np.int16)], -1)
+    my = np.take_along_axis(my, np.argsort(my[..., 10], 1)[..., None], 1)          # 종 순서로 정렬
+    opp = np.asarray(data["opp_team_cat"][last]).astype(np.int16)
+    opp = np.take_along_axis(opp, np.argsort(opp[..., 10], 1)[..., None], 1)
+    win = np.sign(np.asarray(data["outcome"])).astype(int)
+    unk = vocab_sizes()["move"]
+    by = {}
+    for g in range(len(first)):
+        by.setdefault((my[g, :, 10].tobytes(), opp[g, :, 10].tobytes(), int(win[g])), []).append(g)
+    out, ok = np.zeros_like(my), np.zeros(len(first), bool)
+    for g in range(len(first)):
+        rev = opp[g, :, 5:9]                                                       # [6,4] 내가 본 상대 기술 (종 순서가 후보의 내 팀과 같음)
+        seen = (rev >= 1) & (rev < unk)
+        c = [j for j in by.get((opp[g, :, 10].tobytes(), my[g, :, 10].tobytes(), -int(win[g])), ())
+             if ((rev[:, :, None] == my[j][:, None, 5:9]).any(-1) | ~seen).all()]
+        if c and all(np.array_equal(my[c[0]], my[j]) for j in c[1:]):
+            out[g], ok[g] = my[c[0]], True
+    return out, ok
+
+
 def hidden_loss(logits: dict, b: dict, unk: dict):
     """logits: {"move": [N,6,Vm], "item": [N,6,Vi], "ability": [N,6,Va]} -> (손실 합, 통계 dict)"""
     cat = b["opp_team_cat"].long()
     counts = torch.bincount(b["seq_index"])
     last = cat[(torch.cumsum(counts, 0) - 1)[b["seq_index"]]]                     # 각 결정이 속한 배틀의 마지막 턴 관측
+    if "true_set" in b:                                                            # 상대 팀의 실제 세트를 아는 판은 그것이 정답 (true_sets), 모르는 판은 드러난 것만
+        last = torch.where(b["true_ok"][b["seq_index"]][:, None, None], b["true_set"][b["seq_index"]], F.pad(last, (0, 6)))
     last, same = align_last(cat, last)                                             # 슬롯 i의 포켓몬이 마지막 턴에 있던 행 (같은 종/폼)
     total, stats = logits["move"].new_zeros(()), {}
     # 기술: 앞으로 드러날 기술들에 대한 CE (이미 드러난 기술은 후보에서 제외)
@@ -81,4 +113,12 @@ def hidden_loss(logits: dict, b: dict, unk: dict):
             total = total + (-(lpk.gather(2, f.clamp(0, lpk.size(-1) - 1)[..., None])[..., 0]) * ok).sum() / m
             stats[f"{key}_acc"] = ((lpk.argmax(-1) == f) & ok).sum().item() / m.item()
         stats[f"{key}_n"] = int(m)
+    if "stat" in logits and last.size(-1) > 11:                                    # 능력치 배율: 실제 능력치 / 표준 가정(252노력치, 무보정)의 로그 (pretrain_belief.stat_logratio와 같은 척도)
+        real, base = last[..., 11:17].float(), b["opp_team_num"][..., 11:17].float() * 255
+        ratio = real / torch.cat([2 * base[..., :1] + 204, 2 * base[..., 1:] + 99], -1)
+        ok = same[..., None] & (ratio > 0.4) & (ratio < 1.2)                       # 범위 밖 = 폼이 달라 종족값이 안 맞음/인코더가 미리 곱한 부스트에너지 -> 그 능력치만 뺌
+        if ok.any():
+            err = (logits["stat"].float() - torch.log(ratio.clamp_min(1e-3)) / STAT_SCALE)[ok]
+            total = total + 0.5 * (err ** 2).mean()                                # 0.5 = pretrain_belief.STAT_COEF
+            stats["stat_mae"] = err.abs().mean().item() * STAT_SCALE
     return total, stats

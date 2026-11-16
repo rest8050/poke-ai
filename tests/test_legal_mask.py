@@ -1,5 +1,5 @@
 """순수 합법 마스크 self-check: PYTHONPATH=. python tests/test_legal_mask.py
-1) 서버 요청 -> 22칸 마스크 (정상 / 구애 고정 / 기술 한 개만 남는 고정 / 교체 봉쇄 / PP 소진 / 강제 교체 / 폼 이름 접두사), 2) 인코더가 순수 합법 마스크(legal_mask)와 휴리스틱 가지치기 마스크(action_mask)를 따로 주고 후자가 전자의 부분집합"""
+1) 서버 요청 -> 22칸 마스크 (정상 / 구애 고정 / 기술 한 개만 남는 고정 / 교체 봉쇄 / PP 소진 / 강제 교체 / 폼 이름 접두사), 2) 인코더의 action_mask는 legal_mask와 같음 (휴리스틱 가지치기 제거됨)"""
 from src.core.tensor_encoder import BattleTensorEncoder, DummyBattle
 from src.training.replay_dataset import legal_from_request
 
@@ -37,5 +37,5 @@ assert bits(legal_from_request(fs, [], TEAM, "forced")) == "00000000" + "01" + "
 # 6) 인코더: 두 마스크가 따로 나오고 휴리스틱 마스크는 순수 합법의 부분집합
 t = BattleTensorEncoder(vocab_path="data/vocab.json").encode_battle(DummyBattle())
 assert len(t) == 9 and t[7].shape == t[8].shape == (1, 22)
-assert not (t[7].numpy() & ~t[8].numpy()).any(), "가지치기 마스크가 순수 합법 마스크를 벗어남"
+assert (t[7].numpy() == t[8].numpy()).all(), "action_mask가 legal_mask와 다름"
 print("legal mask OK")

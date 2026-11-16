@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from src.core.model import build_model, load_compatible, save_ckpt
 from src.evaluation.holdout import decision_pos
 from src.core.tensor_encoder import MOVE_NUM_DIM
-from src.training.hidden_labels import hidden_loss, vocab_sizes
+from src.training.hidden_labels import hidden_loss, true_sets, vocab_sizes
 from src.training.replay_dataset import OBS_KEYS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,6 +63,8 @@ def make_batches(data, offsets, idx, size, shuffle):
         # 히스토리 위치 = 결정 지점 번호: 라벨이 없어 빠진 결정 지점은 빈 칸으로 남아 실전(모든 결정을 이어 붙임)과 같은 번호가 됨
         b["time_index"] = torch.cat([torch.from_numpy(data["pos"][offsets[j]:offsets[j + 1]]).long() for j in sel]) if "pos" in data else torch.cat([torch.arange(n) for n in lens])
         b["n_seq"] = len(sel)
+        if "true_set" in data:           # 상대 팀의 실제 세트 (hidden_labels.true_sets): 숨김정보 손실의 정답
+            b["true_set"], b["true_ok"] = torch.from_numpy(data["true_set"][sel]).long(), torch.from_numpy(data["true_ok"][sel])
         yield b
 
 
@@ -111,6 +113,8 @@ def run(model, data, offsets, idx, args, train, opt=None):
                 if train and args.hard_weight != 1:        # 중요한 결정(Q* - 최저Q >= HARD_STAKES)의 학습 손실 가중. 평균 가중 1로 정규화해 학습률 효과는 그대로
                     w = torch.where(valid & (gap.max(-1).values >= HARD_STAKES), torch.full_like(w, args.hard_weight), w)
                 reg_arg = gap.gather(-1, logp.argmax(-1, keepdim=True)).squeeze(-1)              # argmax 선택의 손해 (평가/체크포인트 선택용)
+                if train and args.err_weight:              # 학생이 지금 틀리는 결정에 가중: w *= 1 + α·min(regret/0.05, 3). 현재 모델 기준(매 배치 재계산), 가중 평균 1로 정규화돼 학습률 효과 그대로
+                    w = w * (1 + args.err_weight * (reg_arg.detach() / 0.05).clamp(max=3) * valid)
             v = F.mse_loss(out["value"].view(-1), b["value_target"])           # 기록/비교용: 항상 할인된 결과 기준
             if args.teacher_value_mix == 0:
                 v_loss = v
@@ -120,9 +124,11 @@ def run(model, data, offsets, idx, args, train, opt=None):
             pg = pg_loss(logp, b, b["value_target"] - out["value"].view(-1).detach())
             hid = ce.new_zeros(())
             if "hid_move" in out:      # 상대의 숨겨진 기술/도구/특성 예측 보조 손실 (정답: 같은 배틀에서 나중에 드러난 것)
-                hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"]}, b, UNK)
+                hid, hs = hidden_loss({"move": out["hid_move"], "item": out["hid_item"], "ability": out["hid_ability"], "stat": out["hid_stat"]}, b, UNK)
                 tot["hid_top4"] += hs.get("move_top4", 0.0) * hs["move_n"]; tot["hid_nb"] += hs["move_n"]
             loss = (w * ce_i).sum() / w.sum() + args.value_coef * v_loss + args.pg_coef * pg + HIDDEN_COEF * hid
+            if train and args.cost_weight and "q_mean" in b:   # 비용 민감 항: 학생 정책의 기대 regret Σπ(a)·gap(a). 동점 행동으로 새는 확률은 벌점 ~0, 해로운 행동만 벌점
+                loss = loss + args.cost_weight * ((logp.exp() * gap).sum(-1) * valid).sum() / valid.sum().clamp_min(1)
         if train:
             # ponytail: --accum k면 배틀 32개를 k개로 나눠 기울기를 누적(VRAM 절약). 미세 배치를 같은 가중으로 평균(결정 수 차이는 무시), 에폭 끝의 덜 찬 묶음은 버림
             if bi % args.accum == 0:
@@ -218,6 +224,8 @@ def main(args):
     data, offsets, lens, files = load(args.data)
     if args.teacher_value_mix > 0 and "teacher_value" not in data:
         raise SystemExit("❌ --teacher-value-mix에는 교사 가치(teacher_value)가 든 npz가 하나는 있어야 함 (build_fp_dataset.py로 만든 새 형식)")
+    data["true_set"], data["true_ok"] = true_sets(data, offsets)
+    print(f"상대 실제 세트를 찾은 판 {data['true_ok'].mean():.3f} (나머지는 배틀에서 드러난 것만 정답)")
     val, train = split_ids(data, offsets, VAL_FRAC)
     print(f"데이터 파일 {len(files)}개 | {len(lens)}판 / 결정 {int(lens.sum())}개 → 학습 {len(train)}판, 검증 {len(val)}판 (같은 배틀의 양쪽 시점은 같은 쪽)")
 
@@ -282,6 +290,8 @@ if __name__ == "__main__":
     ap.add_argument("--init", default="", help="시작 가중치 체크포인트 (기본: 처음부터)")
     ap.add_argument("--lr", type=float, default=LR, help="피크 학습률 (이어서 학습할 때는 낮게)")
     ap.add_argument("--hard-weight", type=float, default=1.0, help="중요도(Q* - 최저Q) >= 0.3인 결정의 정책 손실 가중 (1=끔). Q가 든 데이터만")
+    ap.add_argument("--err-weight", type=float, default=0.0, help="학생 argmax의 손해(regret)가 큰 결정의 정책 손실 가중 α (0=끔). Q가 든 데이터만")
+    ap.add_argument("--cost-weight", type=float, default=0.0, help="학생 정책의 기대 regret Σπ(a)·gap(a) 항의 계수 λ (0=끔). Q가 든 데이터만")
     ap.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (기본 1e-4)")
     ap.add_argument("--value-coef", type=float, default=VALUE_COEF, help="가치 손실 가중치 (기본 0.25). 0이면 가치 헤드는 학습 안 되니 --pg-coef 0도 같이 (PG 기준선이 가치 예측)")
     ap.add_argument("--pg-coef", type=float, default=0.05, help="실제 승패(할인된 결과 − 가치 예측 = advantage) 기반 정책 그라디언트 보조 손실 가중치 (0=끔)")

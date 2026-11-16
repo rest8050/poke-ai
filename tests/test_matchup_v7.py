@@ -100,6 +100,7 @@ def first(my_extra=None, field=None, opp_extra=None, move=(50, 0, "phys", "norma
 assert first() == -1.0
 assert first({"ab": "chlorophyll"}, {0: 1.0}) == 1.0 and first({"ab": "chlorophyll"}, {2: 1.0}) == -1.0     # 쾌청에서만
 assert first({"ab": "swiftswim"}, {2: 1.0}) == 1.0 and first({"ab": "swiftswim"}, {0: 1.0}) == -1.0         # 비에서만
+assert first({"ab": "sandrush"}, {4: 1.0}) == 1.0 and first({"ab": "sandrush"}, {0: 1.0}) == -1.0 and first({"ab": "slushrush"}, {6: 1.0}) == 1.0 and first({"ab": "surgesurfer"}, {12: 1.0}) == 1.0     # 모래/눈/일렉트릭필드에서만
 assert first({"item": "choicescarf"}) == 1.0                                                                # x1.5 = 300 > 299
 assert first({"stage": {7: 1}}) == 1.0                                                                      # +1 랭크 x1.5
 assert first(field={26: 1.0}) == 1.0                                                                        # 내 쪽 순풍
@@ -119,7 +120,7 @@ assert first({"ab": "prankster"}, opp_extra={"types": ("dark",)}, move=(0, 0, "s
 assert first({"ab": "prankster"}, move=(50, 0, "phys", "normal")) == -1.0
 fast_opp = lambda pri: float(run([active(stats=(100, 100, 100, 100, 100, 400), moves=[(50, 0, "phys", "normal")])],
                                  [active(stats=(100, 100, 100, 100, 100, 100), types=("normal",), moves=[(50, pri, "phys", "normal")])])["fm_my"][0, 0, 0])
-assert fast_opp(0) == 1.0 and fast_opp(1) == -1.0                                                           # 상대가 우선기를 드러냄
+assert fast_opp(0) == 1.0 and fast_opp(1) == 1.0                                                            # 상대가 우선기를 드러내도 내 기술의 fm은 스피드 기준 그대로 (그 우선기 칸의 fm_opp가 +1)
 
 # 6) 상대 특성 확률: 엽록소 0.5(쾌청) -> 내 400은 299를 이기고 598에는 짐 -> 기대값 0
 mc, mn, mm = team([active(stats=(100, 100, 100, 100, 100, 400), moves=[(50, 0, "phys", "normal")])], True)
@@ -143,6 +144,7 @@ assert torch.allclose(intim("clearbody")[0], torch.ones(3)) and torch.allclose(i
 assert torch.allclose(intim("defiant")[0], torch.tensor([1.5, 1.0, 1.0]))                                    # -1 후 +2 = +1 랭크
 assert torch.allclose(intim("competitive")[0], torch.tensor([2 / 3, 2.0, 1.0]))
 assert torch.allclose(intim("rattled")[0], torch.tensor([2 / 3, 1.0, 1.5]))
+assert torch.allclose(intim("contrary")[0], torch.tensor([1.5, 1.0, 1.0])) and torch.allclose(intim("simple")[0], torch.tensor([0.5, 1.0, 1.0]))      # 우회전 +1 / 단순 -2
 assert torch.allclose(intim("levitate", cand_ab="levitate")[0], torch.ones(3)) and torch.allclose(intim("levitate", cand_active=True)[0], torch.ones(3))
 q = torch.zeros(1, 6, A); q[0, 0, AB["clearbody"]] = 0.5; q[0, 0, AB["levitate"]] = 0.5
 out = run([active(stats=(100, 100, 100, 100, 100, 100)), dict(ab="intimidate", stats=(300, 60, 60, 60, 60, 60))],
@@ -198,4 +200,10 @@ snor = {"species": "snorlax", "tera": "normal"}
 assert close(dm(snor), want(mult=2.0)) and close(dm(snor, move=(40, 0, "phys", "normal")), want(bp=60, mult=2.0))
 assert close(dm({"species": "snorlax", "tera": "fire"}, move=(80, 0, "phys", "fire")), want(mult=1.5)) and close(dm({"species": "snorlax", "tera": "fire"}), want())
 assert close(dm({**snor, "ab": "adaptability"}), want(mult=2.25))
+# 12) 중력: 땅 기술이 비행 타입/부유에 맞음, 날씨볼은 클라우드나인 상대면 날씨 무시
+eq = lambda dfn, field=None: float(run([active(stats=ME, moves=[(100, 0, "phys", "ground")])], [active(stats=(100, 80, 80, 80, 80, 80), **dfn)], field)["off"][0, 0, 0, 1])
+assert eq(dict(types=("flying",))) == 0.0 and eq(dict(types=("flying",)), {46: 1.0}) > 0
+assert eq(dict(types=("normal",), ab="levitate")) == 0.0 and eq(dict(types=("normal",), ab="levitate"), {46: 1.0}) > 0
+wb = lambda ab=None, field=None: float(run([active(stats=ME, moves=[(50, 0, "spec", "normal", "weatherball")])], [active(types=("normal",), stats=(100, 80, 80, 80, 80, 80), ab=ab)], field)["off"][0, 0, 0, 1])
+assert wb(field={0: 1.0}) > wb() and abs(wb("cloudnine", {0: 1.0}) - wb("cloudnine")) < 1e-6
 print("matchup v7 OK")

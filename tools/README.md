@@ -17,71 +17,13 @@ done                                              # 끄기
 ```
 작업 끝나면 항상 꺼둘 것.
 
-## 1. 팀 풀 준비 (한 번만, 또는 풀 바뀔 때만)
+## 1. 팀 풀 준비
 
-```bash
-node tools/filter_teams.js --dir data/metamon/teams/gen9ou --format gen9ou --holdout 500 --seed 42
-# → data/team_pool_metamon.json (학습), data/team_pool_metamon_holdout.json (평가 A)
-
-node tools/make_party_pools.js --n 500 --seed 7
-# → data/team_pool_rare.json, data/team_pool_randomset.json (평가 전용 B/C)
-
-node tools/make_party_pools.js --seed 11 --suffix _train --plain \
-  --avoid data/team_pool_rare.json,data/team_pool_randomset.json --train-a 2000
-# → data/team_pool_rare_train.json, data/team_pool_randomset_train.json, data/team_pool_train_a.json (학습용, 평가 풀과 안 겹침)
-```
-
-새 학습 풀 (2026-09-28, 기존 풀이 팀당 10~43회 재사용돼서 교체. 평가 풀 및 이전 학습 풀과 겹치지 않음을 확인함):
-```bash
-node tools/make_party_pools.js --n 2000 --seed 17 --suffix _train3 --plain --train-a 3000 --train-a-out data/team_pool_train_a2.json   --avoid data/team_pool_rare.json,data/team_pool_randomset.json,data/team_pool_rare_train.json,data/team_pool_rare_train2.json,data/team_pool_train_a.json
-# → data/team_pool_train_a2.json(3000) / rare_train3.json(2000) / randomset_train3.json(2000)
-python tools/export_fp_teams.py data/team_pool_train_a2.json train_a2
-python tools/export_fp_teams.py data/team_pool_rare_train3.json rare_train3
-python tools/export_fp_teams.py data/team_pool_randomset_train3.json randomset_train3
-```
-옛 randomset_train/randomset_train2 풀 파일과 FP 폴더는 삭제함(C는 랜덤 세트라 재생성). train_a/rare_train/rare_train2는 비교 실증용으로 유지.
-
-Foul Play가 team-preview에 쓸 팀 폴더로 내보내기 (풀 새로 만들 때마다):
-```bash
-python tools/export_fp_teams.py data/team_pool_train_a.json train_a
-python tools/export_fp_teams.py data/team_pool_rare_train.json rare_train
-python tools/export_fp_teams.py data/team_pool_randomset_train.json randomset_train
-```
-
-엔티티(도구/특성/기술) 특징 표 재생성 (Showdown 데이터 바뀌었을 때만):
-```bash
-node tools/dump_entities.js
-python tools/build_entity_features.py
-```
-
-## 2. BC 학습
-
-BC 학습 코드(`train_bc.py`)는 정리해서 삭제함. 현재 계보는 Foul Play 증류만 이어가며 BC 원본 체크포인트도 삭제함. 코드가 필요하면 GitHub 커밋 `ee0df15`에 있음.
-
-## 3. Foul Play 데이터 수집 (탐색 교사 데이터)
-
-**2026-09-28부터 탐색 300ms로만 수집한다.** 100ms는 라벨이 가끔 틀린다(예: 필드에 트릭룸이 이미 켜져 있는데
-또 쓰는 걸 100ms 교사가 가끔 고름 → 300ms로 재생하면 정정됨, `tests/test_trickroom_guard.py` 관련 조사 참고).
-기존 100ms 누적 데이터(`data/fp_selfplay/ms100/`)는 이미 쌓인 양이 많아서 버리지 않고 계속 학습에 섞지만,
-**새로 수집하는 건 전부 ms300**. 시간이 3배라 판 수는 줄여서 조정.
-
-FP vs FP 자가대전 (약한 상대 편향 없는 강한 데이터):
-```bash
-# 풀마다 한 번씩 실행. A는 판이 길고(평균 39턴 vs 25~30턴) 1쌍이라 전체 소요시간을 결정함 → A는 B/C의 절반 남짓 판수(1쌍x400판 ≈ 4.2h < B/C 6.5h라 병목 아님, 판수 비중 ~7%) (sp12: A 667판이 7h, B/C 667판x4쌍은 6h)
-# (2026-09-28 풀 교체: train_a→train_a2 / rare_train2→rare_train3 / randomset_train*→randomset_train3, 아래 "새 학습 풀" 참고)
-bash tools/fp_selfplay.sh 1 400 300 sp13a train_a2
-bash tools/fp_selfplay.sh 4 700 300 sp13b rare_train3
-bash tools/fp_selfplay.sh 4 700 300 sp13c randomset_train3
-```
-
+풀 생성은 `tools/make_party_pools.js`(풀 JSON, `--avoid`로 기존·평가 풀과 겹침 방지)와 `tools/export_fp_teams.py`(FP 팀 폴더)로 한다. 2026-11-12에 삭제했다가 2026-11-14에 git에서 복원함(filter_teams.js는 삭제 유지). 최신 학습 풀: train_a3·rare_train4·randomset_train4(시드 19). 풀 파일(data/team_pool_*.json)과 FP 팀 폴더는 그대로 쓴다. 풀 구성: metamon(학습)/metamon_holdout(평가 A), rare·randomset(평가 B/C), *_train*·train_a*(학습용, 평가 풀과 겹치지 않음).
 
 ### Uber/AG 종 커버 데이터 (OU에서 금지된 종, 2026-09-29 준비)
 Metamon 등 공개 데이터에는 Gen9 Ubers/AG가 없어서 직접 만든다. 형식은 `gen9anythinggoes`(Uber+AG 종 모두 합법). 팀은 랜덤배틀 세트 방식(팀당 Uber/AG 종 3마리 이상).
 ```bash
-node tools/make_party_pools.js --n 300 --seed 22 --suffix _uber_eval --plain --format gen9anythinggoes --uber-min 3 --only-randomset 1
-node tools/make_party_pools.js --n 2000 --seed 23 --suffix _uber_train --plain --format gen9anythinggoes --uber-min 3 --only-randomset 1 --avoid data/team_pool_randomset_uber_eval.json
-python tools/export_fp_teams.py data/team_pool_randomset_uber_train.json uber_train
-python tools/export_fp_teams.py data/team_pool_randomset_uber_eval.json uber_eval
 # 수집 (FORMAT 환경변수로 형식 지정; 평가용 uber_eval은 학습에 쓰지 말 것)
 FORMAT=gen9anythinggoes bash tools/fp_selfplay.sh 4 <판수> 300 <태그> uber_train
 ```
@@ -99,7 +41,7 @@ python src/training/train_fp_distill.py --data "data/fp_selfplay/ms300/fp_data*.
   --out checkpoints/supervised_v2_fp_next.pt   # 처음부터 학습: 피크 lr 1e-3 + 웜업 5% + 코사인 감쇠, 6에폭, 구조 v8. 세트 추정은 checkpoints/belief_<NUM_DIM>.pt(pretrain_belief.py)를 불러옴
 ```
 수집이 끝난 원본 결정기록(`dec_*.jsonl`)은 `python tools/compress_raw.py <폴더>`로 압축해 보관한다(해시 검증 후 원본 삭제, 약 12배 작아짐). 빌더는 같은 패턴(`dec_sp12[abc]_*.jsonl`)으로 `.gz`도 읽는다.
-npz 데이터셋은 `savez_compressed`로 저장한다(빌더·holdout 기본). 예전 무압축 npz는 `python tools/compress_npz.py <파일들>`로 무손실 변환(배열 동일 확인 후 교체, 약 60배 작아짐, 로드 1~2초).
+npz 데이터셋은 `savez_compressed`로 저장한다(빌더·holdout 기본).
 
 증류는 누적 전체 데이터로 처음부터 학습한다 (워밍스타트와 KL 항은 지움: v6/v7/v8 모두 처음부터, KL 0). `--out`이 기존 체크포인트 이름이면 덮어쓰니 다른 이름을 쓸 것.
 
@@ -129,8 +71,6 @@ python tools/entropy_eval.py --models v9 --sets data/dagger/dg5.npz,data/dagger/
 python tools/regret_eval.py --models v8_full,v9 --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz
 # regret 분해: 학생 regret이 어떤 결정에 몰려 있나 (교사 선택 종류/턴/벤치 수/강제 교체/결정 중요도/교사 확신/드러난 상대 기술 수별 평균 regret과 전체 몫)
 python tools/regret_breakdown.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
-# 실패 사례 읽기: 학생이 크게 틀린 결정(regret >= 0.15)을 무작위로 N개 뽑아 활성/벤치/필드/교사와 학생의 상위 행동과 Q를 읽을 수 있게 출력. CPU로 됨
-python tools/failure_cases.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz --n 30 --seed 0
 # 교체 이유 분석: 상대 활성의 공개 기술 수별 교체 판별 AUC/regret, 세계(상대 세트 표본)별 교체 이득의 일관성. 세계별 가치는 world_q.py가 원본 결정기록에서 따로 만듦 (d7/d6만 가능)
 python tools/world_q.py --decisions "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --npz data/dagger/d7_ho.npz --out data/dagger/d7_ho_worlds.npz
 # 쌍 비교: 같은 결정에서 두 모델의 KL/일치/regret 차이를 "규칙이 닿는 결정" 범주(특성, 위협 후보, 스피드 상황)별로 판 단위 부트스트랩 (묶음별 표보다 민감). q가 든 npz만 가능

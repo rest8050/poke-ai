@@ -143,7 +143,7 @@ def get_dynamic_turns(val: Any, effect_name: str, current_turn: int, battle: Any
                 held_items.add(re.sub(r'[^a-z0-9]', '', it))
 
     # 3. 효과별 동적 최대 지속 턴 (Max Duration) 결정
-    if any(k in eff_str for k in ["sun", "sunny", "rain", "sand", "hail", "snow"]):
+    if "terrain" not in eff_str and any(k in eff_str for k in ["sun", "sunny", "rain", "sand", "hail", "snow"]):      # "terrain" 안에 "rain"이 들어 있어 지형이 날씨 분기로 샌 버그 방지
         if "heatrock" in held_items and "sun" in eff_str:
             max_duration = 8.0
         elif "damprock" in held_items and "rain" in eff_str:
@@ -662,7 +662,7 @@ class BattleTensorEncoder:
         
         field_vec = np.zeros((1, FIELD_DIM), dtype=np.float32)
         action_mask = np.zeros((1, 22), dtype=bool)
-        legal_mask = np.zeros((1, 22), dtype=bool)     # 서버 요청이 알려 준 순수 합법성 (모델 입력 특징용). action_mask = 여기에 휴리스틱 가지치기를 더한 것 (로짓 마스킹 전용)
+        legal_mask = np.zeros((1, 22), dtype=bool)     # 서버 요청이 알려 준 순수 합법성 (모델 입력 특징용). action_mask는 이것과 같은 값 (로짓 마스킹 전용, 가지치기 없음)
         ev = battle.__dict__.get("_ev")  # 턴 사건/상대 증거/도구·특성 추적 (events.py, events.py가 parse_message에서 채움)
 
         if not hasattr(battle, "team") or not battle.team:
@@ -756,23 +756,8 @@ class BattleTensorEncoder:
             item_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "item", "")))
             ability_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(getattr(pkmn, "ability", "")))
             
-            if item_str == "choiceband":
-                atk_val *= 1.5
-            elif item_str == "choicespecs":
-                spa_val *= 1.5
-            elif item_str == "choicescarf":
-                spe_val *= 1.5
-            elif item_str == "lifeorb":
-                # 생명의구슬은 기술 위력 1.3배지만, 인공지능 인지를 위해 공/특공 1.3배로 근사치 적용
-                atk_val *= 1.3
-                spa_val *= 1.3
-            elif item_str == "assaultvest":
-                spd_val *= 1.5
-            elif item_str == "eviolite":
-                # 엄밀히는 미진화체 전용이나, 실전 데이터 특성상 장착 시 1.5배로 근사
-                def_val *= 1.5
-                spd_val *= 1.5
-            elif item_str == "boosterenergy" and ability_str in ["protosynthesis", "quarkdrive"]:
+            # 구애/생명의구슬/조끼/휘석 배율은 여기서 곱하지 않음: matchup_v7이 실제 능력치에 한 번만 곱함 (이중 적용 방지)
+            if item_str == "boosterenergy" and ability_str in ["protosynthesis", "quarkdrive"]:
                 stats_dict = {"atk": atk_val, "def": def_val, "spa": spa_val, "spd": spd_val, "spe": spe_val}
                 highest = max(stats_dict, key=stats_dict.get)
                 if highest == "spe": spe_val *= 1.5
@@ -881,23 +866,8 @@ class BattleTensorEncoder:
             item_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(item_name or ""))
             ability_str = re.sub(r'[^a-z0-9]', '', extract_enum_str(ability_name or ""))
             
-            if item_str == "choiceband":
-                atk_val *= 1.5
-            elif item_str == "choicespecs":
-                spa_val *= 1.5
-            elif item_str == "choicescarf":
-                spe_val *= 1.5
-            elif item_str == "lifeorb":
-                # 생명의구슬은 기술 위력 1.3배지만, 인공지능 인지를 위해 공/특공 1.3배로 근사치 적용
-                atk_val *= 1.3
-                spa_val *= 1.3
-            elif item_str == "assaultvest":
-                spd_val *= 1.5
-            elif item_str == "eviolite":
-                # 엄밀히는 미진화체 전용이나, 실전 데이터 특성상 장착 시 1.5배로 근사
-                def_val *= 1.5
-                spd_val *= 1.5
-            elif item_str == "boosterenergy" and ability_str in ["protosynthesis", "quarkdrive"]:
+            # 구애/생명의구슬/조끼/휘석 배율은 여기서 곱하지 않음: matchup_v7이 실제 능력치에 한 번만 곱함 (이중 적용 방지)
+            if item_str == "boosterenergy" and ability_str in ["protosynthesis", "quarkdrive"]:
                 stats_dict = {"atk": atk_val, "def": def_val, "spa": spa_val, "spd": spd_val, "spe": spe_val}
                 highest = max(stats_dict, key=stats_dict.get)
                 if highest == "spe": spe_val *= 1.5
@@ -1015,42 +985,6 @@ class BattleTensorEncoder:
                     legal_mask[0, m_idx] = True
                     if mv_id in z_ids or can_tera:
                         legal_mask[0, 4 + m_idx] = True
-                    # 💡 [휴리스틱 마스킹] 무의미한 턴 낭비 방지 룰 (action_mask에만 적용, legal_mask에는 안 닿음)
-                    is_valid = True
-                    
-                    # 1. 상대가 이미 상태이상인데, 또 상태이상을 거는 변화기(도깨비불, 맹독 등) 사용 금지
-                    if hasattr(mv, "status") and mv.status is not None:
-                        opp_pkmn = getattr(battle, "opponent_active_pokemon", None)
-                        if opp_pkmn and opp_pkmn.status is not None:
-                            is_valid = False
-                            
-                    # 2. 상대가 부유(Levitate) 특성이나 비행 타입일 때 땅 타입 공격기(지진 등) 금지
-                    if hasattr(mv, "type") and extract_enum_str(mv.type) == "ground" and getattr(mv, "base_power", 0) > 0:
-                        opp_pkmn = getattr(battle, "opponent_active_pokemon", None)
-                        if opp_pkmn:
-                            opp_type1 = extract_enum_str(getattr(opp_pkmn, "type_1", ""))
-                            opp_type2 = extract_enum_str(getattr(opp_pkmn, "type_2", ""))
-                            opp_ability = extract_enum_str(getattr(opp_pkmn, "ability", ""))
-                            if "flying" in [opp_type1, opp_type2] or opp_ability == "levitate":
-                                is_valid = False
-
-                    # 3. 이미 깔려있는 1회용 장판기(스텔스록, 끈적끈적네트) 및 벽(리플렉터 등) 중복 사용 금지
-                    if mv_id in ["stealthrock", "stickyweb"]:
-                        opp_side = getattr(battle, "opponent_side_conditions", {})
-                        opp_side_str = [extract_enum_str(k) for k in opp_side.keys()]
-                        if mv_id in opp_side_str:
-                            is_valid = False
-                            
-                    if mv_id in ["reflect", "lightscreen", "auroraveil", "tailwind", "safeguard"]:
-                        my_side = getattr(battle, "side_conditions", {})
-                        my_side_str = [extract_enum_str(k) for k in my_side.keys()]
-                        if mv_id in my_side_str:
-                            is_valid = False
-
-                    if is_valid:
-                        action_mask[0, m_idx] = True
-                        if mv_id in z_ids or can_tera:
-                            action_mask[0, 4 + m_idx] = True
 
         if hasattr(battle, "available_switches"):
             avail_switches = getattr(battle, "available_switches", [])
@@ -1058,13 +992,12 @@ class BattleTensorEncoder:
                 pkmn = my_team_list[s_idx]
                 is_fainted = getattr(pkmn, "fainted", False)
                 if pkmn in avail_switches and not is_fainted and pkmn != active_pkmn:
-                    action_mask[0, 8 + s_idx] = True
                     legal_mask[0, 8 + s_idx] = True
 
-        if not action_mask.any():
-            action_mask[0, 0] = True
         if not legal_mask.any():
             legal_mask[0, 0] = True
+        # 학습 데이터 마스크(서버 요청 기반 순수 합법)와 같은 규칙: 휴리스틱 가지치기 없음 (교사 FP도 가지치기 없이 요청 기준으로 둠)
+        action_mask = legal_mask.copy()
 
         return self._to_tensors(my_cat, my_num, my_m_num, opp_cat, opp_num, opp_m_num, field_vec, action_mask, legal_mask)
 

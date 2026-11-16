@@ -293,7 +293,7 @@ class EntityPokemonNetV8(nn.Module):
                  head_width: int = 192, entity_features: bool = True,
                  species_dim: int = 32, belief_hidden: int = 256, belief_species_dropout: float = 0.3,
                  mon_moves: bool = False, pair_glu: int = 0, pair_mode: str = "glu",
-                 forced_legal_zero: bool = False, cand_attn: bool = False, tera_split: bool = False):
+                 forced_legal_zero: bool = False):
         super().__init__()
         self.cfg = dict(model="v8", d_model=d_model, n_layers=n_layers, n_heads=n_heads, ff_mult=ff_mult, dropout=dropout,
                         history_dim=history_dim, hist_layers=hist_layers, latent_dim=latent_dim, head_width=head_width,
@@ -354,20 +354,6 @@ class EntityPokemonNetV8(nn.Module):
         is_switch[8:14] = True
         self.register_buffer("is_switch", is_switch, persistent=False)
         self.value_head = nn.Sequential(nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, 1))
-        self.cand_attn, self.tera_split = cand_attn, tera_split
-        assert cand_attn or not tera_split, "tera_split은 cand_attn이 필요 (칸별 게이트가 후보 출력을 봄)"
-        if cand_attn:                 # 후보(기술 4 + 교체 6) 토큰 + 컨텍스트 토큰이 서로 어텐션해 점수를 냄. move_score/switch_score를 대체. 켰을 때만 cfg에 기록
-            self.cfg["cand_attn"] = True
-            w = head_width
-            self.c_mv, self.c_sw = nn.Linear(latent_dim + 2 * d, w), nn.Linear(latent_dim + d + CAND_N + G_DIM + 1, w)
-            self.c_ctx, self.c_kind = nn.Linear(latent_dim, w), nn.Embedding(3, w)
-            cl = nn.TransformerEncoderLayer(w, 4, 2 * w, dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
-            self.c_enc = nn.TransformerEncoder(cl, 2, enable_nested_tensor=False)
-            self.c_out = nn.Linear(w, 2)
-            del self.move_score, self.switch_score
-        if tera_split:                # 테라 여부를 기술 칸마다 따로 정하는 게이트(테라 로짓은 안 씀): P(테라,k) = P(기술) x softmax_k x g_k. 켰을 때만 cfg에 기록
-            self.cfg["tera_split"] = True
-            self.tera_net = nn.Sequential(nn.Linear(latent_dim + head_width, 64), nn.GELU(), nn.Linear(64, 1))
 
     def _fit_field(self, fv):
         """field_vec 폭을 이 모델이 학습한 폭에 맞춤: 더 넓으면(인코더가 뒤에 열을 추가) 뒤를 버리고, 더 좁으면(옛 데이터) 0으로 채움"""
@@ -456,14 +442,14 @@ class EntityPokemonNetV8(nn.Module):
         expected = (q @ w[: q.size(-1)].to(q.dtype)).to(e.dtype)
         return torch.cat([e[:, :6], torch.where(hidden, expected, e[:, 6:])], 1).view(B * 12, -1)
 
-    def _matchup_feats(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, guess, mult, stat, field_vec, q_opp, p_scarf):
+    def _matchup_feats(self, my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, guess, mult, stat, field_vec, q_opp, p_scarf, p_item):
         B, K = my_cat.size(0), K_GUESS
         ar = torch.arange(B, device=my_cat.device)
         with torch.no_grad():
-            M = self.matchup(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, field_vec, q_opp, p_scarf, mult)
+            M = self.matchup(my_cat, my_num, my_mv, opp_cat, opp_num, opp_mv, field_vec, q_opp, p_scarf, mult, opp_item_p=p_item)
             D, O, ent, entry_opp = M["def"], M["off"], M["entry_frac"], M["entry_opp"]    # 공개된 기술만 [B,6,24,4]
             Dp = self.matchup._pair(opp_cat, opp_num, guess["pseudo"], False, q_opp, my_cat, my_num, True, self.matchup._onehot(my_cat),
-                                    att_mult=mult, entry=ent, cand_f=(entry_opp[..., 0], entry_opp[..., 1]), mid=guess["idx"], field=field_vec)     # [B,6(내),6K,4]
+                                    att_mult=mult, entry=ent, cand_f=(entry_opp[..., 0], entry_opp[..., 1]), mid=guess["idx"], field=field_vec, att_item_p=p_item)     # [B,6(내),6K,4]
             w = guess["w"][:, None]                                                # [B,1,6(상대 o),K]
             dmg, ko = Dp[..., 1].view(B, 6, 6, K), Dp[..., 2].view(B, 6, 6, K)     # 후보별 데미지 비율/확정 KO [B,6(내 i),6(상대 o),K]
             H = torch.stack([1 - (1 - w * ko).prod(-1), (dmg * (w >= PLAUSIBLE)).amax(-1)], -1)   # [B,6,6,2] P_KO, 그럴듯한 최대 데미지
@@ -495,6 +481,7 @@ class EntityPokemonNetV8(nn.Module):
         belief_logits = self.belief(opp_team_cat, opp_team_num)
         q_opp, q_item = self._prob(opp_team_cat[..., 1], belief_logits["ability"]), self._prob(opp_team_cat[..., 0], belief_logits["item"])
         p_scarf = q_item[..., self.matchup.scarf]
+        p_item = q_item[..., self.matchup.item4]      # [B,6,4] 상대의 구애머리띠/안경/생명의구슬/돌격조끼 확률 -> 데미지 계산의 기대 배율 (숨은 도구에만 쓰임)
         parts = [E.species_proj(num[:, 11:18]), self._expected_emb("item", cat[:, 0], q_item, B), self._expected_emb("ability", cat[:, 1], q_opp, B),
                  E.type_embed(cat[:, 2]), E.type_embed(cat[:, 3]), E.status_embed(cat[:, 4]), E.type_embed(cat[:, 9]), num[:, :11], num[:, 18:]]
         raw = E._emb("move", cat[:, 5:9])
@@ -504,7 +491,7 @@ class EntityPokemonNetV8(nn.Module):
         mult = torch.exp(STAT_SCALE * stat).clamp(*MULT_RANGE)
         guess = self._top_guess(belief_logits, opp_team_cat, opp_move_num, opp_team_num)
         D, O, H, mon_extra, mv_extra, cand, ar, act_m, exit_heal = self._matchup_feats(my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num,
-                                                                             opp_move_num, guess, mult, stat, field_vec, q_opp, p_scarf)
+                                                                             opp_move_num, guess, mult, stat, field_vec, q_opp, p_scarf, p_item)
         opp_act = opp_team_num[:, :, 0].argmax(1)
         # ---- 합법성: 토큰 플래그 + 요약 ----
         leg = torch.ones(B, 22, device=dev) if legal is None else legal.float()
@@ -566,15 +553,7 @@ class EntityPokemonNetV8(nn.Module):
         min_thr = torch.where(ok.any(1, keepdim=True), min_thr, torch.zeros_like(min_thr))
         mv_in = torch.cat([latent[:, None].expand(-1, 4, -1), enc["active_mv"], enc["active_mon"][:, None].expand(-1, 4, -1)], -1)
         sw_in = torch.cat([latent[:, None].expand(-1, 6, -1), enc["my_mon"], cand, lg[:, None].expand(-1, 6, -1), enc["leg_sw"][..., None].to(lg.dtype)], -1)
-        am = action_mask if action_mask is not None else torch.ones(B, 22, dtype=torch.bool, device=latent.device)
-        if self.cand_attn:
-            tok = torch.cat([self.c_ctx(latent)[:, None] + self.c_kind.weight[0], self.c_mv(mv_in) + self.c_kind.weight[1], self.c_sw(sw_in) + self.c_kind.weight[2]], 1)
-            legal = torch.cat([am.new_ones(B, 1), am[:, :4] | am[:, 4:8], am[:, 8:14]], 1)
-            h = self.c_enc(tok, src_key_padding_mask=~legal)
-            o = self.c_out(h[:, 1:])
-            mv, sw = o[:, :4], o[:, 4:, 0]
-        else:
-            mv, sw = self.move_score(mv_in), self.switch_score(sw_in).squeeze(-1)
+        mv, sw = self.move_score(mv_in), self.switch_score(sw_in).squeeze(-1)
         detail = torch.cat([mv[..., 0], mv[..., 1], sw, latent.new_full((B, 8), -1e9)], 1)
         type_logits = self.type_head(torch.cat([latent, act_feat, best_off, min_thr, lg], -1))
         if action_mask is not None:
@@ -583,18 +562,12 @@ class EntityPokemonNetV8(nn.Module):
             no_switch = ~(action_mask & self.is_switch).any(dim=1)
             type_logits = type_logits.masked_fill(torch.stack([no_move, no_switch], dim=1), -1e9)
         lp_type = F.log_softmax(type_logits, -1)
-        if self.tera_split:
-            z = self.tera_net(torch.cat([latent[:, None].expand(-1, 4, -1), h[:, 1:5]], -1))[..., 0].float()
-            z = z.masked_fill(~am[:, 4:8], -1e9).masked_fill(~am[:, :4], 1e9)                 # 테라 불법이면 g=0, 일반 불법(테라만 합법)이면 g=1
-            lm = F.log_softmax(mv[..., 0].float().masked_fill(~(am[:, :4] | am[:, 4:8]), -1e9), -1)
-            lp_move = torch.cat([lm + F.logsigmoid(-z), lm + F.logsigmoid(z), latent.new_full((B, 14), -1e9).float()], 1)
-        else:
-            lp_move = F.log_softmax(detail.masked_fill(self.is_switch, -1e9), -1)
+        lp_move = F.log_softmax(detail.masked_fill(self.is_switch, -1e9), -1)
         lp_switch = F.log_softmax(detail.masked_fill(~self.is_switch, -1e9), -1)
         policy_logits = torch.where(self.is_switch, lp_type[:, 1:2] + lp_switch, lp_type[:, 0:1] + lp_move)
         bl = enc["belief_logits"]
         out = {"policy_logits": policy_logits, "latent": latent, "value": self.value_head(latent),
-               "hid_move": bl["move"], "hid_item": bl["item"], "hid_ability": bl["ability"]}
+               "hid_move": bl["move"], "hid_item": bl["item"], "hid_ability": bl["ability"], "hid_stat": bl["stat"]}
         return out
 
     def forward(self, my_team_cat, my_team_num, my_move_num, opp_team_cat, opp_team_num, opp_move_num, field_vec,
