@@ -37,7 +37,8 @@ FORMAT=gen9anythinggoes bash tools/fp_selfplay.sh 4 <판수> 300 <태그> uber_t
 python src/training/build_fp_dataset.py --decisions "data/fp_selfplay/ms300/dec_sp12[abc]_*.jsonl" \
   --out data/fp_selfplay/ms300/fp_data_sp12.npz
 
-python src/training/train_fp_distill.py --data "data/fp_selfplay/ms300/fp_data*.npz,data/fp_selfplay/ms100/fp_data*.npz" \
+source tools/train_data.sh      # TRAIN_DATA = data/enc1/npz의 학습 파일 전부
+python src/training/train_fp_distill.py --data "$TRAIN_DATA" --accum 4 \
   --out checkpoints/supervised_v2_fp_next.pt   # 처음부터 학습: 피크 lr 1e-3 + 웜업 5% + 코사인 감쇠, 6에폭, 구조 v8. 세트 추정은 checkpoints/belief_<NUM_DIM>.pt(pretrain_belief.py)를 불러옴
 ```
 수집이 끝난 원본 결정기록(`dec_*.jsonl`)은 `python tools/compress_raw.py <폴더>`로 압축해 보관한다(해시 검증 후 원본 삭제, 약 12배 작아짐). 빌더는 같은 패턴(`dec_sp12[abc]_*.jsonl`)으로 `.gz`도 읽는다.
@@ -61,20 +62,20 @@ npz의 `pos`는 그 결정이 배틀의 몇 번째 결정 지점인지이고, �
 데이터는 build_fp_dataset이 서버 요청(`|request|`)으로 만든 합법 마스크를 쓰고, 행동 제약 효과 열(field_vec 뒤쪽 14열)도 같이 만든다. 옛 npz(마스크가 규칙 기반, 효과 열 없음)로는 v5/v6의 입력이 비어 있으니 다시 빌드할 것.
 ```bash
 # 합법성 범주(기술 4개/2~3개/1개만/교체 봉쇄) + 제약 효과 범주(도발·앵콜 등)별 교사/학생 교체 확률, 종류 KL, 총 KL, AUC와 기준 모델 대비 차이의 판 단위 부트스트랩 95% 구간
-python tools/legal_eval.py --models v8_full,v9 --base v8_full --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/dagger/dg5.npz
+python tools/legal_eval.py --models v8_full,v9 --base v8_full --sets sp4=data/fp_selfplay/ms100/fp_data_sp4.npz,dg5=data/enc1/eval/dg5.npz
 # 필드/도구/상태 범주(트릭룸, 순풍, 벽, 날씨, 지형, 구애·증폭 도구, 마비)별 KL과 일치율을 나머지와 비교 (학습에 안 쓴 학생 상태 세트만 쓸 것)
-python tools/field_eval.py --models v9 --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
+python tools/field_eval.py --models v9 --sets data/enc1/eval/dg5.npz,data/enc1/eval/d6_ho.npz
 # 교사 확신도(최상위 확률)별·교사 선택 종류별 KL/일치 (학생의 격차가 확신하는 결정에 몰려 있는지)
-python tools/entropy_eval.py --models v9 --sets data/dagger/dg5.npz,data/dagger/d6_ho.npz
+python tools/entropy_eval.py --models v9 --sets data/enc1/eval/dg5.npz,data/enc1/eval/d6_ho.npz
 # regret: 학생 argmax가 교사 탐색의 행동별 가치(Q)로 얼마나 손해인가 (일치율은 근소한 차이 선택도 감점이라 가치 손실로 재측정). 교사 argmax 기준선 포함, 2개 모델이면 판 단위 쌍 비교
 # q_mean/q_vis가 든 npz만 가능 (build_fp_dataset이 항상 저장. 옛 홀드아웃은 원본 결정기록으로 재빌드)
-python tools/regret_eval.py --models v8_full,v9 --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz
+python tools/regret_eval.py --models v8_full,v9 --sets data/enc1/eval/d7_ho.npz,data/enc1/eval/d6_ho.npz
 # regret 분해: 학생 regret이 어떤 결정에 몰려 있나 (교사 선택 종류/턴/벤치 수/강제 교체/결정 중요도/교사 확신/드러난 상대 기술 수별 평균 regret과 전체 몫)
-python tools/regret_breakdown.py --models v8_full --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
+python tools/regret_breakdown.py --models v8_full --sets data/enc1/eval/d7_ho.npz,data/enc1/eval/d6_ho.npz,data/enc1/eval/dg5.npz
 # 교체 이유 분석: 상대 활성의 공개 기술 수별 교체 판별 AUC/regret, 세계(상대 세트 표본)별 교체 이득의 일관성. 세계별 가치는 world_q.py가 원본 결정기록에서 따로 만듦 (d7/d6만 가능)
-python tools/world_q.py --decisions "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --npz data/dagger/d7_ho.npz --out data/dagger/d7_ho_worlds.npz
+python tools/world_q.py --decisions "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --npz data/enc1/eval/d7_ho.npz --out data/dagger/d7_ho_worlds.npz
 # 쌍 비교: 같은 결정에서 두 모델의 KL/일치/regret 차이를 "규칙이 닿는 결정" 범주(특성, 위협 후보, 스피드 상황)별로 판 단위 부트스트랩 (묶음별 표보다 민감). q가 든 npz만 가능
-python tools/paired_eval.py --a v8_full --b v9 --sets data/dagger/d7_ho.npz,data/dagger/d6_ho.npz,data/dagger/dg5.npz
+python tools/paired_eval.py --a v8_full --b v9 --sets data/enc1/eval/d7_ho.npz,data/enc1/eval/d6_ho.npz,data/enc1/eval/dg5.npz
 # 교사 잡음 상한: 같은 상태를 Foul Play가 두 번 라벨링한 결정기록 두 벌의 일치율/KL/regret (학생이 낼 수 있는 값의 기준). 재라벨은 logs/ceiling_run.sh (탐색이 시간 기반이라 다른 CPU 작업 금지)
 python tools/teacher_ceiling.py --a "data/dagger/raw/d7/lab_rec_*_h*.jsonl" --b "data/dagger/raw/d7b/lab_rec_*_h*.jsonl"
 ```
@@ -94,7 +95,7 @@ python tools/damage_residual_report.py data/events/sp12.jsonl.gz --min-n 30 --ts
 교사 상태 검증(학습 스크립트가 찍는 값)은 강도를 따라가지 못함 → 1차 검증은 **학생 상태 홀드아웃**, 최종 판정은 **직접 대전**.
 ```bash
 # 1차 (약 30초): 학생이 방문한 상태에서 교사와의 일치율/CE (높을수록/낮을수록 좋음). 기준: all5d300 0.485/1.5596, all5x 0.497/1.5500, all5h 0.500/1.5335
-python tools/eval_on_npz.py checkpoints/supervised_v2_fp_XXX.pt data/holdout/holdout_all.npz    # 그룹(dg2 dg3 dg4 dg5 fp)별 한 줄. 홀드아웃은 이 통합 파일 하나: 새 라운드는 python tools/merge_holdouts.py dgN=data/dagger/dgN_ho.npz 로 추가
+python tools/regret_eval.py --models <기준>,<후보> --sets data/enc1/eval/d7_ho.npz,data/enc1/eval/d6_ho.npz,data/enc1/eval/dg5.npz    # 학생 상태 홀드아웃의 argmax regret (낮을수록 좋음). 옛 npz로 잰 값과는 비교 불가
 
 # 최종 (Showdown 서버는 없으면 알아서 띄움): 후보 대 기준 SPRT 대전. 결론이 나는 즉시 멈추고(δ 3%p, 상한 6000판), 풀별 판 수를 맞춘 데이터로 판정. 기록은 results/ledger.jsonl
 python tools/arena.py <후보> <기준> --delta 0.03 --cap 6000    # 이름 = checkpoints/supervised_v2_fp_<이름>.pt
@@ -124,8 +125,6 @@ python tools/filter_dagger_hard.py <출력접두사>_b.jsonl <출력접두사>_b
 ```bash
 # 파싱: Metamon 샤드 0 -> 양쪽 시점 시퀀스 npz (r1400 약 25분/21GB, r1600 약 10분, 이미 있는 조각은 건너뜀)
 PYTHONPATH=. python tools/parse_human.py --shard 0 --min-rating 1400 [--out-dir data/human]
-python tools/parse_diff.py <옛 폴더> <새 폴더> r1600 0 1      # 파서나 규칙을 바꿨을 때 옛 조각과 새 조각의 배열별 차이
-python tools/human_table.py                       # logs/human_*.txt 전체 표
 ```
 태그에 대소문자만 다른 이름을 쓰지 말 것 (윈도우가 같은 파일로 봐서 결과를 덮어씀).
 
